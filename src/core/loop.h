@@ -29,6 +29,9 @@ void dc_loop_remove_fd(dc_loop *loop, int fd);
 
 void dc_loop_set_prepare(dc_loop *loop, dc_prepare_cb cb, void *user_data);
 
+/* Register an additional prepare hook (multiple subsystems can each add one). */
+int dc_loop_add_prepare(dc_loop *loop, dc_prepare_cb cb, void *user_data);
+
 /* Block servicing fds until dc_loop_stop() is called. */
 void dc_loop_run(dc_loop *loop);
 void dc_loop_stop(dc_loop *loop);

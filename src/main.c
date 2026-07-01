@@ -9,6 +9,7 @@
 #include "dc.h"
 #include "niri/niri.h"
 #include "render/nvg.h"
+#include "services/dbus.h"
 #include "theme/theme.h"
 #include "ui/bar/bar.h"
 #include "wayland/egl.h"
@@ -88,6 +89,7 @@ int main(void)
     }
 
     dc_niri *niri = dc_niri_connect();
+    dc_dbus *dbus = dc_dbus_connect();
 
     dc_render render = {0};
     struct bar_set set = {0};
@@ -106,6 +108,7 @@ int main(void)
     dc_wayland_integrate(wl, g_loop);
     dc_niri_integrate(niri, g_loop);
     dc_niri_set_changed_cb(niri, niri_changed, &set);
+    dc_dbus_integrate(dbus, g_loop);
 
     int clock_fd = create_clock_timer();
     if (clock_fd >= 0)
@@ -126,6 +129,7 @@ int main(void)
     /* GL teardown is skipped: the process is exiting and nvgDelete needs a live
      * context; the driver reclaims resources on exit. */
     dc_loop_destroy(g_loop);
+    dc_dbus_destroy(dbus);
     dc_niri_destroy(niri);
     dc_egl_finish(&egl);
     dc_wayland_destroy(wl);
