@@ -7,6 +7,7 @@
 #include "render/nvg.h"
 #include "services/audio.h"
 #include "services/battery.h"
+#include "services/bluez.h"
 #include "services/icons.h"
 #include "services/net.h"
 #include "theme/theme.h"
@@ -343,7 +344,15 @@ static void draw_right_cluster(dc_bar *bar)
     dc_render_icon(bar->render, volume_icon, x, cy, isize, volume_color, align);
     x -= step;
 
-    dc_render_icon(bar->render, DC_ICON_BLUETOOTH, x, cy, isize, t->info, align);
+    /* Bluetooth — info-blue when a device is connected, mid when powered, dim off. */
+    dc_bluez_info bt;
+    bool have_bt = dc_bluez_read(&bt);
+    dc_color bt_color = t->outline;
+    if (have_bt && bt.connected)
+        bt_color = t->info;
+    else if (have_bt && bt.powered)
+        bt_color = t->surface_variant_text;
+    dc_render_icon(bar->render, DC_ICON_BLUETOOTH, x, cy, isize, bt_color, align);
     x -= step;
 
     /* Wi-Fi — green when connected (sysfs), dim otherwise. */

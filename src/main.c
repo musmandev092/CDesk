@@ -9,6 +9,7 @@
 #include "dc.h"
 #include "niri/niri.h"
 #include "render/nvg.h"
+#include "services/bluez.h"
 #include "services/dbus.h"
 #include "theme/theme.h"
 #include "ui/bar/bar.h"
@@ -90,6 +91,7 @@ int main(void)
 
     dc_niri *niri = dc_niri_connect();
     dc_dbus *dbus = dc_dbus_connect();
+    dc_bluez_init(dbus);
 
     dc_render render = {0};
     struct bar_set set = {0};
