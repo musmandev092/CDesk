@@ -1,5 +1,6 @@
 #include "ui/osd.h"
 
+#include "core/anim.h"
 #include "core/log.h"
 #include "core/loop.h"
 #include "dc.h"
@@ -50,7 +51,25 @@ struct dc_osd {
     bool visible;
     bool configured;
     bool egl_ready;
+
+    dc_anim anim;
+    struct wl_callback *frame_cb;
 };
+
+static void osd_render(dc_osd *osd);
+
+static void osd_frame_done(void *data, struct wl_callback *cb, uint32_t time);
+static const struct wl_callback_listener osd_frame_listener = {.done = osd_frame_done};
+
+static void osd_frame_done(void *data, struct wl_callback *cb, uint32_t time)
+{
+    dc_osd *osd = data;
+    DC_UNUSED(time);
+    wl_callback_destroy(cb);
+    osd->frame_cb = NULL;
+    if (osd->visible && dc_anim_active(&osd->anim))
+        osd_render(osd);
+}
 
 static void recompute_physical(dc_osd *osd)
 {
@@ -88,6 +107,12 @@ static void osd_render(dc_osd *osd)
     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
     nvgBeginFrame(vg, w, h, (float)osd->scale120 / DC_SCALE_BASE);
+
+    /* Entrance: fade in + slide up from below (DMS OSD). */
+    float p = dc_anim_progress(&osd->anim);
+    float ap = p > 1.0f ? 1.0f : p;
+    nvgGlobalAlpha(vg, ap);
+    nvgTranslate(vg, 0.0f, (1.0f - ap) * 16.0f);
 
     NVGpaint shadow = nvgBoxGradient(vg, pad, pad + 2.0f, w - 2 * pad, h - 2 * pad, 14.0f, 16.0f,
                                      nvgRGBA(0, 0, 0, 90), nvgRGBA(0, 0, 0, 0));
@@ -136,6 +161,11 @@ static void osd_render(dc_osd *osd)
     nvgText(vg, w - pad - 18.0f, cy, label, NULL);
 
     nvgEndFrame(vg);
+
+    if (dc_anim_active(&osd->anim) && !osd->frame_cb) {
+        osd->frame_cb = wl_surface_frame(osd->surface);
+        wl_callback_add_listener(osd->frame_cb, &osd_frame_listener, osd);
+    }
     dc_egl_swap(osd->egl, &osd->egl_window);
 }
 
@@ -181,6 +211,10 @@ static void osd_hide(dc_osd *osd)
 {
     if (!osd->visible)
         return;
+    if (osd->frame_cb) {
+        wl_callback_destroy(osd->frame_cb);
+        osd->frame_cb = NULL;
+    }
     if (osd->egl_ready)
         dc_egl_window_finish(&osd->egl_window, osd->egl);
     if (osd->viewport)
@@ -252,6 +286,7 @@ void dc_osd_show_volume(dc_osd *osd, dc_output *output, int volume, bool muted)
     osd->configured = false;
     osd->egl_ready = false;
     osd->scale120 = (output && output->scale > 0 ? output->scale : 1) * DC_SCALE_BASE;
+    dc_anim_start(&osd->anim, DC_DUR_SHORT, DC_EASE_EMPHASIZED_DECEL);
 
     osd->surface = wl_compositor_create_surface(osd->wl->compositor);
     if (osd->wl->fractional_scale_mgr) {
