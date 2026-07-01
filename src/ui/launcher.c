@@ -1,5 +1,6 @@
 #include "ui/launcher.h"
 
+#include "core/anim.h"
 #include "core/log.h"
 #include "dc.h"
 #include "render/icons.h"
@@ -59,10 +60,29 @@ struct dc_launcher {
     int selected;
     int scroll; /* first visible row */
 
+    dc_anim anim;                 /* entrance (fade + scale) */
+    struct wl_callback *frame_cb; /* pending frame callback while animating */
+
     bool visible;
     bool configured;
     bool egl_ready;
 };
+
+static void launcher_render(dc_launcher *l);
+
+/* Frame callback: advance the entrance animation one frame. */
+static void frame_done(void *data, struct wl_callback *cb, uint32_t time);
+static const struct wl_callback_listener frame_listener = {.done = frame_done};
+
+static void frame_done(void *data, struct wl_callback *cb, uint32_t time)
+{
+    dc_launcher *l = data;
+    DC_UNUSED(time);
+    wl_callback_destroy(cb);
+    l->frame_cb = NULL;
+    if (l->visible && dc_anim_active(&l->anim))
+        launcher_render(l);
+}
 
 static inline NVGcolor tc(dc_color c)
 {
@@ -135,6 +155,15 @@ static void launcher_render(dc_launcher *l)
     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
     nvgBeginFrame(vg, w, h, (float)l->scale120 / DC_SCALE_BASE);
+
+    /* Entrance animation: fade in + scale up from center (DMS spotlight). */
+    float p = dc_anim_progress(&l->anim);
+    float alpha = p > 1.0f ? 1.0f : p;
+    float scale = 0.92f + 0.08f * p;
+    nvgGlobalAlpha(vg, alpha);
+    nvgTranslate(vg, w / 2.0f, h / 2.0f);
+    nvgScale(vg, scale, scale);
+    nvgTranslate(vg, -w / 2.0f, -h / 2.0f);
 
     /* Drop shadow + card. */
     NVGpaint shadow = nvgBoxGradient(vg, pad, pad + 2.0f, w - 2 * pad, h - 2 * pad, 16.0f, 20.0f,
@@ -242,6 +271,13 @@ static void launcher_render(dc_launcher *l)
     }
 
     nvgEndFrame(vg);
+
+    /* While animating, ask for a frame callback (committed by the swap) so the
+     * next frame is drawn; the loop drives it via frame_done. */
+    if (dc_anim_active(&l->anim) && !l->frame_cb) {
+        l->frame_cb = wl_surface_frame(l->surface);
+        wl_callback_add_listener(l->frame_cb, &frame_listener, l);
+    }
     dc_egl_swap(l->egl, &l->egl_window);
 }
 
@@ -304,6 +340,7 @@ static void launcher_show(dc_launcher *l, dc_output *output)
     l->scale120 = (output && output->scale > 0 ? output->scale : 1) * DC_SCALE_BASE;
     l->query[0] = '\0';
     run_search(l);
+    dc_anim_start(&l->anim, DC_DUR_MEDIUM, DC_EASE_EXPRESSIVE);
 
     l->surface = wl_compositor_create_surface(l->wl->compositor);
     if (l->wl->fractional_scale_mgr) {
@@ -330,6 +367,10 @@ static void launcher_show(dc_launcher *l, dc_output *output)
 
 static void launcher_hide(dc_launcher *l)
 {
+    if (l->frame_cb) {
+        wl_callback_destroy(l->frame_cb);
+        l->frame_cb = NULL;
+    }
     if (l->egl_ready)
         dc_egl_window_finish(&l->egl_window, l->egl);
     if (l->viewport)

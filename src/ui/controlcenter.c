@@ -1,5 +1,6 @@
 #include "ui/controlcenter.h"
 
+#include "core/anim.h"
 #include "core/log.h"
 #include "dc.h"
 #include "render/icons.h"
@@ -44,10 +45,28 @@ struct dc_control_center {
     int phys_width;
     int phys_height;
 
+    dc_anim anim;
+    struct wl_callback *frame_cb;
+
     bool visible;
     bool configured;
     bool egl_ready;
 };
+
+static void cc_render(dc_control_center *cc);
+
+static void cc_frame_done(void *data, struct wl_callback *cb, uint32_t time);
+static const struct wl_callback_listener cc_frame_listener = {.done = cc_frame_done};
+
+static void cc_frame_done(void *data, struct wl_callback *cb, uint32_t time)
+{
+    dc_control_center *cc = data;
+    DC_UNUSED(time);
+    wl_callback_destroy(cb);
+    cc->frame_cb = NULL;
+    if (cc->visible && dc_anim_active(&cc->anim))
+        cc_render(cc);
+}
 
 static inline NVGcolor tc(dc_color c)
 {
@@ -227,6 +246,15 @@ static void cc_render(dc_control_center *cc)
 
     nvgBeginFrame(vg, w, h, (float)cc->scale120 / DC_SCALE_BASE);
 
+    /* Entrance: fade in + scale up from the top-right corner (DMS). */
+    float p = dc_anim_progress(&cc->anim);
+    float alpha = p > 1.0f ? 1.0f : p;
+    float scale = 0.94f + 0.06f * p;
+    nvgGlobalAlpha(vg, alpha);
+    nvgTranslate(vg, w - pad, pad);
+    nvgScale(vg, scale, scale);
+    nvgTranslate(vg, -(w - pad), -pad);
+
     /* Soft drop shadow. */
     NVGpaint shadow = nvgBoxGradient(vg, pad, pad + 2.0f, w - 2 * pad, h - 2 * pad, 12.0f, 18.0f,
                                      nvgRGBA(0, 0, 0, 90), nvgRGBA(0, 0, 0, 0));
@@ -278,6 +306,11 @@ static void cc_render(dc_control_center *cc)
                 brightness >= 0.0f ? brightness : 0.7f);
 
     nvgEndFrame(vg);
+
+    if (dc_anim_active(&cc->anim) && !cc->frame_cb) {
+        cc->frame_cb = wl_surface_frame(cc->surface);
+        wl_callback_add_listener(cc->frame_cb, &cc_frame_listener, cc);
+    }
     dc_egl_swap(cc->egl, &cc->egl_window);
 }
 
@@ -337,6 +370,7 @@ static void cc_show(dc_control_center *cc, dc_output *output)
     cc->configured = false;
     cc->egl_ready = false;
     cc->scale120 = (output && output->scale > 0 ? output->scale : 1) * DC_SCALE_BASE;
+    dc_anim_start(&cc->anim, DC_DUR_MEDIUM, DC_EASE_EXPRESSIVE);
 
     cc->surface = wl_compositor_create_surface(cc->wl->compositor);
     if (cc->wl->fractional_scale_mgr) {
@@ -364,6 +398,10 @@ static void cc_show(dc_control_center *cc, dc_output *output)
 
 static void cc_hide(dc_control_center *cc)
 {
+    if (cc->frame_cb) {
+        wl_callback_destroy(cc->frame_cb);
+        cc->frame_cb = NULL;
+    }
     if (cc->egl_ready)
         dc_egl_window_finish(&cc->egl_window, cc->egl);
     if (cc->viewport)
