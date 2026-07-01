@@ -31,13 +31,15 @@ niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
 - **Config + themes** (T26): ~/.config/dankc/config.json (cJSON) — theme/clock24h/showDate/animation
   prefs, DMS defaults. All 10 DMS DARK stock themes selectable via dc_theme_set (stock_themes.inc,
   generated). Bar clock honours 12/24h + showDate.
+- **Animation engine** (T9): core/anim.c — DMS durations + easing (incl. expressive overshoot),
+  config-scaled. Fade+scale entrance on launcher + control center via frame callbacks (self-terminating).
 - **FIXED the frozen clock**: it was a loop-wide deadlock — blocking `wl_display_dispatch()` raced Mesa's
   gallium threads for the display fd. Now uses thread-safe prepare_read/read_events + a wall-clock loop
   tick. See memory `dankc-wayland-dispatch-deadlock`.
 - **Footprint:** RSS ≈ **145 MB** for two GPU bars incl. Mesa (Pss lower), vs DMS `qs` ≈ 477 MB.
-- **Next:** T9 animation engine (DMS durations, config-driven intensity), then T23 clipboard/screenshot/
-  night, then T22 lock screen (DEFERRED: needs the user awake to test PAM auth — locking the live session
-  with unverified code risks a lockout).
+- **Next:** T23 clipboard history (wlr-data-control, safe/testable), then apply anim to toasts/OSD +
+  workspace pill. T22 lock screen DEFERRED: needs the user awake to test PAM auth — locking the live
+  session with unverified code risks a lockout.
 - Vendored: nanovg (GLES3, `third_party/nanovg`), cJSON (`third_party/cjson`); Inter bundled
   (`assets/fonts/InterVariable.ttf`).
 

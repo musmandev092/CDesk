@@ -47,8 +47,11 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
   red-dot, real wifi/bt/volume state). Verified vs a 2x crop of the DMS reference.
 - [x] **T8 CPU + RAM widgets** — NOT NEEDED. The user's DMS bar right side is icon-only (no CPU/RAM text
   widgets), confirmed from the reference crop. Skipped to stay faithful.
-- [ ] **T9 Animation engine.** src/render/anim.c: tween + easing + the DMS duration table
-  (docs/02-RENDERING §8). Animate workspace focus + widget hover.
+- [x] **T9 Animation engine** — DONE: src/core/anim.c — DMS durations (150/300/450/500) + easing
+  (OutCubic/OutQuart/emphasized accel-decel/expressive overshoot via cubic-Bezier), config-scaled
+  (animationSpeed/animationsEnabled). Frame-callback-driven fade+scale entrances on launcher + control
+  center (loop self-terminates at completion). TODO: apply to toasts/OSD slide-in, workspace-focus pill,
+  widget hover, and exit animations.
 
 ## Then — services (M3, sd-bus; libsystemd present)
 - [x] **T10 sd-bus scaffolding** (src/services/dbus.c): system+user bus opened + driven from the poll loop
