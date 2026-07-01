@@ -26,6 +26,9 @@ typedef struct dc_output {
     struct wl_list link; /* dc_wayland.outputs */
 } dc_output;
 
+/* Left-click on a bar surface, in surface-local logical coordinates. */
+typedef void (*dc_click_cb)(struct wl_surface *surface, double x, double y, void *user_data);
+
 typedef struct dc_wayland {
     struct wl_display *display;
     struct wl_registry *registry;
@@ -37,8 +40,18 @@ typedef struct dc_wayland {
     struct wp_fractional_scale_manager_v1 *fractional_scale_mgr;
     struct wl_seat *seat;
 
+    /* Pointer state. */
+    struct wl_pointer *pointer;
+    struct wl_surface *pointer_surface;
+    double pointer_x;
+    double pointer_y;
+    dc_click_cb click_cb;
+    void *click_data;
+
     struct wl_list outputs; /* dc_output.link */
 } dc_wayland;
+
+void dc_wayland_set_click_cb(dc_wayland *wl, dc_click_cb cb, void *user_data);
 
 /* Connect to $WAYLAND_DISPLAY and bind globals. Returns NULL on failure.
  * Caller owns the result and must call dc_wayland_destroy(). */

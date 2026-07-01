@@ -61,6 +61,18 @@ static void niri_changed(void *data)
     render_all(data);
 }
 
+/* Route a left click to the bar under the pointer. */
+static void handle_bar_click(struct wl_surface *surface, double x, double y, void *data)
+{
+    struct bar_set *set = data;
+    for (int i = 0; i < set->count; i++) {
+        if (dc_bar_surface(set->bars[i]) == surface) {
+            dc_bar_handle_click(set->bars[i], x, y);
+            return;
+        }
+    }
+}
+
 static int create_clock_timer(void)
 {
     int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -112,6 +124,7 @@ int main(void)
     dc_wayland_integrate(wl, g_loop);
     dc_niri_integrate(niri, g_loop);
     dc_niri_set_changed_cb(niri, niri_changed, &set);
+    dc_wayland_set_click_cb(wl, handle_bar_click, &set);
     dc_dbus_integrate(dbus, g_loop);
 
     int clock_fd = create_clock_timer();

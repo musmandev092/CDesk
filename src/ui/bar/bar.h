@@ -23,4 +23,10 @@ void dc_bar_destroy(dc_bar *bar);
  * the surface has been configured. */
 void dc_bar_render(dc_bar *bar);
 
+/* The bar's wl_surface (for matching pointer events). */
+struct wl_surface *dc_bar_surface(dc_bar *bar);
+
+/* Handle a left click at surface-local logical coordinates. */
+void dc_bar_handle_click(dc_bar *bar, double x, double y);
+
 #endif /* DC_UI_BAR_BAR_H */

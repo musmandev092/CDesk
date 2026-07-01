@@ -549,6 +549,27 @@ dc_bar *dc_bar_create(dc_wayland *wl, dc_output *output, dc_egl *egl, dc_render 
     return bar;
 }
 
+struct wl_surface *dc_bar_surface(dc_bar *bar)
+{
+    return bar->surface;
+}
+
+void dc_bar_handle_click(dc_bar *bar, double x, double y)
+{
+    DC_UNUSED(y);
+    /* Map to a region (logical coords). Actions (popouts) come with the panels. */
+    const char *region;
+    if (x < 44.0)
+        region = "launcher";
+    else if (x > bar->logical_width - 210.0)
+        region = "control-center";
+    else if (x > bar->logical_width / 2.0 - 70.0 && x < bar->logical_width / 2.0 + 70.0)
+        region = "clock/dash";
+    else
+        region = "bar";
+    dc_info("bar click %.0f,%.0f -> %s", x, y, region);
+}
+
 void dc_bar_destroy(dc_bar *bar)
 {
     if (!bar)

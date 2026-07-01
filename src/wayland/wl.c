@@ -4,6 +4,7 @@
 #include "core/loop.h"
 #include "dc.h"
 
+#include <linux/input-event-codes.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
@@ -94,6 +95,94 @@ static const struct xdg_wm_base_listener wm_base_listener = {
     .ping = wm_base_handle_ping,
 };
 
+/* --- pointer / seat ----------------------------------------------------- */
+
+static void pointer_handle_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
+                                 struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy)
+{
+    dc_wayland *wl = data;
+    DC_UNUSED(pointer);
+    DC_UNUSED(serial);
+    wl->pointer_surface = surface;
+    wl->pointer_x = wl_fixed_to_double(sx);
+    wl->pointer_y = wl_fixed_to_double(sy);
+}
+
+static void pointer_handle_leave(void *data, struct wl_pointer *pointer, uint32_t serial,
+                                 struct wl_surface *surface)
+{
+    dc_wayland *wl = data;
+    DC_UNUSED(pointer);
+    DC_UNUSED(serial);
+    if (wl->pointer_surface == surface)
+        wl->pointer_surface = NULL;
+}
+
+static void pointer_handle_motion(void *data, struct wl_pointer *pointer, uint32_t time,
+                                  wl_fixed_t sx, wl_fixed_t sy)
+{
+    dc_wayland *wl = data;
+    DC_UNUSED(pointer);
+    DC_UNUSED(time);
+    wl->pointer_x = wl_fixed_to_double(sx);
+    wl->pointer_y = wl_fixed_to_double(sy);
+}
+
+static void pointer_handle_button(void *data, struct wl_pointer *pointer, uint32_t serial,
+                                  uint32_t time, uint32_t button, uint32_t state)
+{
+    dc_wayland *wl = data;
+    DC_UNUSED(pointer);
+    DC_UNUSED(serial);
+    DC_UNUSED(time);
+    if (button == BTN_LEFT && state == WL_POINTER_BUTTON_STATE_PRESSED && wl->pointer_surface &&
+        wl->click_cb)
+        wl->click_cb(wl->pointer_surface, wl->pointer_x, wl->pointer_y, wl->click_data);
+}
+
+static void pointer_handle_axis(void *data, struct wl_pointer *pointer, uint32_t time,
+                                uint32_t axis, wl_fixed_t value)
+{
+    DC_UNUSED(data);
+    DC_UNUSED(pointer);
+    DC_UNUSED(time);
+    DC_UNUSED(axis);
+    DC_UNUSED(value);
+}
+
+static const struct wl_pointer_listener pointer_listener = {
+    .enter = pointer_handle_enter,
+    .leave = pointer_handle_leave,
+    .motion = pointer_handle_motion,
+    .button = pointer_handle_button,
+    .axis = pointer_handle_axis,
+};
+
+static void seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
+{
+    dc_wayland *wl = data;
+    if ((caps & WL_SEAT_CAPABILITY_POINTER) && !wl->pointer) {
+        wl->pointer = wl_seat_get_pointer(seat);
+        wl_pointer_add_listener(wl->pointer, &pointer_listener, wl);
+        dc_debug("pointer acquired");
+    } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && wl->pointer) {
+        wl_pointer_release(wl->pointer);
+        wl->pointer = NULL;
+    }
+}
+
+static void seat_handle_name(void *data, struct wl_seat *seat, const char *name)
+{
+    DC_UNUSED(data);
+    DC_UNUSED(seat);
+    DC_UNUSED(name);
+}
+
+static const struct wl_seat_listener seat_listener = {
+    .capabilities = seat_handle_capabilities,
+    .name = seat_handle_name,
+};
+
 /* --- registry ----------------------------------------------------------- */
 
 static void registry_handle_global(void *data, struct wl_registry *registry, uint32_t name,
@@ -118,6 +207,7 @@ static void registry_handle_global(void *data, struct wl_registry *registry, uin
             wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1);
     } else if (strcmp(interface, wl_seat_interface.name) == 0) {
         wl->seat = wl_registry_bind(registry, name, &wl_seat_interface, DC_MIN(version, 7u));
+        wl_seat_add_listener(wl->seat, &seat_listener, wl);
     } else if (strcmp(interface, wl_output_interface.name) == 0) {
         dc_output *output = calloc(1, sizeof(*output));
         output->registry_name = name;
@@ -225,6 +315,12 @@ static void wayland_readable(int fd, uint32_t revents, void *data)
     DC_UNUSED(revents);
     if (wl_display_dispatch(wl->display) < 0)
         dc_error("wl_display_dispatch failed; compositor gone?");
+}
+
+void dc_wayland_set_click_cb(dc_wayland *wl, dc_click_cb cb, void *user_data)
+{
+    wl->click_cb = cb;
+    wl->click_data = user_data;
 }
 
 void dc_wayland_integrate(dc_wayland *wl, struct dc_loop *loop)
