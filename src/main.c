@@ -17,6 +17,7 @@
 #include "theme/theme.h"
 #include "ui/bar/bar.h"
 #include "ui/controlcenter.h"
+#include "ui/launcher.h"
 #include "ui/osd.h"
 #include "ui/toasts.h"
 #include "wayland/egl.h"
@@ -100,7 +101,14 @@ struct click_ctx {
     struct bar_set *set;
     dc_control_center *control_center;
     dc_toasts *toasts;
+    dc_launcher *launcher;
 };
+
+/* Keyboard input routed to the launcher (the only keyboard-grabbing surface). */
+static void handle_key(uint32_t keysym, const char *utf8, void *data)
+{
+    dc_launcher_handle_key(data, keysym, utf8);
+}
 
 /* Route a left click: into the control-center popup if it's the target, else to
  * the bar under the pointer (toggle the control center, or dismiss it). */
@@ -112,6 +120,11 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
     if (dc_toasts_handle_click(ctx->toasts, surface, x, y))
         return;
 
+    if (dc_launcher_visible(ctx->launcher) && surface == dc_launcher_surface(ctx->launcher)) {
+        dc_launcher_handle_click(ctx->launcher, x, y);
+        return;
+    }
+
     if (dc_control_center_visible(cc) && surface == dc_control_center_surface(cc)) {
         dc_control_center_handle_click(cc, x, y);
         return;
@@ -122,7 +135,9 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
         if (dc_bar_surface(bar) != surface)
             continue;
         dc_bar_region region = dc_bar_hittest(bar, x, y);
-        if (region == DC_BAR_REGION_CONTROL_CENTER)
+        if (region == DC_BAR_REGION_LAUNCHER)
+            dc_launcher_toggle(ctx->launcher, dc_bar_output(bar));
+        else if (region == DC_BAR_REGION_CONTROL_CENTER)
             dc_control_center_toggle(cc, dc_bar_output(bar));
         else if (dc_control_center_visible(cc))
             dc_control_center_hide(cc);
@@ -175,7 +190,13 @@ int main(void)
     dc_toasts *toasts = dc_toasts_create(wl, &egl, &render, notifications, first_output);
     dc_notifications_set_changed_cb(notifications, notifications_changed, toasts);
 
-    struct click_ctx cctx = {.set = &set, .control_center = control_center, .toasts = toasts};
+    dc_launcher *launcher = dc_launcher_create(wl, &egl, &render);
+    dc_wayland_set_key_cb(wl, handle_key, launcher);
+
+    struct click_ctx cctx = {.set = &set,
+                             .control_center = control_center,
+                             .toasts = toasts,
+                             .launcher = launcher};
     struct tick_ctx tick = {.set = &set, .osd = osd, .wl = wl, .notifications = notifications};
 
     g_loop = dc_loop_create();
@@ -204,11 +225,19 @@ dc_osd_integrate(osd, g_loop);
         if (first && getenv("DANKC_OSD_DEMO"))
             dc_osd_show_volume(osd, first, 55, false);
     }
+    if (getenv("DANKC_LAUNCHER_DEMO")) {
+        dc_output *first = NULL;
+        wl_list_for_each(first, &wl->outputs, link) {
+            break;
+        }
+        dc_launcher_toggle(launcher, first);
+    }
 
     dc_info("entering event loop (%d bar%s)", set.count, set.count == 1 ? "" : "s");
     dc_loop_run(g_loop);
 
     dc_info("shutting down");
+    dc_launcher_destroy(launcher);
     dc_toasts_destroy(toasts);
     dc_notifications_destroy(notifications);
     dc_osd_destroy(osd);
