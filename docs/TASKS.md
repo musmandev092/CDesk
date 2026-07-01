@@ -89,6 +89,10 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
 - [ ] **T22 Lock screen**, **T23 clipboard/screenshot/color-picker/night**.
 
 ## Later
+- [x] **T26 config engine (cJSON)** — DONE: ~/.config/dankc/config.json (theme/clock24h/showDate/
+  animationsEnabled/animationSpeed) with defaults; bar clock honours clock24h + showDate. Plus all 10 DMS
+  DARK stock themes selectable via dc_theme_set (generated from StockThemes.js). TODO: hot-reload on
+  file change; light variants; more keys (bar position/height, widget toggles).
 - [ ] **T24 Material color engine** (C++ MCU, colors from wallpaper — matches DMS when matugen active).
-- [ ] **T25 dankctl IPC + niri keybind generation.**  **T26 settings.json config engine (cJSON).**
+- [ ] **T25 dankctl IPC + niri keybind generation.**
   **T27 Settings UI.**  **T28 meson build.**  **T29 plugins (.so ABI).**  **T30 packaging.**

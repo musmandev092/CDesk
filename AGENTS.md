@@ -28,11 +28,16 @@ niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
   already owns it. History/center panel + action buttons deferred.
 - **App launcher** (T21): centered spotlight overlay with keyboard focus (xkb), fuzzy desktop-entry
   search + icons, type/arrows/enter/click to launch. Opens from the bar launcher button.
+- **Config + themes** (T26): ~/.config/dankc/config.json (cJSON) — theme/clock24h/showDate/animation
+  prefs, DMS defaults. All 10 DMS DARK stock themes selectable via dc_theme_set (stock_themes.inc,
+  generated). Bar clock honours 12/24h + showDate.
 - **FIXED the frozen clock**: it was a loop-wide deadlock — blocking `wl_display_dispatch()` raced Mesa's
   gallium threads for the display fd. Now uses thread-safe prepare_read/read_events + a wall-clock loop
   tick. See memory `dankc-wayland-dispatch-deadlock`.
 - **Footprint:** RSS ≈ **145 MB** for two GPU bars incl. Mesa (Pss lower), vs DMS `qs` ≈ 477 MB.
-- **Next:** T22 lock screen (ext-session-lock), then T23 clipboard/screenshot/color-picker/night.
+- **Next:** T9 animation engine (DMS durations, config-driven intensity), then T23 clipboard/screenshot/
+  night, then T22 lock screen (DEFERRED: needs the user awake to test PAM auth — locking the live session
+  with unverified code risks a lockout).
 - Vendored: nanovg (GLES3, `third_party/nanovg`), cJSON (`third_party/cjson`); Inter bundled
   (`assets/fonts/InterVariable.ttf`).
 
