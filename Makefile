@@ -6,7 +6,7 @@ CC          ?= cc
 PKG_CONFIG  ?= pkg-config
 WAYLAND_SCANNER ?= wayland-scanner
 
-PKGS := wayland-client wayland-egl egl glesv2 libsystemd
+PKGS := wayland-client wayland-egl egl glesv2 libsystemd xkbcommon
 
 WARNINGS := -Wall -Wextra -Wshadow -Wvla -Wpointer-arith -Wno-unused-parameter
 INCLUDES := -Isrc -Iprotocol/generated -Ithird_party/nanovg -Ithird_party/nanosvg -Ithird_party/cjson

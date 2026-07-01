@@ -8,6 +8,9 @@
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <xkbcommon/xkbcommon.h>
 
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
@@ -158,6 +161,102 @@ static const struct wl_pointer_listener pointer_listener = {
     .axis = pointer_handle_axis,
 };
 
+/* --- keyboard (xkb) ----------------------------------------------------- */
+
+static void keyboard_handle_keymap(void *data, struct wl_keyboard *kbd, uint32_t format, int fd,
+                                   uint32_t size)
+{
+    dc_wayland *wl = data;
+    DC_UNUSED(kbd);
+    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
+        close(fd);
+        return;
+    }
+    char *map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED) {
+        close(fd);
+        return;
+    }
+    struct xkb_keymap *keymap = xkb_keymap_new_from_string(
+        wl->xkb_context, map, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    munmap(map, size);
+    close(fd);
+    if (!keymap)
+        return;
+
+    if (wl->xkb_state)
+        xkb_state_unref(wl->xkb_state);
+    if (wl->xkb_keymap)
+        xkb_keymap_unref(wl->xkb_keymap);
+    wl->xkb_keymap = keymap;
+    wl->xkb_state = xkb_state_new(keymap);
+}
+
+static void keyboard_handle_enter(void *data, struct wl_keyboard *kbd, uint32_t serial,
+                                  struct wl_surface *surface, struct wl_array *keys)
+{
+    DC_UNUSED(data);
+    DC_UNUSED(kbd);
+    DC_UNUSED(serial);
+    DC_UNUSED(surface);
+    DC_UNUSED(keys);
+}
+
+static void keyboard_handle_leave(void *data, struct wl_keyboard *kbd, uint32_t serial,
+                                  struct wl_surface *surface)
+{
+    DC_UNUSED(data);
+    DC_UNUSED(kbd);
+    DC_UNUSED(serial);
+    DC_UNUSED(surface);
+}
+
+static void keyboard_handle_key(void *data, struct wl_keyboard *kbd, uint32_t serial, uint32_t time,
+                                uint32_t key, uint32_t state)
+{
+    dc_wayland *wl = data;
+    DC_UNUSED(kbd);
+    DC_UNUSED(serial);
+    DC_UNUSED(time);
+    if (state != WL_KEYBOARD_KEY_STATE_PRESSED || !wl->xkb_state || !wl->key_cb)
+        return;
+
+    xkb_keycode_t keycode = key + 8; /* evdev -> xkb offset */
+    xkb_keysym_t sym = xkb_state_key_get_one_sym(wl->xkb_state, keycode);
+    char utf8[64];
+    xkb_state_key_get_utf8(wl->xkb_state, keycode, utf8, sizeof(utf8));
+    wl->key_cb((uint32_t)sym, utf8, wl->key_data);
+}
+
+static void keyboard_handle_modifiers(void *data, struct wl_keyboard *kbd, uint32_t serial,
+                                      uint32_t mods_depressed, uint32_t mods_latched,
+                                      uint32_t mods_locked, uint32_t group)
+{
+    dc_wayland *wl = data;
+    DC_UNUSED(kbd);
+    DC_UNUSED(serial);
+    if (wl->xkb_state)
+        xkb_state_update_mask(wl->xkb_state, mods_depressed, mods_latched, mods_locked, 0, 0, group);
+}
+
+static void keyboard_handle_repeat_info(void *data, struct wl_keyboard *kbd, int32_t rate,
+                                        int32_t delay)
+{
+    DC_UNUSED(data);
+    DC_UNUSED(kbd);
+    DC_UNUSED(rate);
+    DC_UNUSED(delay);
+}
+
+static const struct wl_keyboard_listener keyboard_listener = {
+    .keymap = keyboard_handle_keymap,
+    .enter = keyboard_handle_enter,
+    .leave = keyboard_handle_leave,
+    .key = keyboard_handle_key,
+    .modifiers = keyboard_handle_modifiers,
+    .repeat_info = keyboard_handle_repeat_info,
+};
+
 static void seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
 {
     dc_wayland *wl = data;
@@ -168,6 +267,17 @@ static void seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t 
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && wl->pointer) {
         wl_pointer_release(wl->pointer);
         wl->pointer = NULL;
+    }
+
+    if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !wl->keyboard) {
+        if (!wl->xkb_context)
+            wl->xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+        wl->keyboard = wl_seat_get_keyboard(seat);
+        wl_keyboard_add_listener(wl->keyboard, &keyboard_listener, wl);
+        dc_debug("keyboard acquired");
+    } else if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD) && wl->keyboard) {
+        wl_keyboard_release(wl->keyboard);
+        wl->keyboard = NULL;
     }
 }
 
@@ -292,6 +402,13 @@ void dc_wayland_destroy(dc_wayland *wl)
         free(output);
     }
 
+    if (wl->xkb_state)
+        xkb_state_unref(wl->xkb_state);
+    if (wl->xkb_keymap)
+        xkb_keymap_unref(wl->xkb_keymap);
+    if (wl->xkb_context)
+        xkb_context_unref(wl->xkb_context);
+
     if (wl->registry)
         wl_registry_destroy(wl->registry);
     if (wl->display)
@@ -335,6 +452,12 @@ void dc_wayland_set_click_cb(dc_wayland *wl, dc_click_cb cb, void *user_data)
 {
     wl->click_cb = cb;
     wl->click_data = user_data;
+}
+
+void dc_wayland_set_key_cb(dc_wayland *wl, dc_key_cb cb, void *user_data)
+{
+    wl->key_cb = cb;
+    wl->key_data = user_data;
 }
 
 void dc_wayland_integrate(dc_wayland *wl, struct dc_loop *loop)

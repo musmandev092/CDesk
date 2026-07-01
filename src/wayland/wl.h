@@ -15,6 +15,9 @@ struct zwlr_layer_shell_v1;
 struct xdg_wm_base;
 struct wp_viewporter;
 struct wp_fractional_scale_manager_v1;
+struct xkb_context;
+struct xkb_keymap;
+struct xkb_state;
 
 typedef struct dc_output {
     struct wl_output *wl_output;
@@ -28,6 +31,9 @@ typedef struct dc_output {
 
 /* Left-click on a bar surface, in surface-local logical coordinates. */
 typedef void (*dc_click_cb)(struct wl_surface *surface, double x, double y, void *user_data);
+
+/* A key press: `keysym` is the xkb keysym; `utf8` is its text (may be empty). */
+typedef void (*dc_key_cb)(uint32_t keysym, const char *utf8, void *user_data);
 
 typedef struct dc_wayland {
     struct wl_display *display;
@@ -48,10 +54,22 @@ typedef struct dc_wayland {
     dc_click_cb click_cb;
     void *click_data;
 
+    /* Keyboard state (xkb). */
+    struct wl_keyboard *keyboard;
+    struct xkb_context *xkb_context;
+    struct xkb_keymap *xkb_keymap;
+    struct xkb_state *xkb_state;
+    dc_key_cb key_cb;
+    void *key_data;
+
     struct wl_list outputs; /* dc_output.link */
 } dc_wayland;
 
 void dc_wayland_set_click_cb(dc_wayland *wl, dc_click_cb cb, void *user_data);
+
+/* Set the handler for keyboard input (used by the launcher/lock screen). Keys
+ * are only delivered while a DankC surface holds keyboard focus. */
+void dc_wayland_set_key_cb(dc_wayland *wl, dc_key_cb cb, void *user_data);
 
 /* Connect to $WAYLAND_DISPLAY and bind globals. Returns NULL on failure.
  * Caller owns the result and must call dc_wayland_destroy(). */
