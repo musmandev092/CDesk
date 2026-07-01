@@ -32,6 +32,11 @@ void dc_loop_set_prepare(dc_loop *loop, dc_prepare_cb cb, void *user_data);
 /* Register an additional prepare hook (multiple subsystems can each add one). */
 int dc_loop_add_prepare(dc_loop *loop, dc_prepare_cb cb, void *user_data);
 
+/* Periodic tick, called about every `interval_ms` from the loop (wall-clock
+ * based, independent of any fd). Used for the clock/OSD. */
+typedef void (*dc_tick_cb)(void *user_data);
+void dc_loop_set_tick(dc_loop *loop, dc_tick_cb cb, void *user_data, int interval_ms);
+
 /* Block servicing fds until dc_loop_stop() is called. */
 void dc_loop_run(dc_loop *loop);
 void dc_loop_stop(dc_loop *loop);

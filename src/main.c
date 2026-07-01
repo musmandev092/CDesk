@@ -11,10 +11,12 @@
 #include "render/nvg.h"
 #include "services/bluez.h"
 #include "services/dbus.h"
+#include "services/audio.h"
 #include "services/mpris.h"
 #include "theme/theme.h"
 #include "ui/bar/bar.h"
 #include "ui/controlcenter.h"
+#include "ui/osd.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
@@ -46,14 +48,36 @@ static void render_all(struct bar_set *set)
         dc_bar_render(set->bars[i]);
 }
 
-/* Fires once per second; redraws every bar so the clock stays current. */
-static void clock_tick(int fd, uint32_t revents, void *data)
+struct tick_ctx {
+    struct bar_set *set;
+    dc_osd *osd;
+    dc_wayland *wl;
+    int last_volume;
+    bool last_muted;
+    bool have_last;
+};
+
+/* Called ~once per second by the loop: redraw the bars (clock) and pop the
+ * volume OSD on a change. */
+static void clock_tick(void *data)
 {
-    DC_UNUSED(revents);
-    uint64_t expirations;
-    if (read(fd, &expirations, sizeof(expirations)) < 0)
-        return;
-    render_all(data);
+    struct tick_ctx *ctx = data;
+    render_all(ctx->set);
+
+    dc_audio_info audio;
+    if (dc_audio_read(&audio) && audio.available) {
+        if (ctx->have_last && (audio.volume != ctx->last_volume || audio.muted != ctx->last_muted)) {
+            dc_output *first = NULL;
+            wl_list_for_each(first, &ctx->wl->outputs, link) {
+                break;
+            }
+            if (first)
+                dc_osd_show_volume(ctx->osd, first, audio.volume, audio.muted);
+        }
+        ctx->last_volume = audio.volume;
+        ctx->last_muted = audio.muted;
+        ctx->have_last = true;
+    }
 }
 
 /* Called when niri's workspace state changes. */
@@ -92,19 +116,6 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
     }
 }
 
-static int create_clock_timer(void)
-{
-    int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-    if (fd < 0)
-        return -1;
-    struct itimerspec spec = {
-        .it_interval = {.tv_sec = 1, .tv_nsec = 0},
-        .it_value = {.tv_sec = 1, .tv_nsec = 0},
-    };
-    timerfd_settime(fd, 0, &spec, NULL);
-    return fd;
-}
-
 int main(void)
 {
     dc_log_init(DC_LOG_DEBUG);
@@ -140,40 +151,42 @@ int main(void)
         dc_warn("no outputs found; nothing to display");
 
     dc_control_center *control_center = dc_control_center_create(wl, &egl, &render);
+    dc_osd *osd = dc_osd_create(wl, &egl, &render);
     struct click_ctx cctx = {.set = &set, .control_center = control_center};
+    struct tick_ctx tick = {.set = &set, .osd = osd, .wl = wl};
 
     g_loop = dc_loop_create();
     dc_wayland_integrate(wl, g_loop);
     dc_niri_integrate(niri, g_loop);
     dc_niri_set_changed_cb(niri, niri_changed, &set);
     dc_wayland_set_click_cb(wl, handle_bar_click, &cctx);
-    dc_dbus_integrate(dbus, g_loop);
+dc_dbus_integrate(dbus, g_loop);
+dc_osd_integrate(osd, g_loop);
 
-    int clock_fd = create_clock_timer();
-    if (clock_fd >= 0)
-        dc_loop_add_fd(g_loop, clock_fd, POLLIN, clock_tick, &set);
+    dc_loop_set_tick(g_loop, clock_tick, &tick, 1000);
 
     struct sigaction sa = {.sa_handler = handle_signal};
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGCHLD, SIG_IGN); /* auto-reap detached action processes */
 
-    /* TEMP(verify): auto-open the control center to screenshot it. */
-    if (getenv("DANKC_CC_DEMO")) {
+    /* TEMP(verify): auto-open a popup to screenshot it. */
+    if (getenv("DANKC_CC_DEMO") || getenv("DANKC_OSD_DEMO")) {
         dc_output *first = NULL;
         wl_list_for_each(first, &wl->outputs, link) {
             break;
         }
-        if (first)
+        if (first && getenv("DANKC_CC_DEMO"))
             dc_control_center_toggle(control_center, first);
+        if (first && getenv("DANKC_OSD_DEMO"))
+            dc_osd_show_volume(osd, first, 55, false);
     }
 
     dc_info("entering event loop (%d bar%s)", set.count, set.count == 1 ? "" : "s");
     dc_loop_run(g_loop);
 
     dc_info("shutting down");
-    if (clock_fd >= 0)
-        close(clock_fd);
+    dc_osd_destroy(osd);
     dc_control_center_destroy(control_center);
     for (int i = 0; i < set.count; i++)
         dc_bar_destroy(set.bars[i]);

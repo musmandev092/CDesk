@@ -311,10 +311,24 @@ static void wayland_prepare(void *data)
 static void wayland_readable(int fd, uint32_t revents, void *data)
 {
     dc_wayland *wl = data;
+    struct wl_display *display = wl->display;
     DC_UNUSED(fd);
     DC_UNUSED(revents);
-    if (wl_display_dispatch(wl->display) < 0)
-        dc_error("wl_display_dispatch failed; compositor gone?");
+
+    /* Mesa's gallium worker threads share this wl_display and race to drain the
+     * display fd. The blocking wl_display_dispatch() therefore deadlocks in
+     * ppoll() when a worker has already consumed the data we polled on. Use the
+     * thread-safe prepare_read / read_events pattern, which coordinates all
+     * readers and never blocks the loop. */
+    while (wl_display_prepare_read(display) != 0)
+        wl_display_dispatch_pending(display);
+    wl_display_flush(display);
+    if (wl_display_read_events(display) < 0) {
+        dc_error("wl_display_read_events failed; compositor gone?");
+        return;
+    }
+    if (wl_display_dispatch_pending(display) < 0)
+        dc_error("wl_display_dispatch_pending failed; compositor gone?");
 }
 
 void dc_wayland_set_click_cb(dc_wayland *wl, dc_click_cb cb, void *user_data)

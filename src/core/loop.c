@@ -4,7 +4,9 @@
 #include <errno.h>
 #include <poll.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #define DC_LOOP_MAX_FDS 64
 #define DC_LOOP_MAX_PREPARE 8
@@ -23,6 +25,9 @@ struct dc_loop {
     dc_prepare_cb prepares[DC_LOOP_MAX_PREPARE];
     void *prepare_data[DC_LOOP_MAX_PREPARE];
     int prepare_count;
+    dc_tick_cb tick_cb;
+    void *tick_data;
+    int tick_interval_ms;
 };
 
 dc_loop *dc_loop_create(void)
@@ -82,14 +87,38 @@ void dc_loop_set_prepare(dc_loop *loop, dc_prepare_cb cb, void *user_data)
     dc_loop_add_prepare(loop, cb, user_data);
 }
 
+void dc_loop_set_tick(dc_loop *loop, dc_tick_cb cb, void *user_data, int interval_ms)
+{
+    loop->tick_cb = cb;
+    loop->tick_data = user_data;
+    loop->tick_interval_ms = interval_ms;
+}
+
+static long ms_since(const struct timespec *from)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - from->tv_sec) * 1000 + (now.tv_nsec - from->tv_nsec) / 1000000;
+}
+
 void dc_loop_run(dc_loop *loop)
 {
     loop->running = true;
+    struct timespec last_tick;
+    clock_gettime(CLOCK_MONOTONIC, &last_tick);
+
     while (loop->running) {
         for (int i = 0; i < loop->prepare_count; i++)
             loop->prepares[i](loop->prepare_data[i]);
 
-        int n = poll(loop->fds, loop->count, -1);
+        /* Block until an fd is ready or the next tick is due. */
+        int timeout = -1;
+        if (loop->tick_cb) {
+            long remaining = loop->tick_interval_ms - ms_since(&last_tick);
+            timeout = remaining < 0 ? 0 : (int)remaining;
+        }
+
+        int n = poll(loop->fds, loop->count, timeout);
         if (n < 0) {
             if (errno == EINTR)
                 continue;
@@ -97,7 +126,6 @@ void dc_loop_run(dc_loop *loop)
             break;
         }
 
-        /* Snapshot revents: callbacks may add/remove sources mid-iteration. */
         for (int i = 0; i < loop->count && n > 0; i++) {
             uint32_t revents = loop->fds[i].revents;
             if (revents == 0)
@@ -105,6 +133,11 @@ void dc_loop_run(dc_loop *loop)
             n--;
             loop->fds[i].revents = 0;
             loop->sources[i].cb(loop->sources[i].fd, revents, loop->sources[i].user_data);
+        }
+
+        if (loop->tick_cb && ms_since(&last_tick) >= loop->tick_interval_ms) {
+            loop->tick_cb(loop->tick_data);
+            clock_gettime(CLOCK_MONOTONIC, &last_tick);
         }
     }
 }
