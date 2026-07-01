@@ -27,7 +27,8 @@ PROTO_H   := $(patsubst protocol/%.xml,protocol/generated/%-client-protocol.h,$(
 PROTO_C   := $(patsubst protocol/%.xml,protocol/generated/%-protocol.c,$(PROTO_XML))
 PROTO_O   := $(PROTO_C:.c=.o)
 
-SRC := $(wildcard src/*.c src/core/*.c src/wayland/*.c src/render/*.c src/ui/bar/*.c src/niri/*.c)
+SRC := $(wildcard src/*.c src/core/*.c src/wayland/*.c src/render/*.c src/ui/*.c src/ui/bar/*.c \
+	src/services/*.c src/niri/*.c src/theme/*.c src/ipc/*.c)
 OBJ := $(SRC:.c=.o)
 
 TP_SRC := third_party/nanovg/nanovg.c third_party/nanovg/nanovg_gl_impl.c third_party/cjson/cJSON.c

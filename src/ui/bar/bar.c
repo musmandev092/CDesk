@@ -4,6 +4,7 @@
 #include "dc.h"
 #include "niri/niri.h"
 #include "render/nvg.h"
+#include "services/battery.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
@@ -170,6 +171,61 @@ static void draw_clock(dc_bar *bar)
     nvgText(vg, bar->logical_width / 2.0f, bar->logical_height / 2.0f, text, NULL);
 }
 
+/* Battery indicator (vector pictograph + percentage), right-aligned. */
+static void draw_battery(dc_bar *bar)
+{
+    dc_battery_info bat;
+    if (!dc_battery_read(&bat) || !bat.present)
+        return;
+
+    NVGcontext *vg = bar->render->vg;
+    const float pad = 12.0f;
+    const float cy = bar->logical_height / 2.0f;
+    const bool low = bat.percent <= 20 && !bat.charging;
+
+    const NVGcolor text_color = low ? nvgRGB(0xf2, 0xb8, 0xb5) : nvgRGB(0xe6, 0xe0, 0xe9);
+    const NVGcolor fill_color = bat.charging ? nvgRGB(0x4c, 0xaf, 0x50) : text_color;
+    const NVGcolor outline = nvgRGBA(0xe6, 0xe0, 0xe9, 180);
+
+    char label[8];
+    snprintf(label, sizeof(label), "%d%%", bat.percent);
+
+    nvgFontFaceId(vg, bar->render->font_ui);
+    nvgFontSize(vg, 14.0f);
+    nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
+    nvgFillColor(vg, text_color);
+    const float text_right = bar->logical_width - pad;
+    nvgText(vg, text_right, cy, label, NULL);
+
+    float bounds[4];
+    nvgTextBounds(vg, text_right, cy, label, NULL, bounds);
+    const float text_width = bounds[2] - bounds[0];
+
+    /* Pictograph: rounded body + terminal nub + proportional fill. */
+    const float body_w = 22.0f, body_h = 11.0f, nub_w = 2.0f, nub_h = 5.0f, inset = 2.0f;
+    const float bx = text_right - text_width - 8.0f - body_w;
+    const float by = cy - body_h / 2.0f;
+
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, bx, by, body_w, body_h, 2.5f);
+    nvgStrokeColor(vg, outline);
+    nvgStrokeWidth(vg, 1.5f);
+    nvgStroke(vg);
+
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, bx + body_w, cy - nub_h / 2.0f, nub_w, nub_h, 1.0f);
+    nvgFillColor(vg, outline);
+    nvgFill(vg);
+
+    const float fill_w = (body_w - 2.0f * inset) * (bat.percent / 100.0f);
+    if (fill_w > 0.5f) {
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, bx + inset, by + inset, fill_w, body_h - 2.0f * inset, 1.0f);
+        nvgFillColor(vg, fill_color);
+        nvgFill(vg);
+    }
+}
+
 void dc_bar_render(dc_bar *bar)
 {
     if (!bar->configured || bar->phys_width <= 0)
@@ -202,6 +258,7 @@ void dc_bar_render(dc_bar *bar)
     float workspaces_end = draw_workspaces(bar);
     draw_focused_window(bar, workspaces_end);
     draw_clock(bar);
+    draw_battery(bar);
     nvgEndFrame(bar->render->vg);
 
     dc_egl_swap(bar->egl, &bar->egl_window);
