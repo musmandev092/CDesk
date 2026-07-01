@@ -6,6 +6,7 @@
 #include "render/icons.h"
 #include "render/nvg.h"
 #include "services/battery.h"
+#include "services/icons.h"
 #include "theme/theme.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
@@ -51,6 +52,10 @@ struct dc_bar {
     struct wp_fractional_scale_v1 *fractional_scale;
     struct wp_viewport *viewport;
     dc_egl_window egl_window;
+
+    /* Focused-app icon cache (avoids re-decoding every frame). */
+    char icon_app_id[64];
+    int icon_image; /* nanovg image handle, 0 = none */
 
     int logical_width;  /* from the layer-surface configure */
     int logical_height;
@@ -165,7 +170,33 @@ static void draw_focused_window(dc_bar *bar, float start_x)
         return;
 
     NVGcontext *vg = bar->render->vg;
-    const float x = start_x + 8.0f;
+    const float cy = bar->logical_height / 2.0f;
+    float x = start_x + 8.0f;
+
+    /* Refresh the cached app icon only when the focused app changes. */
+    if (strcmp(win->app_id, bar->icon_app_id) != 0) {
+        if (bar->icon_image > 0)
+            nvgDeleteImage(vg, bar->icon_image);
+        bar->icon_image = 0;
+        char *path = dc_icon_resolve(win->app_id, 24, 0);
+        if (path) {
+            bar->icon_image = nvgCreateImage(vg, path, 0);
+            free(path);
+        }
+        snprintf(bar->icon_app_id, sizeof(bar->icon_app_id), "%s", win->app_id);
+    }
+
+    if (bar->icon_image > 0) {
+        const float isz = 20.0f;
+        NVGpaint pat =
+            nvgImagePattern(vg, x, cy - isz / 2.0f, isz, isz, 0.0f, bar->icon_image, 1.0f);
+        nvgBeginPath(vg);
+        nvgRect(vg, x, cy - isz / 2.0f, isz, isz);
+        nvgFillPaint(vg, pat);
+        nvgFill(vg);
+        x += isz + 8.0f;
+    }
+
     const float max_x = bar->logical_width / 2.0f - 48.0f; /* keep clear of the clock */
     const float avail = max_x - x;
     if (avail < 40.0f)
@@ -177,7 +208,7 @@ static void draw_focused_window(dc_bar *bar, float start_x)
     nvgFontSize(vg, 14.0f);
     nvgFillColor(vg, tc(dc_theme_current->surface_text));
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
-    nvgText(vg, x, bar->logical_height / 2.0f, label, NULL);
+    nvgText(vg, x, cy, label, NULL);
     nvgRestore(vg);
 }
 
