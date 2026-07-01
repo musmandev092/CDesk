@@ -8,19 +8,22 @@ A lightweight desktop shell for the **niri** Wayland compositor, written in C �
 DankMaterialShell's core (QML/Quickshell + Go) as one native binary. Full spec in `docs/` (00–11).
 niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
 
-## Current status — Milestone 1 complete ✅
-- **Builds clean** (gcc + wayland-scanner, `make` → `./bin/dankc`, ~85 KB, zero warnings).
-- **Runs on niri**: connects via Wayland, binds globals, brings up EGL/GLES3, places a top-anchored
-  layer-shell bar (`dankc:bar`, 48px, exclusive zone) on every output, rendering the themed
-  surfaceContainer background. Verified live on a dual-monitor setup (external 2560@1x + internal HiDPI
-  @2x).
-- **Footprint:** Pss ≈ **23 MB** (Private 8 MB) for two GPU bars, vs DMS `qs` Pss ≈ 477 MB. Goal met.
+## Current status — Milestone 2 in progress 🔨 (clock + workspaces working)
+- **Builds clean** (gcc + wayland-scanner, `make` → `./bin/dankc`, ~1.2 MB with nanovg, zero warnings).
+- **Runs on niri**: layer-shell bar per output rendering via **nanovg** — themed surfaceContainer
+  background + centered **live clock** (HH:MM, timerfd) + left-aligned **workspace pills** from the
+  **niri IPC EventStream** (per-output filtered, focused=primary/urgent=error). Verified live on a
+  dual-monitor setup (external 2560@1x "P24q-10" + internal HiDPI@2x "0x0599").
+- **Footprint:** Pss ≈ **30 MB** for two GPU bars, vs DMS `qs` Pss ≈ 477 MB.
+- Vendored: nanovg (GLES3, `third_party/nanovg`), cJSON (`third_party/cjson`); Inter bundled
+  (`assets/fonts/InterVariable.ttf`).
 
 ## Milestones (see docs/06-ROADMAP.md)
-- M0 core loop/log — done. M1 hello bar — done. **Next: M2** (text via Pango/HarfBuzz, widget toolkit,
-  nanovg, animation engine + DMS duration table, niri IPC EventStream, Material color engine → real bar
-  with clock + workspaces). Then M3 services, M4 panels, M5 lock/clipboard/screenshot, M6 theming/settings,
-  M7 plugins, M8 packaging.
+- M0 core, M1 hello bar — done. **M2 in progress:** nanovg text ✅, live clock ✅, niri workspaces ✅.
+  Remaining M2: more bar widgets (focused window, battery/media/tray placeholders), the animation engine
+  (DMS duration table), the Material color engine (C++ MCU), and proper HiDPI. Then M3 services (sd-bus:
+  audio/network/battery/…), M4 panels, M5 lock/clipboard/screenshot, M6 theming/settings, M7 plugins,
+  M8 packaging.
 
 ## Known follow-ups (address in M2)
 - **HiDPI:** bar currently renders buffer_scale=1 (blurry on the scale-2 internal panel). Implement
