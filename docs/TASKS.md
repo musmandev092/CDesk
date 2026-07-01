@@ -41,10 +41,11 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
 - [ ] **T6 App-icon resolution (XDG icon theme).** New src/services/icons.c: resolve a .desktop/app_id
   or tray IconName to a file via the icon theme (index.theme lookup), decode with stb_image/nanosvg,
   cache as an nvg image. Used by launcher/dock/tray/focused-app.
-- [ ] **T7 Right status cluster (icons).** Draw the DMS right-side icons using Material Symbols: network/
-  wifi, bluetooth, volume, notifications, battery(icon form). State can be static/placeholder until the
-  sd-bus services land (T10+); shape/placement must match DMS now.
-- [ ] **T8 CPU + RAM widgets** from /proc (src/services/sysmon.c) — like DMS cpuUsage/memUsage.
+- [x] **T7 Right status cluster (icons).** Matches DMS exactly: signal, clipboard, notification, battery+%,
+  wifi, bluetooth, volume — same order + colours. State static until M3 services drive it (notification
+  red-dot, real wifi/bt/volume state). Verified vs a 2x crop of the DMS reference.
+- [x] **T8 CPU + RAM widgets** — NOT NEEDED. The user's DMS bar right side is icon-only (no CPU/RAM text
+  widgets), confirmed from the reference crop. Skipped to stay faithful.
 - [ ] **T9 Animation engine.** src/render/anim.c: tween + easing + the DMS duration table
   (docs/02-RENDERING §8). Animate workspace focus + widget hover.
 
