@@ -4,6 +4,7 @@
  * themed bar with a live clock on every output. Later milestones add services,
  * more widgets, and the rest of the shell (see docs/06-ROADMAP.md).
  */
+#include "core/config.h"
 #include "core/log.h"
 #include "core/loop.h"
 #include "dc.h"
@@ -150,6 +151,7 @@ int main(void)
     dc_log_init(DC_LOG_DEBUG);
     dc_info("DankC %s starting", DC_VERSION);
     dc_theme_init();
+    dc_config_load();
 
     dc_wayland *wl = dc_wayland_connect();
     if (!wl)

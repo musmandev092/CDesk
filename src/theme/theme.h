@@ -8,6 +8,7 @@
 #ifndef DC_THEME_THEME_H
 #define DC_THEME_THEME_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 typedef struct dc_color {
@@ -40,8 +41,17 @@ typedef struct dc_theme {
 /* The active theme. Read-only for widgets; owned by the theme module. */
 extern const dc_theme *dc_theme_current;
 
-/* Select the built-in "green" palette (default). Later replaced by the color
- * engine. Safe to call before rendering starts. */
+/* Select the default palette ("green"). Safe to call before rendering starts. */
 void dc_theme_init(void);
+
+/* Switch to the built-in palette with the given id (e.g. "blue", "green",
+ * "monochrome"). Falls back to the default if `id` is unknown. Returns true iff
+ * the requested id matched a known theme. */
+bool dc_theme_set(const char *id);
+
+/* Enumerate the built-in palettes (for config/settings UI). */
+int dc_theme_count(void);
+const char *dc_theme_id_at(int index);
+const char *dc_theme_name_at(int index);
 
 #endif /* DC_THEME_THEME_H */

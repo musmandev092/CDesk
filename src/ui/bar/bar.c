@@ -1,5 +1,6 @@
 #include "ui/bar/bar.h"
 
+#include "core/config.h"
 #include "core/log.h"
 #include "dc.h"
 #include "niri/niri.h"
@@ -238,9 +239,10 @@ static float draw_clock(dc_bar *bar)
     struct tm tm;
     localtime_r(&now, &tm);
 
+    const dc_config *cfg = dc_config_current;
     char time_str[16];
     char date_str[32];
-    strftime(time_str, sizeof(time_str), "%H:%M", &tm); /* TODO(config): 12h when !use24HourClock */
+    strftime(time_str, sizeof(time_str), cfg->clock_24h ? "%H:%M" : "%-I:%M %p", &tm);
     strftime(date_str, sizeof(date_str), "%a %-d", &tm); /* e.g. "Wed 1" */
 
     const float gap = 10.0f;
@@ -250,20 +252,25 @@ static float draw_clock(dc_bar *bar)
     nvgFontSize(vg, 14.0f);
     nvgTextBounds(vg, 0.0f, 0.0f, time_str, NULL, bounds);
     const float time_w = bounds[2] - bounds[0];
-    nvgFontSize(vg, 13.0f);
-    nvgTextBounds(vg, 0.0f, 0.0f, date_str, NULL, bounds);
-    const float date_w = bounds[2] - bounds[0];
+    float date_w = 0.0f;
+    if (cfg->show_date) {
+        nvgFontSize(vg, 13.0f);
+        nvgTextBounds(vg, 0.0f, 0.0f, date_str, NULL, bounds);
+        date_w = bounds[2] - bounds[0];
+    }
 
-    const float total = time_w + gap + date_w;
+    const float total = cfg->show_date ? time_w + gap + date_w : time_w;
     const float x = bar->logical_width / 2.0f - total / 2.0f;
 
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
     nvgFontSize(vg, 14.0f);
     nvgFillColor(vg, tc(t->surface_text));
     nvgText(vg, x, cy, time_str, NULL);
-    nvgFontSize(vg, 13.0f);
-    nvgFillColor(vg, tc(t->surface_variant_text));
-    nvgText(vg, x + time_w + gap, cy, date_str, NULL);
+    if (cfg->show_date) {
+        nvgFontSize(vg, 13.0f);
+        nvgFillColor(vg, tc(t->surface_variant_text));
+        nvgText(vg, x + time_w + gap, cy, date_str, NULL);
+    }
     return x;
 }
 
