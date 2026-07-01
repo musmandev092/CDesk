@@ -9,9 +9,17 @@ WAYLAND_SCANNER ?= wayland-scanner
 PKGS := wayland-client wayland-egl egl glesv2
 
 WARNINGS := -Wall -Wextra -Wshadow -Wvla -Wpointer-arith -Wno-unused-parameter
+INCLUDES := -Isrc -Iprotocol/generated -Ithird_party/nanovg -Ithird_party/cjson
+BASE_CFLAGS := -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE $(INCLUDES) \
+	$(shell $(PKG_CONFIG) --cflags $(PKGS))
+
 CFLAGS   ?= -O2 -g
-CFLAGS   += -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
-CFLAGS   += $(WARNINGS) -Isrc -Iprotocol/generated $(shell $(PKG_CONFIG) --cflags $(PKGS))
+CFLAGS   += $(BASE_CFLAGS) $(WARNINGS)
+
+# Vendored third-party code (nanovg, cJSON): compile with warnings suppressed so
+# our own -Wextra output stays meaningful.
+TP_CFLAGS := -O2 -g $(BASE_CFLAGS) -w
+
 LDLIBS   += $(shell $(PKG_CONFIG) --libs $(PKGS)) -lm
 
 PROTO_XML := $(wildcard protocol/*.xml)
@@ -19,14 +27,17 @@ PROTO_H   := $(patsubst protocol/%.xml,protocol/generated/%-client-protocol.h,$(
 PROTO_C   := $(patsubst protocol/%.xml,protocol/generated/%-protocol.c,$(PROTO_XML))
 PROTO_O   := $(PROTO_C:.c=.o)
 
-SRC := $(wildcard src/*.c src/core/*.c src/wayland/*.c src/ui/bar/*.c)
+SRC := $(wildcard src/*.c src/core/*.c src/wayland/*.c src/render/*.c src/ui/bar/*.c src/niri/*.c)
 OBJ := $(SRC:.c=.o)
+
+TP_SRC := third_party/nanovg/nanovg.c third_party/nanovg/nanovg_gl_impl.c third_party/cjson/cJSON.c
+TP_OBJ := $(TP_SRC:.c=.o)
 
 BIN := bin/dankc
 
 all: $(BIN)
 
-$(BIN): $(OBJ) $(PROTO_O)
+$(BIN): $(OBJ) $(TP_OBJ) $(PROTO_O)
 	@mkdir -p bin
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -39,13 +50,17 @@ protocol/generated/%-protocol.c: protocol/%.xml
 	@mkdir -p protocol/generated
 	$(WAYLAND_SCANNER) private-code $< $@
 
-# All translation units need the generated client headers present first.
+# All first-party translation units need the generated client headers first.
 $(OBJ): $(PROTO_H)
+
+# Vendored code: relaxed warnings.
+$(TP_OBJ): %.o: %.c
+	$(CC) $(TP_CFLAGS) -c -o $@ $<
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -rf bin protocol/generated $(OBJ) $(PROTO_O)
+	rm -rf bin protocol/generated $(OBJ) $(TP_OBJ) $(PROTO_O)
 
 .PHONY: all clean

@@ -2,19 +2,22 @@
 
 #include "core/log.h"
 #include "dc.h"
+#include "render/nvg.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
 #include <GLES2/gl2.h>
 #include <stdlib.h>
+#include <time.h>
 
+#include "nanovg.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 
 /* Reference bar height in logical pixels (docs/10-DESIGN-SYSTEM.md). */
 #define DC_BAR_HEIGHT 48
 
-/* Stock "purple" surfaceContainer #211f24 — the themed bar background until the
- * Material color engine lands (Milestone 2). */
+/* Stock "purple" palette until the Material color engine lands (Milestone 2+):
+ * surfaceContainer #211f24 background, surfaceText #e6e0e9 foreground. */
 #define DC_BAR_BG_R (0x21 / 255.0f)
 #define DC_BAR_BG_G (0x1f / 255.0f)
 #define DC_BAR_BG_B (0x24 / 255.0f)
@@ -23,6 +26,7 @@ struct dc_bar {
     dc_wayland *wl;
     dc_output *output;
     dc_egl *egl;
+    dc_render *render;
 
     struct wl_surface *surface;
     struct zwlr_layer_surface_v1 *layer_surface;
@@ -30,11 +34,32 @@ struct dc_bar {
 
     int width;
     int height;
+    bool configured;
     bool egl_ready;
 };
 
-static void bar_render(dc_bar *bar)
+static void draw_clock(dc_bar *bar)
 {
+    NVGcontext *vg = bar->render->vg;
+
+    char text[16];
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    strftime(text, sizeof(text), "%H:%M", &tm);
+
+    nvgFontFaceId(vg, bar->render->font_ui);
+    nvgFontSize(vg, 15.0f);
+    nvgFillColor(vg, nvgRGB(0xe6, 0xe0, 0xe9));
+    nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+    nvgText(vg, bar->width / 2.0f, bar->height / 2.0f, text, NULL);
+}
+
+void dc_bar_render(dc_bar *bar)
+{
+    if (!bar->configured)
+        return;
+
     if (!bar->egl_ready) {
         if (!dc_egl_window_init(&bar->egl_window, bar->egl, bar->surface, bar->width, bar->height))
             return;
@@ -45,10 +70,18 @@ static void bar_render(dc_bar *bar)
 
     if (!dc_egl_make_current(bar->egl, &bar->egl_window))
         return;
+    if (!dc_render_ensure(bar->render))
+        return;
 
     glViewport(0, 0, bar->width, bar->height);
     glClearColor(DC_BAR_BG_R, DC_BAR_BG_G, DC_BAR_BG_B, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
+    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+
+    /* TODO(hidpi): pass the real fractional scale as the pixel ratio (M2). */
+    nvgBeginFrame(bar->render->vg, bar->width, bar->height, 1.0f);
+    draw_clock(bar);
+    nvgEndFrame(bar->render->vg);
+
     dc_egl_swap(bar->egl, &bar->egl_window);
 }
 
@@ -62,9 +95,10 @@ static void layer_surface_handle_configure(void *data, struct zwlr_layer_surface
 
     bar->width = width > 0 ? (int)width : bar->width;
     bar->height = height > 0 ? (int)height : DC_BAR_HEIGHT;
+    bar->configured = true;
     dc_debug("bar configured: %dx%d on %s", bar->width, bar->height,
              bar->output->model ? bar->output->model : "?");
-    bar_render(bar);
+    dc_bar_render(bar);
 }
 
 static void layer_surface_handle_closed(void *data, struct zwlr_layer_surface_v1 *surface)
@@ -72,6 +106,7 @@ static void layer_surface_handle_closed(void *data, struct zwlr_layer_surface_v1
     dc_bar *bar = data;
     DC_UNUSED(surface);
     dc_debug("bar surface closed by compositor");
+    bar->configured = false;
     bar->egl_ready = false;
 }
 
@@ -80,12 +115,13 @@ static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
     .closed = layer_surface_handle_closed,
 };
 
-dc_bar *dc_bar_create(dc_wayland *wl, dc_output *output, dc_egl *egl)
+dc_bar *dc_bar_create(dc_wayland *wl, dc_output *output, dc_egl *egl, dc_render *render)
 {
     dc_bar *bar = calloc(1, sizeof(*bar));
     bar->wl = wl;
     bar->output = output;
     bar->egl = egl;
+    bar->render = render;
     bar->height = DC_BAR_HEIGHT;
 
     bar->surface = wl_compositor_create_surface(wl->compositor);
