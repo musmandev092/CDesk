@@ -13,6 +13,7 @@
 #include "services/dbus.h"
 #include "services/audio.h"
 #include "services/mpris.h"
+#include "services/notifications.h"
 #include "theme/theme.h"
 #include "ui/bar/bar.h"
 #include "ui/controlcenter.h"
@@ -52,6 +53,7 @@ struct tick_ctx {
     struct bar_set *set;
     dc_osd *osd;
     dc_wayland *wl;
+    dc_notifications *notifications;
     int last_volume;
     bool last_muted;
     bool have_last;
@@ -62,6 +64,7 @@ struct tick_ctx {
 static void clock_tick(void *data)
 {
     struct tick_ctx *ctx = data;
+    dc_notifications_tick(ctx->notifications);
     render_all(ctx->set);
 
     dc_audio_info audio;
@@ -136,6 +139,7 @@ int main(void)
     dc_dbus *dbus = dc_dbus_connect();
     dc_bluez_init(dbus);
     dc_mpris_init(dbus);
+    dc_notifications *notifications = dc_notifications_create(dbus);
 
     dc_render render = {0};
     struct bar_set set = {0};
@@ -153,7 +157,7 @@ int main(void)
     dc_control_center *control_center = dc_control_center_create(wl, &egl, &render);
     dc_osd *osd = dc_osd_create(wl, &egl, &render);
     struct click_ctx cctx = {.set = &set, .control_center = control_center};
-    struct tick_ctx tick = {.set = &set, .osd = osd, .wl = wl};
+    struct tick_ctx tick = {.set = &set, .osd = osd, .wl = wl, .notifications = notifications};
 
     g_loop = dc_loop_create();
     dc_wayland_integrate(wl, g_loop);
@@ -186,6 +190,7 @@ dc_osd_integrate(osd, g_loop);
     dc_loop_run(g_loop);
 
     dc_info("shutting down");
+    dc_notifications_destroy(notifications);
     dc_osd_destroy(osd);
     dc_control_center_destroy(control_center);
     for (int i = 0; i < set.count; i++)
