@@ -34,8 +34,8 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
   PILL + grey dots (not numbered squares), sorted by idx — reworked to match.
 - [x] **T3 Widget pill containers.** NOT NEEDED — comparing cropped bar strips shows DMS's bar is FLAT
   (widgets sit directly on #1d211b, no per-widget pill backgrounds). Skipped by design.
-- [ ] **T4 Clock + date + format.** Match DMS: time (respect `use24HourClock`), plus date "Wed 1" segment;
-  read format from settings.json if present. Center section.
+- [x] **T4 Clock + date.** Center shows "HH:MM  Www D" (24h time + date), centered as a group, matching
+  DMS. Weather segment deferred to the weather/geolocation service. TODO: honour 12h when !use24HourClock.
 - [ ] **T5 Focused app: icon + name.** Show the app icon (needs T6) + app name/title like DMS
   ("Alacritty · <title>"). Until icons: app_id + title, styled like DMS.
 - [ ] **T6 App-icon resolution (XDG icon theme).** New src/services/icons.c: resolve a .desktop/app_id
