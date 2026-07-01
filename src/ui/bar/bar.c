@@ -73,18 +73,27 @@ static void recompute_physical(dc_bar *bar)
     bar->phys_height = (bar->logical_height * bar->scale120 + DC_SCALE_BASE / 2) / DC_SCALE_BASE;
 }
 
-/* Workspace pills, left-aligned, filtered to this bar's output. Logical coords.
- * Returns the x coordinate just past the last pill. */
-static float draw_workspaces(dc_bar *bar)
+/* Apps-grid launcher icon at the far left (like DMS). Returns the x past it. */
+static float draw_launcher(dc_bar *bar)
 {
-    const float pad = 12.0f; /* spacingM */
+    const float pad = 12.0f;
+    const float size = 22.0f;
+    dc_render_icon(bar->render, DC_ICON_APPS, pad, bar->logical_height / 2.0f, size,
+                   dc_theme_current->surface_text, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+    return pad + size + 10.0f;
+}
+
+/* Workspace pills, filtered to this bar's output, starting at `start_x`.
+ * Returns the x coordinate just past the last pill. */
+static float draw_workspaces(dc_bar *bar, float start_x)
+{
     if (!bar->niri)
-        return pad;
+        return start_x;
 
     int count = 0;
     const dc_niri_workspace *workspaces = dc_niri_workspaces(bar->niri, &count);
     if (!workspaces)
-        return pad;
+        return start_x;
 
     NVGcontext *vg = bar->render->vg;
     const dc_theme *t = dc_theme_current;
@@ -93,7 +102,7 @@ static float draw_workspaces(dc_bar *bar)
     const float dot = 9.0f;         /* inactive workspace dot diameter */
     const float pill_w = 30.0f;     /* focused workspace pill */
     const float pill_h = 11.0f;
-    float x = pad;
+    float x = start_x;
 
     /* DMS style: focused = wide primary pill, others = dots (brighter if the
      * active/visible workspace on their output). */
@@ -370,7 +379,8 @@ void dc_bar_render(dc_bar *bar)
 
     float pixel_ratio = (float)bar->scale120 / DC_SCALE_BASE;
     nvgBeginFrame(bar->render->vg, bar->logical_width, bar->logical_height, pixel_ratio);
-    float workspaces_end = draw_workspaces(bar);
+    float launcher_end = draw_launcher(bar);
+    float workspaces_end = draw_workspaces(bar, launcher_end);
     draw_focused_window(bar, workspaces_end);
     draw_clock(bar);
     draw_right_cluster(bar);
