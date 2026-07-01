@@ -38,9 +38,9 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
   DMS. Weather segment deferred to the weather/geolocation service. TODO: honour 12h when !use24HourClock.
 - [x] **T5 Focused app: name (text).** Shows "AppName · Title" (pretty name from app_id) like DMS. The
   app ICON still needs T6 (icon-theme resolution). Minor: some titles carry a stray glyph — strip later.
-- [ ] **T6 App-icon resolution (XDG icon theme).** New src/services/icons.c: resolve a .desktop/app_id
-  or tray IconName to a file via the icon theme (index.theme lookup), decode with stb_image/nanosvg,
-  cache as an nvg image. Used by launcher/dock/tray/focused-app.
+- [x] **T6 App-icon resolution (XDG icon theme).** src/services/icons.c resolves app_id -> .desktop Icon=
+  -> PNG file (icon-theme dirs + hicolor + pixmaps); bar decodes via nanovg/stb_image + caches per app.
+  PNG works; SVG-only icons (Alacritty etc.) need nanosvg — FOLLOW-UP: vendor nanosvg for SVG icons.
 - [x] **T7 Right status cluster (icons).** Matches DMS exactly: signal, clipboard, notification, battery+%,
   wifi, bluetooth, volume — same order + colours. State static until M3 services drive it (notification
   red-dot, real wifi/bt/volume state). Verified vs a 2x crop of the DMS reference.
