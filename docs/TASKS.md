@@ -29,11 +29,11 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
   `src/render/icons.h`. NOTE: the 14MB Material Symbols *variable* font segfaults stb_truetype (nanovg),
   so we bundled the *static* Material Icons Round (legacy codepoints match the common icons). For full
   variable-font + FILL/wght-axis fidelity later, render icons via the FreeType glyph path (docs/02 §5).
-- [ ] **T2 Exact bar background.** Sample DMS's bar pixel colour (compare screenshots) and match the
-  bar's background + transparency (DMS uses surfaceContainer w/ panelTransparency 0.85). Verify.
-- [ ] **T3 Widget pill containers.** DMS groups bar widgets in rounded surfaceContainer pills with
-  padding (docs/10). Wrap clock, battery, etc. in pill backgrounds matching DMS shape/radius (cornerRadius
-  12) and spacing (4/8/12).
+- [x] **T2 Exact bar background.** Verified: DMS bar bg is surfaceContainer #1d211b, OPAQUE (user's bar
+  transparency = 1) — already exactly what DankC renders. Also fixed: DMS workspaces are a green focused
+  PILL + grey dots (not numbered squares), sorted by idx — reworked to match.
+- [x] **T3 Widget pill containers.** NOT NEEDED — comparing cropped bar strips shows DMS's bar is FLAT
+  (widgets sit directly on #1d211b, no per-widget pill backgrounds). Skipped by design.
 - [ ] **T4 Clock + date + format.** Match DMS: time (respect `use24HourClock`), plus date "Wed 1" segment;
   read format from settings.json if present. Center section.
 - [ ] **T5 Focused app: icon + name.** Show the app icon (needs T6) + app name/title like DMS
