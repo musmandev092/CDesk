@@ -164,21 +164,44 @@ static void draw_focused_window(dc_bar *bar, float start_x)
     nvgRestore(vg);
 }
 
+/* Center cluster: "HH:MM  Www D", matching DMS (weather is a separate widget,
+ * added once the weather service lands). Honours use24HourClock. */
 static void draw_clock(dc_bar *bar)
 {
     NVGcontext *vg = bar->render->vg;
+    const dc_theme *t = dc_theme_current;
+    const float cy = bar->logical_height / 2.0f;
 
-    char text[16];
     time_t now = time(NULL);
     struct tm tm;
     localtime_r(&now, &tm);
-    strftime(text, sizeof(text), "%H:%M", &tm);
+
+    char time_str[16];
+    char date_str[32];
+    strftime(time_str, sizeof(time_str), "%H:%M", &tm); /* TODO(config): 12h when !use24HourClock */
+    strftime(date_str, sizeof(date_str), "%a %-d", &tm); /* e.g. "Wed 1" */
+
+    const float gap = 10.0f;
+    float bounds[4];
 
     nvgFontFaceId(vg, bar->render->font_ui);
-    nvgFontSize(vg, 15.0f);
-    nvgFillColor(vg, tc(dc_theme_current->surface_text));
-    nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
-    nvgText(vg, bar->logical_width / 2.0f, bar->logical_height / 2.0f, text, NULL);
+    nvgFontSize(vg, 14.0f);
+    nvgTextBounds(vg, 0.0f, 0.0f, time_str, NULL, bounds);
+    const float time_w = bounds[2] - bounds[0];
+    nvgFontSize(vg, 13.0f);
+    nvgTextBounds(vg, 0.0f, 0.0f, date_str, NULL, bounds);
+    const float date_w = bounds[2] - bounds[0];
+
+    const float total = time_w + gap + date_w;
+    const float x = bar->logical_width / 2.0f - total / 2.0f;
+
+    nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+    nvgFontSize(vg, 14.0f);
+    nvgFillColor(vg, tc(t->surface_text));
+    nvgText(vg, x, cy, time_str, NULL);
+    nvgFontSize(vg, 13.0f);
+    nvgFillColor(vg, tc(t->surface_variant_text));
+    nvgText(vg, x + time_w + gap, cy, date_str, NULL);
 }
 
 /* Battery indicator (vector pictograph + percentage), right-aligned. Returns
