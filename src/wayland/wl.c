@@ -60,9 +60,10 @@ static void output_handle_done(void *data, struct wl_output *o)
 
 static void output_handle_name(void *data, struct wl_output *o, const char *name)
 {
-    DC_UNUSED(data);
+    dc_output *output = data;
     DC_UNUSED(o);
-    DC_UNUSED(name);
+    free(output->name);
+    output->name = name ? strdup(name) : NULL;
 }
 
 static void output_handle_description(void *data, struct wl_output *o, const char *desc)
@@ -141,6 +142,7 @@ static void registry_handle_global_remove(void *data, struct wl_registry *regist
         wl_list_remove(&output->link);
         wl_output_destroy(output->wl_output);
         free(output->model);
+        free(output->name);
         free(output);
         return;
     }
@@ -196,6 +198,7 @@ void dc_wayland_destroy(dc_wayland *wl)
         wl_list_remove(&output->link);
         wl_output_destroy(output->wl_output);
         free(output->model);
+        free(output->name);
         free(output);
     }
 

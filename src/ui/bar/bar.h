@@ -9,12 +9,14 @@ struct dc_wayland;
 struct dc_output;
 struct dc_egl;
 struct dc_render;
+struct dc_niri;
 
 typedef struct dc_bar dc_bar;
 
-/* Create a bar on `output`. Returns NULL on failure. Owned by the caller. */
+/* Create a bar on `output`. `niri` may be NULL (workspaces then omitted).
+ * Returns NULL on failure. Owned by the caller. */
 dc_bar *dc_bar_create(struct dc_wayland *wl, struct dc_output *output, struct dc_egl *egl,
-                      struct dc_render *render);
+                      struct dc_render *render, struct dc_niri *niri);
 void dc_bar_destroy(dc_bar *bar);
 
 /* Re-render the bar (e.g. on a clock tick or a compositor event). No-op until

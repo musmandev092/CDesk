@@ -1,0 +1,238 @@
+#include "niri/niri.h"
+
+#include "core/log.h"
+#include "core/loop.h"
+#include "dc.h"
+
+#include <fcntl.h>
+#include <poll.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+#include "cJSON.h"
+
+#define DC_NIRI_BUF_CAP (128 * 1024)
+
+struct dc_niri {
+    int fd;
+    char buf[DC_NIRI_BUF_CAP];
+    size_t buf_len;
+
+    dc_niri_workspace workspaces[DC_NIRI_MAX_WORKSPACES];
+    int workspace_count;
+
+    dc_niri_changed_cb on_changed;
+    void *cb_data;
+};
+
+/* --- small cJSON helpers ------------------------------------------------ */
+
+static double json_num(const cJSON *obj, const char *key)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    return cJSON_IsNumber(item) ? item->valuedouble : 0.0;
+}
+
+static bool json_bool(const cJSON *obj, const char *key)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    return cJSON_IsTrue(item);
+}
+
+static void json_str(char *dst, size_t cap, const cJSON *obj, const char *key)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsString(item) && item->valuestring) {
+        strncpy(dst, item->valuestring, cap - 1);
+        dst[cap - 1] = '\0';
+    } else {
+        dst[0] = '\0';
+    }
+}
+
+/* --- event handlers ----------------------------------------------------- */
+
+static void handle_workspaces_changed(dc_niri *niri, const cJSON *value)
+{
+    const cJSON *array = cJSON_GetObjectItemCaseSensitive(value, "workspaces");
+    if (!cJSON_IsArray(array))
+        return;
+
+    int n = 0;
+    const cJSON *entry;
+    cJSON_ArrayForEach(entry, array)
+    {
+        if (n >= DC_NIRI_MAX_WORKSPACES)
+            break;
+        dc_niri_workspace *ws = &niri->workspaces[n++];
+        memset(ws, 0, sizeof(*ws));
+        ws->id = (uint64_t)json_num(entry, "id");
+        ws->idx = (uint8_t)json_num(entry, "idx");
+        json_str(ws->output, sizeof(ws->output), entry, "output");
+        json_str(ws->name, sizeof(ws->name), entry, "name");
+        ws->is_focused = json_bool(entry, "is_focused");
+        ws->is_active = json_bool(entry, "is_active");
+        ws->is_urgent = json_bool(entry, "is_urgent");
+    }
+    niri->workspace_count = n;
+}
+
+static dc_niri_workspace *find_workspace(dc_niri *niri, uint64_t id)
+{
+    for (int i = 0; i < niri->workspace_count; i++)
+        if (niri->workspaces[i].id == id)
+            return &niri->workspaces[i];
+    return NULL;
+}
+
+static void handle_workspace_activated(dc_niri *niri, const cJSON *value)
+{
+    dc_niri_workspace *target = find_workspace(niri, (uint64_t)json_num(value, "id"));
+    if (!target)
+        return;
+    bool focused = json_bool(value, "focused");
+
+    for (int i = 0; i < niri->workspace_count; i++) {
+        dc_niri_workspace *ws = &niri->workspaces[i];
+        if (strcmp(ws->output, target->output) != 0)
+            continue;
+        ws->is_active = false;
+        if (focused)
+            ws->is_focused = false;
+    }
+    target->is_active = true;
+    if (focused)
+        target->is_focused = true;
+}
+
+/* Returns true if the workspace view changed. */
+static bool handle_line(dc_niri *niri, const char *line, size_t len)
+{
+    cJSON *root = cJSON_ParseWithLength(line, len);
+    if (!root)
+        return false;
+
+    /* The initial reply and request acks are {"Ok":...}/{"Err":...}. */
+    if (cJSON_HasObjectItem(root, "Ok") || cJSON_HasObjectItem(root, "Err")) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    /* Events are single-key objects: {"<EventName>": {...}}. */
+    bool changed = false;
+    const cJSON *event = root->child;
+    if (event && event->string) {
+        if (strcmp(event->string, "WorkspacesChanged") == 0) {
+            handle_workspaces_changed(niri, event);
+            changed = true;
+        } else if (strcmp(event->string, "WorkspaceActivated") == 0) {
+            handle_workspace_activated(niri, event);
+            changed = true;
+        }
+    }
+
+    cJSON_Delete(root);
+    return changed;
+}
+
+/* --- socket ------------------------------------------------------------- */
+
+static void niri_readable(int fd, uint32_t revents, void *data)
+{
+    DC_UNUSED(revents);
+    dc_niri *niri = data;
+
+    ssize_t got = read(fd, niri->buf + niri->buf_len, sizeof(niri->buf) - niri->buf_len - 1);
+    if (got <= 0) {
+        if (got == 0)
+            dc_warn("niri socket closed");
+        return;
+    }
+    niri->buf_len += (size_t)got;
+
+    size_t start = 0;
+    bool changed = false;
+    for (size_t i = 0; i < niri->buf_len; i++) {
+        if (niri->buf[i] != '\n')
+            continue;
+        changed |= handle_line(niri, niri->buf + start, i - start);
+        start = i + 1;
+    }
+    if (start > 0) {
+        memmove(niri->buf, niri->buf + start, niri->buf_len - start);
+        niri->buf_len -= start;
+    }
+    /* A single oversized line would wedge the buffer; drop it defensively. */
+    if (niri->buf_len >= sizeof(niri->buf) - 1)
+        niri->buf_len = 0;
+
+    if (changed && niri->on_changed)
+        niri->on_changed(niri->cb_data);
+}
+
+dc_niri *dc_niri_connect(void)
+{
+    const char *path = getenv("NIRI_SOCKET");
+    if (!path || !*path) {
+        dc_warn("NIRI_SOCKET unset; workspaces disabled");
+        return NULL;
+    }
+
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return NULL;
+
+    struct sockaddr_un addr = {.sun_family = AF_UNIX};
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        dc_error("failed to connect NIRI_SOCKET (%s)", path);
+        close(fd);
+        return NULL;
+    }
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+
+    dc_niri *niri = calloc(1, sizeof(*niri));
+    niri->fd = fd;
+
+    static const char request[] = "\"EventStream\"\n";
+    if (write(fd, request, sizeof(request) - 1) < 0)
+        dc_error("niri: failed to request EventStream");
+    dc_info("niri IPC connected (EventStream)");
+    return niri;
+}
+
+void dc_niri_destroy(dc_niri *niri)
+{
+    if (!niri)
+        return;
+    if (niri->fd >= 0)
+        close(niri->fd);
+    free(niri);
+}
+
+void dc_niri_integrate(dc_niri *niri, struct dc_loop *loop)
+{
+    if (niri)
+        dc_loop_add_fd(loop, niri->fd, POLLIN, niri_readable, niri);
+}
+
+void dc_niri_set_changed_cb(dc_niri *niri, dc_niri_changed_cb cb, void *user_data)
+{
+    if (!niri)
+        return;
+    niri->on_changed = cb;
+    niri->cb_data = user_data;
+}
+
+const dc_niri_workspace *dc_niri_workspaces(const dc_niri *niri, int *count)
+{
+    if (!niri) {
+        *count = 0;
+        return NULL;
+    }
+    *count = niri->workspace_count;
+    return niri->workspaces;
+}

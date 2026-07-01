@@ -2,12 +2,15 @@
 
 #include "core/log.h"
 #include "dc.h"
+#include "niri/niri.h"
 #include "render/nvg.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
 #include <GLES2/gl2.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include "nanovg.h"
@@ -27,6 +30,7 @@ struct dc_bar {
     dc_output *output;
     dc_egl *egl;
     dc_render *render;
+    dc_niri *niri;
 
     struct wl_surface *surface;
     struct zwlr_layer_surface_v1 *layer_surface;
@@ -37,6 +41,52 @@ struct dc_bar {
     bool configured;
     bool egl_ready;
 };
+
+/* Workspace pills, left-aligned, filtered to this bar's output. */
+static void draw_workspaces(dc_bar *bar)
+{
+    if (!bar->niri)
+        return;
+
+    int count = 0;
+    const dc_niri_workspace *workspaces = dc_niri_workspaces(bar->niri, &count);
+    if (!workspaces)
+        return;
+
+    NVGcontext *vg = bar->render->vg;
+    const float pad = 12.0f;   /* spacingM */
+    const float gap = 6.0f;
+    const float pill = 28.0f;
+    const float cy = bar->height / 2.0f;
+    float x = pad;
+
+    for (int i = 0; i < count; i++) {
+        const dc_niri_workspace *ws = &workspaces[i];
+        if (bar->output->name && ws->output[0] && strcmp(ws->output, bar->output->name) != 0)
+            continue;
+
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, x, cy - pill / 2.0f, pill, pill, 8.0f);
+        if (ws->is_urgent)
+            nvgFillColor(vg, nvgRGB(0xf2, 0xb8, 0xb5)); /* error */
+        else if (ws->is_focused)
+            nvgFillColor(vg, nvgRGB(0xd0, 0xbc, 0xff)); /* primary */
+        else
+            nvgFillColor(vg, nvgRGB(0x2b, 0x29, 0x2f)); /* surfaceContainerHigh */
+        nvgFill(vg);
+
+        char label[8];
+        snprintf(label, sizeof(label), "%u", ws->idx);
+        nvgFontFaceId(vg, bar->render->font_ui);
+        nvgFontSize(vg, 13.0f);
+        nvgFillColor(vg, ws->is_focused || ws->is_urgent ? nvgRGB(0x38, 0x1e, 0x72)
+                                                          : nvgRGB(0xe6, 0xe0, 0xe9));
+        nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+        nvgText(vg, x + pill / 2.0f, cy, label, NULL);
+
+        x += pill + gap;
+    }
+}
 
 static void draw_clock(dc_bar *bar)
 {
@@ -79,6 +129,7 @@ void dc_bar_render(dc_bar *bar)
 
     /* TODO(hidpi): pass the real fractional scale as the pixel ratio (M2). */
     nvgBeginFrame(bar->render->vg, bar->width, bar->height, 1.0f);
+    draw_workspaces(bar);
     draw_clock(bar);
     nvgEndFrame(bar->render->vg);
 
@@ -115,13 +166,15 @@ static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
     .closed = layer_surface_handle_closed,
 };
 
-dc_bar *dc_bar_create(dc_wayland *wl, dc_output *output, dc_egl *egl, dc_render *render)
+dc_bar *dc_bar_create(dc_wayland *wl, dc_output *output, dc_egl *egl, dc_render *render,
+                      dc_niri *niri)
 {
     dc_bar *bar = calloc(1, sizeof(*bar));
     bar->wl = wl;
     bar->output = output;
     bar->egl = egl;
     bar->render = render;
+    bar->niri = niri;
     bar->height = DC_BAR_HEIGHT;
 
     bar->surface = wl_compositor_create_surface(wl->compositor);

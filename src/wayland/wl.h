@@ -21,6 +21,7 @@ typedef struct dc_output {
     uint32_t registry_name;
     int32_t scale;
     char *model;
+    char *name; /* connector name, e.g. "DP-1" — matches niri's output field */
     bool done;
     struct wl_list link; /* dc_wayland.outputs */
 } dc_output;

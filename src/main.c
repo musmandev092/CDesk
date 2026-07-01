@@ -7,6 +7,7 @@
 #include "core/log.h"
 #include "core/loop.h"
 #include "dc.h"
+#include "niri/niri.h"
 #include "render/nvg.h"
 #include "ui/bar/bar.h"
 #include "wayland/egl.h"
@@ -34,6 +35,12 @@ static void handle_signal(int signum)
         dc_loop_stop(g_loop);
 }
 
+static void render_all(struct bar_set *set)
+{
+    for (int i = 0; i < set->count; i++)
+        dc_bar_render(set->bars[i]);
+}
+
 /* Fires once per second; redraws every bar so the clock stays current. */
 static void clock_tick(int fd, uint32_t revents, void *data)
 {
@@ -41,10 +48,13 @@ static void clock_tick(int fd, uint32_t revents, void *data)
     uint64_t expirations;
     if (read(fd, &expirations, sizeof(expirations)) < 0)
         return;
+    render_all(data);
+}
 
-    struct bar_set *set = data;
-    for (int i = 0; i < set->count; i++)
-        dc_bar_render(set->bars[i]);
+/* Called when niri's workspace state changes. */
+static void niri_changed(void *data)
+{
+    render_all(data);
 }
 
 static int create_clock_timer(void)
@@ -75,6 +85,8 @@ int main(void)
         return 1;
     }
 
+    dc_niri *niri = dc_niri_connect();
+
     dc_render render = {0};
     struct bar_set set = {0};
     dc_output *output;
@@ -83,13 +95,15 @@ int main(void)
             dc_warn("more than %d outputs; ignoring the rest", DC_MAX_BARS);
             break;
         }
-        set.bars[set.count++] = dc_bar_create(wl, output, &egl, &render);
+        set.bars[set.count++] = dc_bar_create(wl, output, &egl, &render, niri);
     }
     if (set.count == 0)
         dc_warn("no outputs found; nothing to display");
 
     g_loop = dc_loop_create();
     dc_wayland_integrate(wl, g_loop);
+    dc_niri_integrate(niri, g_loop);
+    dc_niri_set_changed_cb(niri, niri_changed, &set);
 
     int clock_fd = create_clock_timer();
     if (clock_fd >= 0)
@@ -110,6 +124,7 @@ int main(void)
     /* GL teardown is skipped: the process is exiting and nvgDelete needs a live
      * context; the driver reclaims resources on exit. */
     dc_loop_destroy(g_loop);
+    dc_niri_destroy(niri);
     dc_egl_finish(&egl);
     dc_wayland_destroy(wl);
     return 0;
