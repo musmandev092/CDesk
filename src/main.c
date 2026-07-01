@@ -18,6 +18,7 @@
 #include "ui/bar/bar.h"
 #include "ui/controlcenter.h"
 #include "ui/osd.h"
+#include "ui/toasts.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
@@ -89,9 +90,16 @@ static void niri_changed(void *data)
     render_all(data);
 }
 
+/* Notification server signalled a change: rebuild the toast stack. */
+static void notifications_changed(void *data)
+{
+    dc_toasts_refresh(data);
+}
+
 struct click_ctx {
     struct bar_set *set;
     dc_control_center *control_center;
+    dc_toasts *toasts;
 };
 
 /* Route a left click: into the control-center popup if it's the target, else to
@@ -100,6 +108,9 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
 {
     struct click_ctx *ctx = data;
     dc_control_center *cc = ctx->control_center;
+
+    if (dc_toasts_handle_click(ctx->toasts, surface, x, y))
+        return;
 
     if (dc_control_center_visible(cc) && surface == dc_control_center_surface(cc)) {
         dc_control_center_handle_click(cc, x, y);
@@ -156,7 +167,15 @@ int main(void)
 
     dc_control_center *control_center = dc_control_center_create(wl, &egl, &render);
     dc_osd *osd = dc_osd_create(wl, &egl, &render);
-    struct click_ctx cctx = {.set = &set, .control_center = control_center};
+
+    dc_output *first_output = NULL;
+    wl_list_for_each(first_output, &wl->outputs, link) {
+        break;
+    }
+    dc_toasts *toasts = dc_toasts_create(wl, &egl, &render, notifications, first_output);
+    dc_notifications_set_changed_cb(notifications, notifications_changed, toasts);
+
+    struct click_ctx cctx = {.set = &set, .control_center = control_center, .toasts = toasts};
     struct tick_ctx tick = {.set = &set, .osd = osd, .wl = wl, .notifications = notifications};
 
     g_loop = dc_loop_create();
@@ -190,6 +209,7 @@ dc_osd_integrate(osd, g_loop);
     dc_loop_run(g_loop);
 
     dc_info("shutting down");
+    dc_toasts_destroy(toasts);
     dc_notifications_destroy(notifications);
     dc_osd_destroy(osd);
     dc_control_center_destroy(control_center);
