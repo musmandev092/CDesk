@@ -178,9 +178,9 @@ static void draw_focused_window(dc_bar *bar, float start_x)
         if (bar->icon_image > 0)
             nvgDeleteImage(vg, bar->icon_image);
         bar->icon_image = 0;
-        char *path = dc_icon_resolve(win->app_id, 24, 0);
+        char *path = dc_icon_resolve(win->app_id, 24, 1);
         if (path) {
-            bar->icon_image = nvgCreateImage(vg, path, 0);
+            bar->icon_image = dc_render_load_icon(bar->render, path, 22);
             free(path);
         }
         snprintf(bar->icon_app_id, sizeof(bar->icon_app_id), "%s", win->app_id);

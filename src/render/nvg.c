@@ -3,8 +3,13 @@
 #include "core/log.h"
 
 #include <GLES3/gl3.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
+#include "nanosvg.h"
+#include "nanosvgrast.h"
 #include "nanovg.h"
 #define NANOVG_GLES3
 #include "nanovg_gl.h"
@@ -107,6 +112,36 @@ void dc_render_icon(dc_render *render, int codepoint, float x, float y, float si
     nvgFillColor(render->vg, nvgRGBA(color.r, color.g, color.b, color.a));
     nvgTextAlign(render->vg, align_nvg);
     nvgText(render->vg, x, y, glyph, NULL);
+}
+
+int dc_render_load_icon(dc_render *render, const char *path, int size)
+{
+    if (!render->vg || !path || size <= 0)
+        return 0;
+
+    size_t len = strlen(path);
+    if (len > 4 && strcasecmp(path + len - 4, ".svg") == 0) {
+        NSVGimage *svg = nsvgParseFromFile(path, "px", 96.0f);
+        if (!svg)
+            return 0;
+        float src = svg->width > svg->height ? svg->width : svg->height;
+        float scale = src > 0.0f ? (float)size / src : 1.0f;
+
+        unsigned char *pixels = calloc((size_t)size * size * 4, 1);
+        if (!pixels) {
+            nsvgDelete(svg);
+            return 0;
+        }
+        NSVGrasterizer *rast = nsvgCreateRasterizer();
+        nsvgRasterize(rast, svg, 0.0f, 0.0f, scale, pixels, size, size, size * 4);
+        int handle = nvgCreateImageRGBA(render->vg, size, size, 0, pixels);
+        nsvgDeleteRasterizer(rast);
+        free(pixels);
+        nsvgDelete(svg);
+        return handle;
+    }
+
+    return nvgCreateImage(render->vg, path, 0);
 }
 
 void dc_render_finish(dc_render *render)

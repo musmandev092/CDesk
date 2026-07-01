@@ -24,6 +24,11 @@ typedef struct dc_render {
 void dc_render_icon(dc_render *render, int codepoint, float x, float y, float size, dc_color color,
                     int align_nvg);
 
+/* Load an image icon from a file path into a nanovg image handle. Handles PNG
+ * (via stb_image) and SVG (via nanosvg, rasterised to `size`x`size`). Returns
+ * the handle (>0) or 0 on failure. Caller frees with nvgDeleteImage. */
+int dc_render_load_icon(dc_render *render, const char *path, int size);
+
 /* Lazily create the nanovg context and load the UI font. Idempotent. Must run
  * with a GL context current. Returns false on failure. */
 bool dc_render_ensure(dc_render *render);

@@ -9,7 +9,7 @@ WAYLAND_SCANNER ?= wayland-scanner
 PKGS := wayland-client wayland-egl egl glesv2
 
 WARNINGS := -Wall -Wextra -Wshadow -Wvla -Wpointer-arith -Wno-unused-parameter
-INCLUDES := -Isrc -Iprotocol/generated -Ithird_party/nanovg -Ithird_party/cjson
+INCLUDES := -Isrc -Iprotocol/generated -Ithird_party/nanovg -Ithird_party/nanosvg -Ithird_party/cjson
 BASE_CFLAGS := -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE $(INCLUDES) \
 	$(shell $(PKG_CONFIG) --cflags $(PKGS))
 
@@ -31,7 +31,8 @@ SRC := $(wildcard src/*.c src/core/*.c src/wayland/*.c src/render/*.c src/ui/*.c
 	src/services/*.c src/niri/*.c src/theme/*.c src/ipc/*.c)
 OBJ := $(SRC:.c=.o)
 
-TP_SRC := third_party/nanovg/nanovg.c third_party/nanovg/nanovg_gl_impl.c third_party/cjson/cJSON.c
+TP_SRC := third_party/nanovg/nanovg.c third_party/nanovg/nanovg_gl_impl.c \
+	third_party/nanosvg/nanosvg_impl.c third_party/cjson/cJSON.c
 TP_OBJ := $(TP_SRC:.c=.o)
 
 BIN := bin/dankc
