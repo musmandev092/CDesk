@@ -18,19 +18,48 @@ static const char *const FONT_CANDIDATES[] = {
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
 };
 
-static int load_ui_font(NVGcontext *vg)
+static const char *const ICON_FONT_CANDIDATES[] = {
+    "assets/fonts/MaterialSymbolsRounded.ttf",
+    "/usr/share/dankc/fonts/MaterialSymbolsRounded.ttf",
+};
+
+static int load_font(NVGcontext *vg, const char *name, const char *const *candidates, size_t count)
 {
-    for (size_t i = 0; i < sizeof(FONT_CANDIDATES) / sizeof(FONT_CANDIDATES[0]); i++) {
-        if (access(FONT_CANDIDATES[i], R_OK) != 0)
+    for (size_t i = 0; i < count; i++) {
+        if (access(candidates[i], R_OK) != 0)
             continue;
-        int font = nvgCreateFont(vg, "ui", FONT_CANDIDATES[i]);
+        int font = nvgCreateFont(vg, name, candidates[i]);
         if (font >= 0) {
-            dc_debug("loaded UI font: %s", FONT_CANDIDATES[i]);
+            dc_debug("loaded font '%s': %s", name, candidates[i]);
             return font;
         }
     }
-    dc_error("no usable UI font found");
     return -1;
+}
+
+/* Encode a Unicode codepoint as UTF-8. Returns the byte count. */
+static int utf8_encode(int cp, char *out)
+{
+    if (cp < 0x80) {
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        out[0] = (char)(0xc0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3f));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (char)(0xe0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        out[2] = (char)(0x80 | (cp & 0x3f));
+        return 3;
+    }
+    out[0] = (char)(0xf0 | (cp >> 18));
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3f));
+    out[3] = (char)(0x80 | (cp & 0x3f));
+    return 4;
 }
 
 bool dc_render_ensure(dc_render *render)
@@ -44,16 +73,40 @@ bool dc_render_ensure(dc_render *render)
         return false;
     }
 
-    render->font_ui = load_ui_font(render->vg);
+    render->font_ui =
+        load_font(render->vg, "ui", FONT_CANDIDATES, sizeof(FONT_CANDIDATES) / sizeof(char *));
     if (render->font_ui < 0) {
+        dc_error("no usable UI font found");
         nvgDeleteGLES3(render->vg);
         render->vg = NULL;
         return false;
     }
 
+    render->font_icons = load_font(render->vg, "icons", ICON_FONT_CANDIDATES,
+                                   sizeof(ICON_FONT_CANDIDATES) / sizeof(char *));
+    if (render->font_icons < 0)
+        dc_warn("Material Symbols icon font not found; icons disabled");
+
     render->ready = true;
     dc_debug("nanovg render context ready");
     return true;
+}
+
+void dc_render_icon(dc_render *render, int codepoint, float x, float y, float size, dc_color color,
+                    int align_nvg)
+{
+    if (!render->vg || render->font_icons < 0)
+        return;
+
+    char glyph[5];
+    int len = utf8_encode(codepoint, glyph);
+    glyph[len] = '\0';
+
+    nvgFontFaceId(render->vg, render->font_icons);
+    nvgFontSize(render->vg, size);
+    nvgFillColor(render->vg, nvgRGBA(color.r, color.g, color.b, color.a));
+    nvgTextAlign(render->vg, align_nvg);
+    nvgText(render->vg, x, y, glyph, NULL);
 }
 
 void dc_render_finish(dc_render *render)

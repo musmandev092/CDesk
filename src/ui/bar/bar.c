@@ -3,6 +3,7 @@
 #include "core/log.h"
 #include "dc.h"
 #include "niri/niri.h"
+#include "render/icons.h"
 #include "render/nvg.h"
 #include "services/battery.h"
 #include "theme/theme.h"
@@ -178,12 +179,15 @@ static void draw_clock(dc_bar *bar)
     nvgText(vg, bar->logical_width / 2.0f, bar->logical_height / 2.0f, text, NULL);
 }
 
-/* Battery indicator (vector pictograph + percentage), right-aligned. */
-static void draw_battery(dc_bar *bar)
+/* Battery indicator (vector pictograph + percentage), right-aligned. Returns
+ * the x coordinate of its left edge (for placing widgets to its left). */
+static float draw_battery(dc_bar *bar)
 {
+    const float right_edge = bar->logical_width - 12.0f;
+
     dc_battery_info bat;
     if (!dc_battery_read(&bat) || !bat.present)
-        return;
+        return right_edge;
 
     NVGcontext *vg = bar->render->vg;
     const dc_theme *t = dc_theme_current;
@@ -232,6 +236,30 @@ static void draw_battery(dc_bar *bar)
         nvgFillColor(vg, fill_color);
         nvgFill(vg);
     }
+    return bx;
+}
+
+/* Status icons (Material Symbols), drawn right-to-left starting at `right_x`.
+ * State is static for now; the sd-bus services (T11-T16) will drive it. */
+static void draw_status_icons(dc_bar *bar, float right_x)
+{
+    const dc_theme *t = dc_theme_current;
+    const float cy = bar->logical_height / 2.0f;
+    const float size = 19.0f;
+    const float step = 26.0f;
+    const int align = NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE;
+
+    static const int icons[] = {
+        DC_ICON_VOLUME_UP,
+        DC_ICON_BLUETOOTH,
+        DC_ICON_WIFI,
+    };
+
+    float x = right_x;
+    for (size_t i = 0; i < sizeof(icons) / sizeof(icons[0]); i++) {
+        dc_render_icon(bar->render, icons[i], x, cy, size, t->surface_text, align);
+        x -= step;
+    }
 }
 
 void dc_bar_render(dc_bar *bar)
@@ -267,7 +295,8 @@ void dc_bar_render(dc_bar *bar)
     float workspaces_end = draw_workspaces(bar);
     draw_focused_window(bar, workspaces_end);
     draw_clock(bar);
-    draw_battery(bar);
+    float battery_left = draw_battery(bar);
+    draw_status_icons(bar, battery_left - 12.0f);
     nvgEndFrame(bar->render->vg);
 
     dc_egl_swap(bar->egl, &bar->egl_window);

@@ -8,13 +8,21 @@
 
 #include <stdbool.h>
 
+#include "theme/theme.h"
+
 typedef struct NVGcontext NVGcontext;
 
 typedef struct dc_render {
     NVGcontext *vg;
     int font_ui;
+    int font_icons; /* Material Symbols Rounded; -1 if unavailable */
     bool ready;
 } dc_render;
+
+/* Draw a Material Symbols icon (by codepoint) at (x, y) with the given nanovg
+ * alignment. No-op if the icon font failed to load. */
+void dc_render_icon(dc_render *render, int codepoint, float x, float y, float size, dc_color color,
+                    int align_nvg);
 
 /* Lazily create the nanovg context and load the UI font. Idempotent. Must run
  * with a GL context current. Returns false on failure. */
