@@ -554,20 +554,21 @@ struct wl_surface *dc_bar_surface(dc_bar *bar)
     return bar->surface;
 }
 
-void dc_bar_handle_click(dc_bar *bar, double x, double y)
+dc_output *dc_bar_output(dc_bar *bar)
+{
+    return bar->output;
+}
+
+dc_bar_region dc_bar_hittest(dc_bar *bar, double x, double y)
 {
     DC_UNUSED(y);
-    /* Map to a region (logical coords). Actions (popouts) come with the panels. */
-    const char *region;
     if (x < 44.0)
-        region = "launcher";
-    else if (x > bar->logical_width - 210.0)
-        region = "control-center";
-    else if (x > bar->logical_width / 2.0 - 70.0 && x < bar->logical_width / 2.0 + 70.0)
-        region = "clock/dash";
-    else
-        region = "bar";
-    dc_info("bar click %.0f,%.0f -> %s", x, y, region);
+        return DC_BAR_REGION_LAUNCHER;
+    if (x > bar->logical_width - 210.0)
+        return DC_BAR_REGION_CONTROL_CENTER;
+    if (x > bar->logical_width / 2.0 - 70.0 && x < bar->logical_width / 2.0 + 70.0)
+        return DC_BAR_REGION_CLOCK;
+    return DC_BAR_REGION_NONE;
 }
 
 void dc_bar_destroy(dc_bar *bar)

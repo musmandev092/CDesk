@@ -26,7 +26,17 @@ void dc_bar_render(dc_bar *bar);
 /* The bar's wl_surface (for matching pointer events). */
 struct wl_surface *dc_bar_surface(dc_bar *bar);
 
-/* Handle a left click at surface-local logical coordinates. */
-void dc_bar_handle_click(dc_bar *bar, double x, double y);
+/* The output this bar is on. */
+struct dc_output *dc_bar_output(dc_bar *bar);
+
+typedef enum {
+    DC_BAR_REGION_NONE,
+    DC_BAR_REGION_LAUNCHER,
+    DC_BAR_REGION_CONTROL_CENTER,
+    DC_BAR_REGION_CLOCK,
+} dc_bar_region;
+
+/* Which region a surface-local logical coordinate falls in. */
+dc_bar_region dc_bar_hittest(dc_bar *bar, double x, double y);
 
 #endif /* DC_UI_BAR_BAR_H */
