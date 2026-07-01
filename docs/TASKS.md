@@ -36,8 +36,8 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
   (widgets sit directly on #1d211b, no per-widget pill backgrounds). Skipped by design.
 - [x] **T4 Clock + date.** Center shows "HH:MM  Www D" (24h time + date), centered as a group, matching
   DMS. Weather segment deferred to the weather/geolocation service. TODO: honour 12h when !use24HourClock.
-- [ ] **T5 Focused app: icon + name.** Show the app icon (needs T6) + app name/title like DMS
-  ("Alacritty · <title>"). Until icons: app_id + title, styled like DMS.
+- [x] **T5 Focused app: name (text).** Shows "AppName · Title" (pretty name from app_id) like DMS. The
+  app ICON still needs T6 (icon-theme resolution). Minor: some titles carry a stray glyph — strip later.
 - [ ] **T6 App-icon resolution (XDG icon theme).** New src/services/icons.c: resolve a .desktop/app_id
   or tray IconName to a file via the icon theme (index.theme lookup), decode with stb_image/nanosvg,
   cache as an nvg image. Used by launcher/dock/tray/focused-app.
