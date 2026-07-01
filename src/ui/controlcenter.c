@@ -2,7 +2,11 @@
 
 #include "core/log.h"
 #include "dc.h"
+#include "render/icons.h"
 #include "render/nvg.h"
+#include "services/audio.h"
+#include "services/bluez.h"
+#include "services/net.h"
 #include "theme/theme.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
@@ -41,6 +45,72 @@ struct dc_control_center {
     bool configured;
     bool egl_ready;
 };
+
+static inline NVGcolor tc(dc_color c)
+{
+    return nvgRGBA(c.r, c.g, c.b, c.a);
+}
+
+static inline NVGcolor tc_alpha(dc_color c, int a)
+{
+    return nvgRGBA(c.r, c.g, c.b, (unsigned char)a);
+}
+
+/* A rounded toggle tile: icon + label, primary-filled when active (DMS style). */
+static void draw_tile(dc_render *r, float x, float y, float w, float h, int icon, const char *label,
+                      bool active)
+{
+    NVGcontext *vg = r->vg;
+    const dc_theme *t = dc_theme_current;
+    dc_color fg = active ? t->primary_text : t->surface_text;
+
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, x, y, w, h, 12.0f);
+    nvgFillColor(vg, active ? tc(t->primary) : tc(t->surface_container_high));
+    nvgFill(vg);
+
+    dc_render_icon(r, icon, x + 16.0f, y + h / 2.0f, 22.0f, fg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+    nvgFontFaceId(vg, r->font_ui);
+    nvgFontSize(vg, 14.0f);
+    nvgFillColor(vg, tc(fg));
+    nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+    nvgText(vg, x + 48.0f, y + h / 2.0f, label, NULL);
+}
+
+/* A horizontal slider: icon + rounded track + primary fill + handle. */
+static void draw_slider(dc_render *r, float x, float cy, float w, int icon, float value)
+{
+    NVGcontext *vg = r->vg;
+    const dc_theme *t = dc_theme_current;
+    if (value < 0.0f)
+        value = 0.0f;
+    if (value > 1.0f)
+        value = 1.0f;
+
+    dc_render_icon(r, icon, x, cy, 20.0f, t->surface_text, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+
+    const float tx = x + 32.0f;
+    const float tw = w - 32.0f;
+    const float th = 8.0f;
+
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, tx, cy - th / 2.0f, tw, th, th / 2.0f);
+    nvgFillColor(vg, tc_alpha(t->outline, 90));
+    nvgFill(vg);
+
+    float fw = tw * value;
+    if (fw < th)
+        fw = th;
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, tx, cy - th / 2.0f, fw, th, th / 2.0f);
+    nvgFillColor(vg, tc(t->primary));
+    nvgFill(vg);
+
+    nvgBeginPath(vg);
+    nvgCircle(vg, tx + tw * value, cy, 8.0f);
+    nvgFillColor(vg, tc(t->primary));
+    nvgFill(vg);
+}
 
 static void recompute_physical(dc_control_center *cc)
 {
@@ -108,6 +178,34 @@ static void cc_render(dc_control_center *cc)
     nvgFillColor(vg, nvgRGBA(t->surface_text.r, t->surface_text.g, t->surface_text.b, 255));
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
     nvgText(vg, pad + 18.0f, pad + 28.0f, "Control Center", NULL);
+
+    /* Live state for the tiles + sliders. */
+    dc_audio_info audio;
+    bool have_audio = dc_audio_read(&audio);
+    dc_net_info net;
+    dc_net_wifi(&net);
+    dc_bluez_info bt;
+    bool have_bt = dc_bluez_read(&bt);
+
+    const float ix = pad + 18.0f;
+    const float iw = w - 2.0f * (pad + 18.0f);
+    const float gap = 12.0f;
+    const float tile_w = (iw - gap) / 2.0f;
+    const float tile_h = 60.0f;
+    float ty = pad + 52.0f;
+
+    draw_tile(cc->render, ix, ty, tile_w, tile_h, DC_ICON_WIFI, "Wi-Fi", net.connected);
+    draw_tile(cc->render, ix + tile_w + gap, ty, tile_w, tile_h, DC_ICON_BLUETOOTH, "Bluetooth",
+              have_bt && bt.connected);
+    ty += tile_h + gap;
+    draw_tile(cc->render, ix, ty, tile_w, tile_h, DC_ICON_DARK_MODE, "Dark", true);
+    draw_tile(cc->render, ix + tile_w + gap, ty, tile_w, tile_h, DC_ICON_LIGHT_MODE, "Night", false);
+    ty += tile_h + 24.0f;
+
+    draw_slider(cc->render, ix, ty, iw, DC_ICON_VOLUME_UP,
+                have_audio ? audio.volume / 100.0f : 0.5f);
+    ty += 36.0f;
+    draw_slider(cc->render, ix, ty, iw, DC_ICON_LIGHT_MODE, 0.7f); /* TODO: real brightness */
 
     nvgEndFrame(vg);
     dc_egl_swap(cc->egl, &cc->egl_window);
