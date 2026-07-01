@@ -21,4 +21,5 @@ compile_commands.json
 
 # Runtime / local
 *.log
-core
+/core
+core.[0-9]*
