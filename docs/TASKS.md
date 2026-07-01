@@ -66,9 +66,12 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
 ## Then — panels (M4+)
 - [x] **Pointer input** (prerequisite) — wl_seat + wl_pointer + bar click hit-testing (launcher/
   control-center/clock regions). Done; unlocks popouts.
-- [ ] **T18 Control Center popout** (overlay layer surface + nanovg card + toggles; open on
-  control-center click, dismiss on click-outside), **T19 OSDs** (volume/brightness), **T20 Notifications
-  daemon**, **T21 App launcher**, **T22 Lock screen**, **T23 clipboard/screenshot/color-picker/night**.
+- [~] **T18 Control Center popout** — PART 1 done: overlay layer surface + themed rounded card (shadow/
+  border/title) opens on control-center click (dc_control_center, DANKC_CC_DEMO to auto-open for shots).
+  TODO part 2: toggle tiles (wifi/bluetooth/dark-mode) + volume/brightness sliders + click-outside dismiss
+  + keyboard grab. Reuse pointer input (need to route clicks INTO the popup surface too).
+- [ ] **T19 OSDs** (volume/brightness transient overlay), **T20 Notifications daemon**, **T21 App
+  launcher**, **T22 Lock screen**, **T23 clipboard/screenshot/color-picker/night**.
 
 ## Later
 - [ ] **T24 Material color engine** (C++ MCU, colors from wallpaper — matches DMS when matugen active).
