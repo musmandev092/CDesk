@@ -51,10 +51,14 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
   (docs/02-RENDERING §8). Animate workspace focus + widget hover.
 
 ## Then — services (M3, sd-bus; libsystemd present)
-- [ ] **T10 sd-bus scaffolding** (src/services/dbus.c): system+user bus, generic PropertiesChanged router.
-- [ ] **T11 UPower battery** (replace sysfs), **T12 PipeWire audio** (volume/mute), **T13 NetworkManager**
-  (wifi state/signal), **T14 BlueZ** (state), **T15 MPRIS** media, **T16 StatusNotifier tray**,
-  **T17 logind** (brightness/power/idle).
+- [x] **T10 sd-bus scaffolding** (src/services/dbus.c): system+user bus opened + driven from the poll loop
+  (process-on-readable + drain/flush prepare; loop now supports multiple prepare hooks). Stable. TODO: a
+  shared generic PropertiesChanged router helper (each consumer adds matches for now).
+- [~] **T12 audio** — live volume/mute via `wpctl` stand-in (proper libpipewire later).
+- [~] **T13 wifi** — live connected state via sysfs stand-in (proper NetworkManager sd-bus later).
+- [ ] **T11 UPower battery** (D-Bus; sysfs already works), **T14 BlueZ** (bluetooth on/connected ->
+  colour the bar icon), **T15 MPRIS** media, **T16 StatusNotifier tray**, **T17 logind**
+  (brightness/power/idle).
 
 ## Then — panels (M4+)
 - [ ] **T18 Control Center popout**, **T19 OSDs** (volume/brightness), **T20 Notifications daemon**,
