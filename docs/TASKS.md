@@ -66,11 +66,10 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
 ## Then — panels (M4+)
 - [x] **Pointer input** (prerequisite) — wl_seat + wl_pointer + bar click hit-testing (launcher/
   control-center/clock regions). Done; unlocks popouts.
-- [~] **T18 Control Center popout** — PART 1+2 done: themed card + 2x2 toggle tiles (Wi-Fi/Bluetooth/Dark/
-  Night, live wifi+bt state, primary-green when active) + volume/brightness sliders (volume live from
-  wpctl). Matches DMS ControlCenter visually. Opens on control-center click. TODO part 3: route clicks INTO
-  the popup (dc_control_center_handle_click hit-test tiles/sliders -> toggle wifi/bt/volume actions) +
-  click-outside dismiss + real brightness (sysfs).
+- [x] **T18 Control Center popout** — DONE: themed card + 2x2 toggle tiles (Wi-Fi/Bluetooth/Dark/Night, live
+  state) + volume/brightness sliders (both live: wpctl + /sys/class/backlight). Opens on control-center
+  click; clicks hit-test tiles/sliders -> rfkill/wpctl/brightnessctl actions; dismiss on outside click.
+  Matches DMS ControlCenter. (Dark/Night actions are no-ops pending gamma/gsettings.)
 - [ ] **T19 OSDs** (volume/brightness transient overlay), **T20 Notifications daemon**, **T21 App
   launcher**, **T22 Lock screen**, **T23 clipboard/screenshot/color-picker/night**.
 
