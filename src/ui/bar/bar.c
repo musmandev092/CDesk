@@ -336,10 +336,14 @@ static void draw_right_cluster(dc_bar *bar)
 
     float x = bar->logical_width - pad;
 
-    /* Volume — live mute state from wpctl. */
+    /* Volume — live level + mute state from wpctl. */
     dc_audio_info audio;
     bool have_audio = dc_audio_read(&audio);
-    int volume_icon = (have_audio && audio.muted) ? DC_ICON_VOLUME_OFF : DC_ICON_VOLUME_UP;
+    int volume_icon = DC_ICON_VOLUME_UP;
+    if (have_audio && audio.muted)
+        volume_icon = DC_ICON_VOLUME_OFF;
+    else if (have_audio && audio.volume < 34)
+        volume_icon = DC_ICON_VOLUME_DOWN;
     dc_color volume_color = (have_audio && audio.muted) ? t->outline : t->surface_text;
     dc_render_icon(bar->render, volume_icon, x, cy, isize, volume_color, align);
     x -= step;
