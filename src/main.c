@@ -67,17 +67,27 @@ struct click_ctx {
     dc_control_center *control_center;
 };
 
-/* Route a left click to the bar under the pointer and act on the region. */
+/* Route a left click: into the control-center popup if it's the target, else to
+ * the bar under the pointer (toggle the control center, or dismiss it). */
 static void handle_bar_click(struct wl_surface *surface, double x, double y, void *data)
 {
     struct click_ctx *ctx = data;
+    dc_control_center *cc = ctx->control_center;
+
+    if (dc_control_center_visible(cc) && surface == dc_control_center_surface(cc)) {
+        dc_control_center_handle_click(cc, x, y);
+        return;
+    }
+
     for (int i = 0; i < ctx->set->count; i++) {
         dc_bar *bar = ctx->set->bars[i];
         if (dc_bar_surface(bar) != surface)
             continue;
         dc_bar_region region = dc_bar_hittest(bar, x, y);
         if (region == DC_BAR_REGION_CONTROL_CENTER)
-            dc_control_center_toggle(ctx->control_center, dc_bar_output(bar));
+            dc_control_center_toggle(cc, dc_bar_output(bar));
+        else if (dc_control_center_visible(cc))
+            dc_control_center_hide(cc);
         return;
     }
 }
@@ -146,6 +156,7 @@ int main(void)
     struct sigaction sa = {.sa_handler = handle_signal};
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    signal(SIGCHLD, SIG_IGN); /* auto-reap detached action processes */
 
     /* TEMP(verify): auto-open the control center to screenshot it. */
     if (getenv("DANKC_CC_DEMO")) {

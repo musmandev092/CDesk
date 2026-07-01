@@ -12,7 +12,10 @@
 #include "wayland/wl.h"
 
 #include <GLES2/gl2.h>
+#include <dirent.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #include "fractional-scale-v1-client-protocol.h"
 #include "nanovg.h"
@@ -54,6 +57,78 @@ static inline NVGcolor tc(dc_color c)
 static inline NVGcolor tc_alpha(dc_color c, int a)
 {
     return nvgRGBA(c.r, c.g, c.b, (unsigned char)a);
+}
+
+/* Shared layout so cc_render (draw) and handle_click (hit-test) agree. */
+typedef struct {
+    float ix, iw, gap, tile_w, tile_h;
+    float row1_y, row2_y, vol_y, bri_y;
+    float track_x, track_w;
+} cc_layout;
+
+static cc_layout cc_get_layout(float w)
+{
+    const float pad = 6.0f;
+    cc_layout l;
+    l.ix = pad + 18.0f;
+    l.iw = w - 2.0f * (pad + 18.0f);
+    l.gap = 12.0f;
+    l.tile_w = (l.iw - l.gap) / 2.0f;
+    l.tile_h = 60.0f;
+    l.row1_y = pad + 52.0f;
+    l.row2_y = l.row1_y + l.tile_h + l.gap;
+    l.vol_y = l.row2_y + l.tile_h + 24.0f;
+    l.bri_y = l.vol_y + 36.0f;
+    l.track_x = l.ix + 32.0f;
+    l.track_w = l.iw - 32.0f;
+    return l;
+}
+
+/* Run a shell command detached (children auto-reaped via SIG_IGN on SIGCHLD). */
+static void run_detached(const char *cmd)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+}
+
+/* Current backlight brightness as 0..1, or -1 if none. */
+static float read_brightness(void)
+{
+    DIR *dir = opendir("/sys/class/backlight");
+    if (!dir)
+        return -1.0f;
+    struct dirent *ent;
+    float value = -1.0f;
+    while ((ent = readdir(dir))) {
+        if (ent->d_name[0] == '.')
+            continue;
+        char path[300];
+        int cur = -1, max = -1;
+        snprintf(path, sizeof(path), "/sys/class/backlight/%.200s/brightness", ent->d_name);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            if (fscanf(f, "%d", &cur) != 1)
+                cur = -1;
+            fclose(f);
+        }
+        snprintf(path, sizeof(path), "/sys/class/backlight/%.200s/max_brightness", ent->d_name);
+        f = fopen(path, "r");
+        if (f) {
+            if (fscanf(f, "%d", &max) != 1)
+                max = -1;
+            fclose(f);
+        }
+        if (cur >= 0 && max > 0) {
+            value = (float)cur / (float)max;
+            break;
+        }
+    }
+    closedir(dir);
+    return value;
 }
 
 /* A rounded toggle tile: icon + label, primary-filled when active (DMS style). */
@@ -187,25 +262,20 @@ static void cc_render(dc_control_center *cc)
     dc_bluez_info bt;
     bool have_bt = dc_bluez_read(&bt);
 
-    const float ix = pad + 18.0f;
-    const float iw = w - 2.0f * (pad + 18.0f);
-    const float gap = 12.0f;
-    const float tile_w = (iw - gap) / 2.0f;
-    const float tile_h = 60.0f;
-    float ty = pad + 52.0f;
+    cc_layout l = cc_get_layout(w);
+    float brightness = read_brightness();
 
-    draw_tile(cc->render, ix, ty, tile_w, tile_h, DC_ICON_WIFI, "Wi-Fi", net.connected);
-    draw_tile(cc->render, ix + tile_w + gap, ty, tile_w, tile_h, DC_ICON_BLUETOOTH, "Bluetooth",
-              have_bt && bt.connected);
-    ty += tile_h + gap;
-    draw_tile(cc->render, ix, ty, tile_w, tile_h, DC_ICON_DARK_MODE, "Dark", true);
-    draw_tile(cc->render, ix + tile_w + gap, ty, tile_w, tile_h, DC_ICON_LIGHT_MODE, "Night", false);
-    ty += tile_h + 24.0f;
+    draw_tile(cc->render, l.ix, l.row1_y, l.tile_w, l.tile_h, DC_ICON_WIFI, "Wi-Fi", net.connected);
+    draw_tile(cc->render, l.ix + l.tile_w + l.gap, l.row1_y, l.tile_w, l.tile_h, DC_ICON_BLUETOOTH,
+              "Bluetooth", have_bt && bt.connected);
+    draw_tile(cc->render, l.ix, l.row2_y, l.tile_w, l.tile_h, DC_ICON_DARK_MODE, "Dark", true);
+    draw_tile(cc->render, l.ix + l.tile_w + l.gap, l.row2_y, l.tile_w, l.tile_h, DC_ICON_LIGHT_MODE,
+              "Night", false);
 
-    draw_slider(cc->render, ix, ty, iw, DC_ICON_VOLUME_UP,
+    draw_slider(cc->render, l.ix, l.vol_y, l.iw, DC_ICON_VOLUME_UP,
                 have_audio ? audio.volume / 100.0f : 0.5f);
-    ty += 36.0f;
-    draw_slider(cc->render, ix, ty, iw, DC_ICON_LIGHT_MODE, 0.7f); /* TODO: real brightness */
+    draw_slider(cc->render, l.ix, l.bri_y, l.iw, DC_ICON_LIGHT_MODE,
+                brightness >= 0.0f ? brightness : 0.7f);
 
     nvgEndFrame(vg);
     dc_egl_swap(cc->egl, &cc->egl_window);
@@ -325,6 +395,62 @@ void dc_control_center_toggle(dc_control_center *cc, dc_output *output)
 bool dc_control_center_visible(dc_control_center *cc)
 {
     return cc->visible;
+}
+
+void dc_control_center_hide(dc_control_center *cc)
+{
+    if (cc->visible)
+        cc_hide(cc);
+}
+
+struct wl_surface *dc_control_center_surface(dc_control_center *cc)
+{
+    return cc->surface;
+}
+
+void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
+{
+    if (!cc->visible)
+        return;
+
+    cc_layout l = cc_get_layout((float)cc->logical_width);
+    bool in_row1 = y >= l.row1_y && y <= l.row1_y + l.tile_h;
+    bool in_row2 = y >= l.row2_y && y <= l.row2_y + l.tile_h;
+    bool left = x >= l.ix && x <= l.ix + l.tile_w;
+    bool right = x >= l.ix + l.tile_w + l.gap && x <= l.ix + 2.0f * l.tile_w + l.gap;
+    bool in_track = x >= l.track_x - 8.0f && x <= l.track_x + l.track_w + 8.0f;
+
+    float frac = (float)(x - l.track_x) / l.track_w;
+    if (frac < 0.0f)
+        frac = 0.0f;
+    if (frac > 1.0f)
+        frac = 1.0f;
+
+    float dvol = (float)y - l.vol_y;
+    float dbri = (float)y - l.bri_y;
+    if (dvol < 0.0f)
+        dvol = -dvol;
+    if (dbri < 0.0f)
+        dbri = -dbri;
+
+    if (in_row1 && left) {
+        run_detached("rfkill toggle wifi");
+    } else if (in_row1 && right) {
+        run_detached("rfkill toggle bluetooth");
+    } else if (in_row2 && (left || right)) {
+        dc_debug("control center: dark/night toggle (no-op)");
+    } else if (in_track && dvol <= 16.0f) {
+        char cmd[96];
+        snprintf(cmd, sizeof(cmd), "wpctl set-volume @DEFAULT_AUDIO_SINK@ %.2f", frac);
+        run_detached(cmd);
+    } else if (in_track && dbri <= 16.0f) {
+        char cmd[96];
+        snprintf(cmd, sizeof(cmd), "brightnessctl set %d%% 2>/dev/null", (int)(frac * 100.0f + 0.5f));
+        run_detached(cmd);
+    } else {
+        return;
+    }
+    cc_render(cc);
 }
 
 void dc_control_center_destroy(dc_control_center *cc)
