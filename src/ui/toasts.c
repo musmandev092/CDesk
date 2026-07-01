@@ -1,5 +1,6 @@
 #include "ui/toasts.h"
 
+#include "core/anim.h"
 #include "core/log.h"
 #include "dc.h"
 #include "render/icons.h"
@@ -53,10 +54,28 @@ struct dc_toasts {
     uint32_t card_ids[DC_TOAST_MAX];
     int card_count;
 
+    dc_anim anim;
+    struct wl_callback *frame_cb;
+
     bool visible;
     bool configured;
     bool egl_ready;
 };
+
+static void toasts_render(dc_toasts *t);
+
+static void toasts_frame_done(void *data, struct wl_callback *cb, uint32_t time);
+static const struct wl_callback_listener toasts_frame_listener = {.done = toasts_frame_done};
+
+static void toasts_frame_done(void *data, struct wl_callback *cb, uint32_t time)
+{
+    dc_toasts *t = data;
+    DC_UNUSED(time);
+    wl_callback_destroy(cb);
+    t->frame_cb = NULL;
+    if (t->visible && dc_anim_active(&t->anim))
+        toasts_render(t);
+}
 
 static void recompute_physical(dc_toasts *t)
 {
@@ -187,11 +206,23 @@ static void toasts_render(dc_toasts *t)
     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
     nvgBeginFrame(vg, t->logical_width, t->logical_height, (float)t->scale120 / DC_SCALE_BASE);
+
+    /* Entrance: fade in + slide from the right edge (DMS). */
+    float p = dc_anim_progress(&t->anim);
+    float ap = p > 1.0f ? 1.0f : p;
+    nvgGlobalAlpha(vg, ap);
+    nvgTranslate(vg, (1.0f - ap) * 40.0f, 0.0f);
+
     for (int i = 0; i < count; i++) {
         t->card_ids[i] = popups[i]->id;
         draw_card(t, popups[i], 0.0f, (float)(i * (DC_TOAST_CARD_H + DC_TOAST_GAP)));
     }
     nvgEndFrame(vg);
+
+    if (dc_anim_active(&t->anim) && !t->frame_cb) {
+        t->frame_cb = wl_surface_frame(t->surface);
+        wl_callback_add_listener(t->frame_cb, &toasts_frame_listener, t);
+    }
     dc_egl_swap(t->egl, &t->egl_window);
 
     update_input_region(t, count);
@@ -240,6 +271,10 @@ static void toasts_hide(dc_toasts *t)
 {
     if (!t->visible)
         return;
+    if (t->frame_cb) {
+        wl_callback_destroy(t->frame_cb);
+        t->frame_cb = NULL;
+    }
     if (t->egl_ready)
         dc_egl_window_finish(&t->egl_window, t->egl);
     if (t->viewport)
@@ -268,6 +303,7 @@ static void toasts_show(dc_toasts *t)
     t->configured = false;
     t->egl_ready = false;
     t->scale120 = (output && output->scale > 0 ? output->scale : 1) * DC_SCALE_BASE;
+    dc_anim_start(&t->anim, DC_DUR_MEDIUM, DC_EASE_EMPHASIZED_DECEL);
 
     t->surface = wl_compositor_create_surface(t->wl->compositor);
     if (t->wl->fractional_scale_mgr) {
