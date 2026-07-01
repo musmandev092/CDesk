@@ -58,8 +58,10 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
 - [~] **T13 wifi** — live connected state via sysfs stand-in (proper NetworkManager sd-bus later).
 - [x] **T14 BlueZ** — bluetooth state live via GetManagedObjects (system bus), cached 3s; bar bluetooth
   icon: info-blue connected / mid powered / dim off. Stable, no busy-loop.
-- [ ] **T11 UPower battery** (D-Bus; sysfs already works), **T15 MPRIS** media, **T16 StatusNotifier
-  tray**, **T17 logind** (brightness/power/idle).
+- [x] **T15 MPRIS** — media service (session bus): player detect + PlaybackStatus + title/artist, cached;
+  bar shows music-note + title left of clock while Playing (hidden otherwise), like DMS.
+- [ ] **T11 UPower battery** (D-Bus; sysfs already works), **T16 StatusNotifier tray**, **T17 logind**
+  (brightness/power/idle).
 
 ## Then — panels (M4+)
 - [ ] **T18 Control Center popout**, **T19 OSDs** (volume/brightness), **T20 Notifications daemon**,
