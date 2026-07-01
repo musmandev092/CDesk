@@ -5,8 +5,10 @@
 #include "niri/niri.h"
 #include "render/icons.h"
 #include "render/nvg.h"
+#include "services/audio.h"
 #include "services/battery.h"
 #include "services/icons.h"
+#include "services/net.h"
 #include "theme/theme.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
@@ -333,11 +335,23 @@ static void draw_right_cluster(dc_bar *bar)
 
     float x = bar->logical_width - pad;
 
-    dc_render_icon(bar->render, DC_ICON_VOLUME_UP, x, cy, isize, t->surface_text, align);
+    /* Volume — live mute state from wpctl. */
+    dc_audio_info audio;
+    bool have_audio = dc_audio_read(&audio);
+    int volume_icon = (have_audio && audio.muted) ? DC_ICON_VOLUME_OFF : DC_ICON_VOLUME_UP;
+    dc_color volume_color = (have_audio && audio.muted) ? t->outline : t->surface_text;
+    dc_render_icon(bar->render, volume_icon, x, cy, isize, volume_color, align);
     x -= step;
+
     dc_render_icon(bar->render, DC_ICON_BLUETOOTH, x, cy, isize, t->info, align);
     x -= step;
-    dc_render_icon(bar->render, DC_ICON_WIFI, x, cy, isize, t->primary, align);
+
+    /* Wi-Fi — green when connected (sysfs), dim otherwise. */
+    dc_net_info net;
+    dc_net_wifi(&net);
+    int wifi_icon = net.connected ? DC_ICON_WIFI : DC_ICON_NETWORK_WIFI;
+    dc_color wifi_color = net.connected ? t->primary : t->outline;
+    dc_render_icon(bar->render, wifi_icon, x, cy, isize, wifi_color, align);
     x -= step;
 
     x = draw_battery(bar, x - 4.0f) - 10.0f;
