@@ -16,11 +16,11 @@ niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
 
 ## Current status — Milestone 2 in progress 🔨 (clock + workspaces working)
 - **Builds clean** (gcc + wayland-scanner, `make` → `./bin/dankc`, ~1.2 MB with nanovg, zero warnings).
-- **Runs on niri**: layer-shell bar per output rendering via **nanovg** — themed surfaceContainer
-  background + **workspace pills** + **focused-window title** + centered **live clock**, all from the
-  **niri IPC EventStream** (per-output filtered). **Crisp on HiDPI** via wp_fractional_scale + viewport
-  (internal panel detected at 1.25x). Verified live on external 2560@1x "HDMI-A-1" + internal @1.25x
-  "eDP-1".
+- **Runs on niri**: layer-shell bar per output via **nanovg** — DMS **green palette**, **workspace pills**
+  (green focus), **focused-window title**, centered **live clock**, right-side **status icons**
+  (wifi/bluetooth/volume, Material Symbols) + **battery**. From the **niri IPC EventStream** (per-output).
+  **Crisp on HiDPI** (fractional-scale + viewport). Icons use static Material Icons Round (the variable
+  Material Symbols crashes stb_truetype). Verified live on HDMI-A-1 @1x + eDP-1 @1.25x.
 - **Footprint:** Pss ≈ **30 MB** for two GPU bars, vs DMS `qs` Pss ≈ 477 MB.
 - Vendored: nanovg (GLES3, `third_party/nanovg`), cJSON (`third_party/cjson`); Inter bundled
   (`assets/fonts/InterVariable.ttf`).

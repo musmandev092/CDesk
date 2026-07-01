@@ -25,10 +25,10 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
 - [x] green theme palette (matches DMS)
 
 ## Next — bar fidelity (do in order)
-- [ ] **T1 Material Symbols icon font.** Bundle Material Symbols Rounded (from
-  `/home/.../quickshell/assets/fonts/` if present, else system) into `assets/fonts/`; load a second
-  nanovg font "icons" in render/nvg.c; add a `draw_icon(vg, codepoint, x, y, size, color)` helper. This
-  unlocks real icons (the #1 fidelity lever after colors).
+- [x] **T1 Material Symbols icon font.** Loaded a second nanovg font "icons" + `dc_render_icon()` +
+  `src/render/icons.h`. NOTE: the 14MB Material Symbols *variable* font segfaults stb_truetype (nanovg),
+  so we bundled the *static* Material Icons Round (legacy codepoints match the common icons). For full
+  variable-font + FILL/wght-axis fidelity later, render icons via the FreeType glyph path (docs/02 §5).
 - [ ] **T2 Exact bar background.** Sample DMS's bar pixel colour (compare screenshots) and match the
   bar's background + transparency (DMS uses surfaceContainer w/ panelTransparency 0.85). Verify.
 - [ ] **T3 Widget pill containers.** DMS groups bar widgets in rounded surfaceContainer pills with
