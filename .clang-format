@@ -1,0 +1,19 @@
+# DankC C style — Linux-kernel-ish, 4-space indent, 100 col.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+BreakBeforeBraces: Linux
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+PointerAlignment: Right
+SpaceAfterCStyleCast: false
+SortIncludes: false
+AlignAfterOpenBracket: Align
+AlignConsecutiveMacros: true
+IndentCaseLabels: false
+KeepEmptyLinesAtTheStartOfBlocks: false

@@ -1,0 +1,24 @@
+# Build output
+/build/
+/builddir/
+*.o
+*.a
+*.so
+*.so.*
+dankc
+dankctl/dankctl
+/bin/
+
+# Generated Wayland protocol code
+/protocol/generated/
+
+# Editor / tooling
+.cache/
+compile_commands.json
+*.swp
+*~
+.DS_Store
+
+# Runtime / local
+*.log
+core
