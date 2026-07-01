@@ -24,6 +24,7 @@ static const dc_theme green_theme = {
     .surface_container_highest = RGB(32, 36, 30),
     .error = RGB(f2, b8, b5),
     .warning = RGB(ff, 98, 00),
+    .info = RGB(21, 96, f3),
     .success = RGB(4c, af, 50),
 };
 

@@ -221,19 +221,16 @@ static void draw_clock(dc_bar *bar)
     nvgText(vg, x + time_w + gap, cy, date_str, NULL);
 }
 
-/* Battery indicator (vector pictograph + percentage), right-aligned. Returns
- * the x coordinate of its left edge (for placing widgets to its left). */
-static float draw_battery(dc_bar *bar)
+/* Battery indicator (vector pictograph + percentage) ending at `right_edge`.
+ * Returns the x coordinate of its left edge. */
+static float draw_battery(dc_bar *bar, float right_edge)
 {
-    const float right_edge = bar->logical_width - 12.0f;
-
     dc_battery_info bat;
     if (!dc_battery_read(&bat) || !bat.present)
         return right_edge;
 
     NVGcontext *vg = bar->render->vg;
     const dc_theme *t = dc_theme_current;
-    const float pad = 12.0f;
     const float cy = bar->logical_height / 2.0f;
     const bool low = bat.percent <= 20 && !bat.charging;
 
@@ -248,7 +245,7 @@ static float draw_battery(dc_bar *bar)
     nvgFontSize(vg, 14.0f);
     nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
     nvgFillColor(vg, text_color);
-    const float text_right = bar->logical_width - pad;
+    const float text_right = right_edge;
     nvgText(vg, text_right, cy, label, NULL);
 
     float bounds[4];
@@ -281,27 +278,35 @@ static float draw_battery(dc_bar *bar)
     return bx;
 }
 
-/* Status icons (Material Symbols), drawn right-to-left starting at `right_x`.
- * State is static for now; the sd-bus services (T11-T16) will drive it. */
-static void draw_status_icons(dc_bar *bar, float right_x)
+/* Full right status cluster in DMS order (right->left): volume, bluetooth,
+ * wifi, battery+%, notifications, clipboard, signal. State is static until the
+ * sd-bus services (M3) drive it; colours follow DMS (wifi/signal green,
+ * bluetooth info-blue, battery green, rest surfaceText). */
+static void draw_right_cluster(dc_bar *bar)
 {
     const dc_theme *t = dc_theme_current;
     const float cy = bar->logical_height / 2.0f;
-    const float size = 19.0f;
+    const float pad = 12.0f;
+    const float isize = 19.0f;
     const float step = 26.0f;
     const int align = NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE;
 
-    static const int icons[] = {
-        DC_ICON_VOLUME_UP,
-        DC_ICON_BLUETOOTH,
-        DC_ICON_WIFI,
-    };
+    float x = bar->logical_width - pad;
 
-    float x = right_x;
-    for (size_t i = 0; i < sizeof(icons) / sizeof(icons[0]); i++) {
-        dc_render_icon(bar->render, icons[i], x, cy, size, t->surface_text, align);
-        x -= step;
-    }
+    dc_render_icon(bar->render, DC_ICON_VOLUME_UP, x, cy, isize, t->surface_text, align);
+    x -= step;
+    dc_render_icon(bar->render, DC_ICON_BLUETOOTH, x, cy, isize, t->info, align);
+    x -= step;
+    dc_render_icon(bar->render, DC_ICON_WIFI, x, cy, isize, t->primary, align);
+    x -= step;
+
+    x = draw_battery(bar, x - 4.0f) - 10.0f;
+
+    dc_render_icon(bar->render, DC_ICON_NOTIFICATIONS, x, cy, isize, t->surface_text, align);
+    x -= step;
+    dc_render_icon(bar->render, DC_ICON_CONTENT_PASTE, x, cy, isize, t->surface_text, align);
+    x -= step;
+    dc_render_icon(bar->render, DC_ICON_SIGNAL_CELLULAR_ALT, x, cy, isize, t->primary, align);
 }
 
 void dc_bar_render(dc_bar *bar)
@@ -337,8 +342,7 @@ void dc_bar_render(dc_bar *bar)
     float workspaces_end = draw_workspaces(bar);
     draw_focused_window(bar, workspaces_end);
     draw_clock(bar);
-    float battery_left = draw_battery(bar);
-    draw_status_icons(bar, battery_left - 12.0f);
+    draw_right_cluster(bar);
     nvgEndFrame(bar->render->vg);
 
     dc_egl_swap(bar->egl, &bar->egl_window);

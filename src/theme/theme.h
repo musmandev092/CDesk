@@ -33,6 +33,7 @@ typedef struct dc_theme {
     dc_color surface_container_highest;
     dc_color error;
     dc_color warning;
+    dc_color info;
     dc_color success;
 } dc_theme;
 
