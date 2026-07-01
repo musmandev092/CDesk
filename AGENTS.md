@@ -3,6 +3,12 @@
 This file is the canonical, always-current index of the project so a fresh session or subagent does
 **not** need to re-scan the whole tree. Update it whenever state changes.
 
+## Autonomous build
+Running an overnight self-paced loop that works through **docs/TASKS.md** (ordered backlog toward exact
+DankMaterialShell fidelity). Each iteration: implement one task → build → run → screenshot → compare to
+`docs/dms_reference.png` → fix → commit → tick the box → leave session clean. Reference code:
+`/home/mosman092/Downloads/DankMaterialShell-master/quickshell`.
+
 ## What this is
 A lightweight desktop shell for the **niri** Wayland compositor, written in C — a reimplementation of
 DankMaterialShell's core (QML/Quickshell + Go) as one native binary. Full spec in `docs/` (00–11).
