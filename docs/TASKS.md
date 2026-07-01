@@ -81,7 +81,12 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
   summary/body, critical accent), click-to-dismiss with input-region passthrough. Declines the name if a
   daemon already owns it. Verified on an isolated session bus. TODO later: notification CENTER/history
   panel, action buttons, inline images.
-- [ ] **T21 App launcher**, **T22 Lock screen**, **T23 clipboard/screenshot/color-picker/night**.
+- [x] **T21 App launcher** — DONE: centered wlr-layer overlay with exclusive keyboard focus, search
+  field + ranked desktop-entry results (icons via dc_icon_resolve), type-to-filter, Up/Down/Enter/Esc,
+  click-to-launch. Backed by apps.c (XDG scan + fuzzy search) and xkb keyboard input in wl.c. Opens from
+  the bar launcher button. Also fixed a latent libwayland abort: wl_pointer needs frame/axis_* listener
+  stubs (see memory dankc-wl-listener-stubs). TODO later: math/calc/actions, recent apps, mouse hover.
+- [ ] **T22 Lock screen**, **T23 clipboard/screenshot/color-picker/night**.
 
 ## Later
 - [ ] **T24 Material color engine** (C++ MCU, colors from wallpaper — matches DMS when matugen active).
