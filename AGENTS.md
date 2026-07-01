@@ -14,15 +14,20 @@ A lightweight desktop shell for the **niri** Wayland compositor, written in C �
 DankMaterialShell's core (QML/Quickshell + Go) as one native binary. Full spec in `docs/` (00–11).
 niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
 
-## Current status — Milestone 2 in progress 🔨 (clock + workspaces working)
-- **Builds clean** (gcc + wayland-scanner, `make` → `./bin/dankc`, ~1.2 MB with nanovg, zero warnings).
+## Current status — M2/M3/M4 in progress 🔨 (bar live, control center + OSD done)
+- **Builds clean** (gcc + wayland-scanner, `make` → `./bin/dankc`, zero warnings).
 - **Runs on niri**: layer-shell bar per output via **nanovg**, closely matching DMS. LEFT: apps-grid
   launcher · workspace green-pill + grey dots (sorted) · app icon (PNG+SVG) + "AppName · Title". CENTER:
-  time + date. RIGHT: full DMS status cluster (signal/clipboard/notification/battery+%/wifi/bluetooth/
-  volume) with DMS colours. DMS **green palette** (#1d211b bg). **Crisp on HiDPI** (fractional-scale).
-  App icons via XDG icon-theme (nanovg PNG + nanosvg SVG). NOTE: right-cluster state (wifi/bt/volume/
-  notif) is still STATIC — M3 sd-bus services will make it live. Battery % is real (sysfs).
-- **Footprint:** Pss ≈ **30 MB** for two GPU bars, vs DMS `qs` Pss ≈ 477 MB.
+  time + date (**live, 1 Hz**). RIGHT: DMS status cluster with real state — battery% (sysfs), wifi (sysfs),
+  audio (wpctl), bluetooth (BlueZ). DMS **green palette** (#1d211b bg). Crisp on HiDPI (fractional-scale).
+- **Control Center** popout (T18): themed card, 2×2 toggle tiles + volume/brightness sliders, interactive
+  (rfkill/wpctl/brightnessctl), dismiss on outside click.
+- **Volume OSD** (T19): transient bottom-center overlay, auto-hide, pops on volume change.
+- **FIXED the frozen clock**: it was a loop-wide deadlock — blocking `wl_display_dispatch()` raced Mesa's
+  gallium threads for the display fd. Now uses thread-safe prepare_read/read_events + a wall-clock loop
+  tick. See memory `dankc-wayland-dispatch-deadlock`.
+- **Footprint:** RSS ≈ **145 MB** for two GPU bars incl. Mesa (Pss lower), vs DMS `qs` ≈ 477 MB.
+- **Next:** T20 notifications daemon (own org.freedesktop.Notifications), then T21 launcher, T22 lock, T23.
 - Vendored: nanovg (GLES3, `third_party/nanovg`), cJSON (`third_party/cjson`); Inter bundled
   (`assets/fonts/InterVariable.ttf`).
 
@@ -36,8 +41,8 @@ niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
 ## Known follow-ups (address in M2)
 - **HiDPI:** bar currently renders buffer_scale=1 (blurry on the scale-2 internal panel). Implement
   fractional-scale / integer-scale handling (docs/02-RENDERING §3).
-- Event loop uses `wl_display_dispatch` on readable; migrate to `prepare_read`/`read_events` when adding
-  D-Bus/pipewire fds (docs/01-ARCHITECTURE §1).
+- ~~Event loop uses `wl_display_dispatch`~~ — DONE: migrated to `prepare_read`/`read_events` (was
+  deadlocking against Mesa threads; see memory `dankc-wayland-dispatch-deadlock`).
 - Config engine (cjson) not yet wired — bar color is hardcoded; add `src/core/config.c` when cjson is
   installed.
 

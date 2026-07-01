@@ -70,7 +70,12 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
   state) + volume/brightness sliders (both live: wpctl + /sys/class/backlight). Opens on control-center
   click; clicks hit-test tiles/sliders -> rfkill/wpctl/brightnessctl actions; dismiss on outside click.
   Matches DMS ControlCenter. (Dark/Night actions are no-ops pending gamma/gsettings.)
-- [ ] **T19 OSDs** (volume/brightness transient overlay), **T20 Notifications daemon**, **T21 App
+- [x] **T19 Volume OSD** — DONE: transient bottom-center wlr-layer overlay (speaker icon + green bar +
+  value), auto-hides, pops on volume change detected in the 1 Hz tick. Also fixed the long-standing
+  "frozen clock": the whole event loop deadlocked on blocking wl_display_dispatch() racing Mesa's
+  gallium threads for the display fd — replaced with the thread-safe prepare_read/read_events pattern
+  and a wall-clock loop tick. Brightness OSD deferred (same overlay, add on next brightness-change hook).
+- [ ] **T20 Notifications daemon** (own org.freedesktop.Notifications), **T21 App
   launcher**, **T22 Lock screen**, **T23 clipboard/screenshot/color-picker/night**.
 
 ## Later
