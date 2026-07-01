@@ -9,6 +9,7 @@
 #include "dc.h"
 #include "niri/niri.h"
 #include "render/nvg.h"
+#include "theme/theme.h"
 #include "ui/bar/bar.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
@@ -74,6 +75,7 @@ int main(void)
 {
     dc_log_init(DC_LOG_DEBUG);
     dc_info("DankC %s starting", DC_VERSION);
+    dc_theme_init();
 
     dc_wayland *wl = dc_wayland_connect();
     if (!wl)

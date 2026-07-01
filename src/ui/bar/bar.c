@@ -5,6 +5,7 @@
 #include "niri/niri.h"
 #include "render/nvg.h"
 #include "services/battery.h"
+#include "theme/theme.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
@@ -25,11 +26,16 @@
 /* Fractional-scale numerator base: preferred_scale is reported over 120. */
 #define DC_SCALE_BASE 120
 
-/* Stock "purple" palette until the Material color engine lands:
- * surfaceContainer #211f24 background, surfaceText #e6e0e9 foreground. */
-#define DC_BAR_BG_R (0x21 / 255.0f)
-#define DC_BAR_BG_G (0x1f / 255.0f)
-#define DC_BAR_BG_B (0x24 / 255.0f)
+/* dc_color -> nanovg color. */
+static inline NVGcolor tc(dc_color c)
+{
+    return nvgRGBA(c.r, c.g, c.b, c.a);
+}
+
+static inline NVGcolor tc_alpha(dc_color c, int alpha)
+{
+    return nvgRGBA(c.r, c.g, c.b, (unsigned char)alpha);
+}
 
 struct dc_bar {
     dc_wayland *wl;
@@ -84,22 +90,23 @@ static float draw_workspaces(dc_bar *bar)
         if (bar->output->name && ws->output[0] && strcmp(ws->output, bar->output->name) != 0)
             continue;
 
+        const dc_theme *t = dc_theme_current;
         nvgBeginPath(vg);
         nvgRoundedRect(vg, x, cy - pill / 2.0f, pill, pill, 8.0f);
         if (ws->is_urgent)
-            nvgFillColor(vg, nvgRGB(0xf2, 0xb8, 0xb5)); /* error */
+            nvgFillColor(vg, tc(t->error));
         else if (ws->is_focused)
-            nvgFillColor(vg, nvgRGB(0xd0, 0xbc, 0xff)); /* primary */
+            nvgFillColor(vg, tc(t->primary));
         else
-            nvgFillColor(vg, nvgRGB(0x2b, 0x29, 0x2f)); /* surfaceContainerHigh */
+            nvgFillColor(vg, tc(t->surface_container_high));
         nvgFill(vg);
 
         char label[8];
         snprintf(label, sizeof(label), "%u", ws->idx);
         nvgFontFaceId(vg, bar->render->font_ui);
         nvgFontSize(vg, 13.0f);
-        nvgFillColor(vg, ws->is_focused || ws->is_urgent ? nvgRGB(0x38, 0x1e, 0x72)
-                                                          : nvgRGB(0xe6, 0xe0, 0xe9));
+        nvgFillColor(vg, ws->is_focused || ws->is_urgent ? tc(t->primary_text)
+                                                          : tc(t->surface_text));
         nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
         nvgText(vg, x + pill / 2.0f, cy, label, NULL);
 
@@ -148,7 +155,7 @@ static void draw_focused_window(dc_bar *bar, float start_x)
     nvgScissor(vg, x, 0.0f, avail, bar->logical_height);
     nvgFontFaceId(vg, bar->render->font_ui);
     nvgFontSize(vg, 14.0f);
-    nvgFillColor(vg, nvgRGB(0xe6, 0xe0, 0xe9));
+    nvgFillColor(vg, tc(dc_theme_current->surface_text));
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
     nvgText(vg, x, bar->logical_height / 2.0f, text, NULL);
     nvgRestore(vg);
@@ -166,7 +173,7 @@ static void draw_clock(dc_bar *bar)
 
     nvgFontFaceId(vg, bar->render->font_ui);
     nvgFontSize(vg, 15.0f);
-    nvgFillColor(vg, nvgRGB(0xe6, 0xe0, 0xe9));
+    nvgFillColor(vg, tc(dc_theme_current->surface_text));
     nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
     nvgText(vg, bar->logical_width / 2.0f, bar->logical_height / 2.0f, text, NULL);
 }
@@ -179,13 +186,14 @@ static void draw_battery(dc_bar *bar)
         return;
 
     NVGcontext *vg = bar->render->vg;
+    const dc_theme *t = dc_theme_current;
     const float pad = 12.0f;
     const float cy = bar->logical_height / 2.0f;
     const bool low = bat.percent <= 20 && !bat.charging;
 
-    const NVGcolor text_color = low ? nvgRGB(0xf2, 0xb8, 0xb5) : nvgRGB(0xe6, 0xe0, 0xe9);
-    const NVGcolor fill_color = bat.charging ? nvgRGB(0x4c, 0xaf, 0x50) : text_color;
-    const NVGcolor outline = nvgRGBA(0xe6, 0xe0, 0xe9, 180);
+    const NVGcolor text_color = low ? tc(t->error) : tc(t->surface_text);
+    const NVGcolor fill_color = bat.charging ? tc(t->success) : text_color;
+    const NVGcolor outline = tc_alpha(t->outline, 180);
 
     char label[8];
     snprintf(label, sizeof(label), "%d%%", bat.percent);
@@ -249,8 +257,9 @@ void dc_bar_render(dc_bar *bar)
     if (bar->viewport)
         wp_viewport_set_destination(bar->viewport, bar->logical_width, bar->logical_height);
 
+    const dc_color bg = dc_theme_current->surface_container;
     glViewport(0, 0, bar->phys_width, bar->phys_height);
-    glClearColor(DC_BAR_BG_R, DC_BAR_BG_G, DC_BAR_BG_B, 1.0f);
+    glClearColor(bg.r / 255.0f, bg.g / 255.0f, bg.b / 255.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
     float pixel_ratio = (float)bar->scale120 / DC_SCALE_BASE;
