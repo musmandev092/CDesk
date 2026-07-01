@@ -12,7 +12,9 @@
 struct dc_loop;
 
 #define DC_NIRI_MAX_WORKSPACES 64
+#define DC_NIRI_MAX_WINDOWS 256
 #define DC_NIRI_NAME_MAX 64
+#define DC_NIRI_TITLE_MAX 256
 
 typedef struct dc_niri_workspace {
     uint64_t id;
@@ -23,6 +25,14 @@ typedef struct dc_niri_workspace {
     bool is_active;
     bool is_urgent;
 } dc_niri_workspace;
+
+typedef struct dc_niri_window {
+    uint64_t id;
+    uint64_t workspace_id;
+    char title[DC_NIRI_TITLE_MAX];
+    char app_id[DC_NIRI_NAME_MAX];
+    bool is_focused;
+} dc_niri_window;
 
 typedef void (*dc_niri_changed_cb)(void *user_data);
 
@@ -38,5 +48,8 @@ void dc_niri_set_changed_cb(dc_niri *niri, dc_niri_changed_cb cb, void *user_dat
 
 /* Read-only snapshot of the current workspaces. */
 const dc_niri_workspace *dc_niri_workspaces(const dc_niri *niri, int *count);
+
+/* The currently focused window, or NULL if none. */
+const dc_niri_window *dc_niri_focused_window(const dc_niri *niri);
 
 #endif /* DC_NIRI_NIRI_H */

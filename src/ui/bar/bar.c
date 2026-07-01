@@ -59,19 +59,20 @@ static void recompute_physical(dc_bar *bar)
     bar->phys_height = (bar->logical_height * bar->scale120 + DC_SCALE_BASE / 2) / DC_SCALE_BASE;
 }
 
-/* Workspace pills, left-aligned, filtered to this bar's output. Logical coords. */
-static void draw_workspaces(dc_bar *bar)
+/* Workspace pills, left-aligned, filtered to this bar's output. Logical coords.
+ * Returns the x coordinate just past the last pill. */
+static float draw_workspaces(dc_bar *bar)
 {
+    const float pad = 12.0f; /* spacingM */
     if (!bar->niri)
-        return;
+        return pad;
 
     int count = 0;
     const dc_niri_workspace *workspaces = dc_niri_workspaces(bar->niri, &count);
     if (!workspaces)
-        return;
+        return pad;
 
     NVGcontext *vg = bar->render->vg;
-    const float pad = 12.0f;   /* spacingM */
     const float gap = 6.0f;
     const float pill = 28.0f;
     const float cy = bar->logical_height / 2.0f;
@@ -103,6 +104,53 @@ static void draw_workspaces(dc_bar *bar)
 
         x += pill + gap;
     }
+    return x;
+}
+
+/* True if the focused window lives on this bar's output. */
+static bool focused_window_on_output(dc_bar *bar, const dc_niri_window *win)
+{
+    if (!bar->output->name)
+        return true; /* no connector name to filter by */
+
+    int count = 0;
+    const dc_niri_workspace *workspaces = dc_niri_workspaces(bar->niri, &count);
+    for (int i = 0; i < count; i++) {
+        if (workspaces[i].id != win->workspace_id)
+            continue;
+        return workspaces[i].output[0] == '\0' ||
+               strcmp(workspaces[i].output, bar->output->name) == 0;
+    }
+    return false;
+}
+
+/* Focused-window title, drawn after the workspaces and clipped so it never
+ * collides with the centered clock. */
+static void draw_focused_window(dc_bar *bar, float start_x)
+{
+    const dc_niri_window *win = dc_niri_focused_window(bar->niri);
+    if (!win || !focused_window_on_output(bar, win))
+        return;
+
+    const char *text = win->title[0] ? win->title : win->app_id;
+    if (!text[0])
+        return;
+
+    NVGcontext *vg = bar->render->vg;
+    const float x = start_x + 8.0f;
+    const float max_x = bar->logical_width / 2.0f - 48.0f; /* keep clear of the clock */
+    const float avail = max_x - x;
+    if (avail < 40.0f)
+        return;
+
+    nvgSave(vg);
+    nvgScissor(vg, x, 0.0f, avail, bar->logical_height);
+    nvgFontFaceId(vg, bar->render->font_ui);
+    nvgFontSize(vg, 14.0f);
+    nvgFillColor(vg, nvgRGB(0xe6, 0xe0, 0xe9));
+    nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+    nvgText(vg, x, bar->logical_height / 2.0f, text, NULL);
+    nvgRestore(vg);
 }
 
 static void draw_clock(dc_bar *bar)
@@ -151,7 +199,8 @@ void dc_bar_render(dc_bar *bar)
 
     float pixel_ratio = (float)bar->scale120 / DC_SCALE_BASE;
     nvgBeginFrame(bar->render->vg, bar->logical_width, bar->logical_height, pixel_ratio);
-    draw_workspaces(bar);
+    float workspaces_end = draw_workspaces(bar);
+    draw_focused_window(bar, workspaces_end);
     draw_clock(bar);
     nvgEndFrame(bar->render->vg);
 

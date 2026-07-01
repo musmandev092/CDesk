@@ -24,6 +24,9 @@ struct dc_niri {
     dc_niri_workspace workspaces[DC_NIRI_MAX_WORKSPACES];
     int workspace_count;
 
+    dc_niri_window windows[DC_NIRI_MAX_WINDOWS];
+    int window_count;
+
     dc_niri_changed_cb on_changed;
     void *cb_data;
 };
@@ -108,6 +111,85 @@ static void handle_workspace_activated(dc_niri *niri, const cJSON *value)
         target->is_focused = true;
 }
 
+/* --- windows ------------------------------------------------------------ */
+
+static void parse_window(dc_niri_window *win, const cJSON *entry)
+{
+    memset(win, 0, sizeof(*win));
+    win->id = (uint64_t)json_num(entry, "id");
+    win->workspace_id = (uint64_t)json_num(entry, "workspace_id");
+    json_str(win->title, sizeof(win->title), entry, "title");
+    json_str(win->app_id, sizeof(win->app_id), entry, "app_id");
+    win->is_focused = json_bool(entry, "is_focused");
+}
+
+static void clear_focus_except(dc_niri *niri, uint64_t keep_id)
+{
+    for (int i = 0; i < niri->window_count; i++)
+        if (niri->windows[i].id != keep_id)
+            niri->windows[i].is_focused = false;
+}
+
+static void handle_windows_changed(dc_niri *niri, const cJSON *value)
+{
+    const cJSON *array = cJSON_GetObjectItemCaseSensitive(value, "windows");
+    if (!cJSON_IsArray(array))
+        return;
+
+    int n = 0;
+    const cJSON *entry;
+    cJSON_ArrayForEach(entry, array)
+    {
+        if (n >= DC_NIRI_MAX_WINDOWS)
+            break;
+        parse_window(&niri->windows[n++], entry);
+    }
+    niri->window_count = n;
+}
+
+static void handle_window_opened_or_changed(dc_niri *niri, const cJSON *value)
+{
+    const cJSON *entry = cJSON_GetObjectItemCaseSensitive(value, "window");
+    if (!cJSON_IsObject(entry))
+        return;
+
+    dc_niri_window win;
+    parse_window(&win, entry);
+
+    for (int i = 0; i < niri->window_count; i++) {
+        if (niri->windows[i].id != win.id)
+            continue;
+        niri->windows[i] = win;
+        if (win.is_focused)
+            clear_focus_except(niri, win.id);
+        return;
+    }
+    if (niri->window_count < DC_NIRI_MAX_WINDOWS) {
+        niri->windows[niri->window_count++] = win;
+        if (win.is_focused)
+            clear_focus_except(niri, win.id);
+    }
+}
+
+static void handle_window_closed(dc_niri *niri, const cJSON *value)
+{
+    uint64_t id = (uint64_t)json_num(value, "id");
+    for (int i = 0; i < niri->window_count; i++) {
+        if (niri->windows[i].id != id)
+            continue;
+        niri->windows[i] = niri->windows[--niri->window_count];
+        return;
+    }
+}
+
+static void handle_window_focus_changed(dc_niri *niri, const cJSON *value)
+{
+    /* "id" is null when nothing is focused. */
+    uint64_t id = (uint64_t)json_num(value, "id");
+    for (int i = 0; i < niri->window_count; i++)
+        niri->windows[i].is_focused = (niri->windows[i].id == id && id != 0);
+}
+
 /* Returns true if the workspace view changed. */
 static bool handle_line(dc_niri *niri, const char *line, size_t len)
 {
@@ -130,6 +212,18 @@ static bool handle_line(dc_niri *niri, const char *line, size_t len)
             changed = true;
         } else if (strcmp(event->string, "WorkspaceActivated") == 0) {
             handle_workspace_activated(niri, event);
+            changed = true;
+        } else if (strcmp(event->string, "WindowsChanged") == 0) {
+            handle_windows_changed(niri, event);
+            changed = true;
+        } else if (strcmp(event->string, "WindowOpenedOrChanged") == 0) {
+            handle_window_opened_or_changed(niri, event);
+            changed = true;
+        } else if (strcmp(event->string, "WindowClosed") == 0) {
+            handle_window_closed(niri, event);
+            changed = true;
+        } else if (strcmp(event->string, "WindowFocusChanged") == 0) {
+            handle_window_focus_changed(niri, event);
             changed = true;
         }
     }
@@ -235,4 +329,14 @@ const dc_niri_workspace *dc_niri_workspaces(const dc_niri *niri, int *count)
     }
     *count = niri->workspace_count;
     return niri->workspaces;
+}
+
+const dc_niri_window *dc_niri_focused_window(const dc_niri *niri)
+{
+    if (!niri)
+        return NULL;
+    for (int i = 0; i < niri->window_count; i++)
+        if (niri->windows[i].is_focused)
+            return &niri->windows[i];
+    return NULL;
 }
