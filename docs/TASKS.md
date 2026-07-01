@@ -75,8 +75,13 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
   "frozen clock": the whole event loop deadlocked on blocking wl_display_dispatch() racing Mesa's
   gallium threads for the display fd — replaced with the thread-safe prepare_read/read_events pattern
   and a wall-clock loop tick. Brightness OSD deferred (same overlay, add on next brightness-change hook).
-- [ ] **T20 Notifications daemon** (own org.freedesktop.Notifications), **T21 App
-  launcher**, **T22 Lock screen**, **T23 clipboard/screenshot/color-picker/night**.
+- [x] **T20 Notifications daemon** — DONE: full org.freedesktop.Notifications server (Notify/Close/
+  GetCapabilities/GetServerInformation + Closed/ActionInvoked signals, urgency+image hints, replaces_id,
+  per-urgency lifetimes, 1 Hz expiry). Top-right toast stack (dc_toasts): up to 4 cards (avatar/app/
+  summary/body, critical accent), click-to-dismiss with input-region passthrough. Declines the name if a
+  daemon already owns it. Verified on an isolated session bus. TODO later: notification CENTER/history
+  panel, action buttons, inline images.
+- [ ] **T21 App launcher**, **T22 Lock screen**, **T23 clipboard/screenshot/color-picker/night**.
 
 ## Later
 - [ ] **T24 Material color engine** (C++ MCU, colors from wallpaper — matches DMS when matugen active).

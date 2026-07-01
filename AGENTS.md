@@ -23,11 +23,14 @@ niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
 - **Control Center** popout (T18): themed card, 2×2 toggle tiles + volume/brightness sliders, interactive
   (rfkill/wpctl/brightnessctl), dismiss on outside click.
 - **Volume OSD** (T19): transient bottom-center overlay, auto-hide, pops on volume change.
+- **Notifications** (T20): full org.freedesktop.Notifications server + top-right toast stack (max 4
+  cards, avatar/app/summary/body, critical accent, click-to-dismiss). Declines the name if a daemon
+  already owns it. History/center panel + action buttons deferred.
 - **FIXED the frozen clock**: it was a loop-wide deadlock — blocking `wl_display_dispatch()` raced Mesa's
   gallium threads for the display fd. Now uses thread-safe prepare_read/read_events + a wall-clock loop
   tick. See memory `dankc-wayland-dispatch-deadlock`.
 - **Footprint:** RSS ≈ **145 MB** for two GPU bars incl. Mesa (Pss lower), vs DMS `qs` ≈ 477 MB.
-- **Next:** T20 notifications daemon (own org.freedesktop.Notifications), then T21 launcher, T22 lock, T23.
+- **Next:** T21 app launcher (fuzzy app search overlay), then T22 lock screen, T23 clipboard/screenshot.
 - Vendored: nanovg (GLES3, `third_party/nanovg`), cJSON (`third_party/cjson`); Inter bundled
   (`assets/fonts/InterVariable.ttf`).
 
