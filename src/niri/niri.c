@@ -8,6 +8,16 @@
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Sort workspaces by output then index so the bar renders them in order. */
+static int workspace_cmp(const void *a, const void *b)
+{
+    const dc_niri_workspace *wa = a, *wb = b;
+    int out = strcmp(wa->output, wb->output);
+    if (out != 0)
+        return out;
+    return (int)wa->idx - (int)wb->idx;
+}
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -81,6 +91,7 @@ static void handle_workspaces_changed(dc_niri *niri, const cJSON *value)
         ws->is_urgent = json_bool(entry, "is_urgent");
     }
     niri->workspace_count = n;
+    qsort(niri->workspaces, (size_t)n, sizeof(niri->workspaces[0]), workspace_cmp);
 }
 
 static dc_niri_workspace *find_workspace(dc_niri *niri, uint64_t id)

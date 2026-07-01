@@ -81,37 +81,39 @@ static float draw_workspaces(dc_bar *bar)
         return pad;
 
     NVGcontext *vg = bar->render->vg;
-    const float gap = 6.0f;
-    const float pill = 28.0f;
+    const dc_theme *t = dc_theme_current;
     const float cy = bar->logical_height / 2.0f;
+    const float gap = 8.0f;
+    const float dot = 9.0f;         /* inactive workspace dot diameter */
+    const float pill_w = 30.0f;     /* focused workspace pill */
+    const float pill_h = 11.0f;
     float x = pad;
 
+    /* DMS style: focused = wide primary pill, others = dots (brighter if the
+     * active/visible workspace on their output). */
     for (int i = 0; i < count; i++) {
         const dc_niri_workspace *ws = &workspaces[i];
         if (bar->output->name && ws->output[0] && strcmp(ws->output, bar->output->name) != 0)
             continue;
 
-        const dc_theme *t = dc_theme_current;
-        nvgBeginPath(vg);
-        nvgRoundedRect(vg, x, cy - pill / 2.0f, pill, pill, 8.0f);
-        if (ws->is_urgent)
-            nvgFillColor(vg, tc(t->error));
-        else if (ws->is_focused)
-            nvgFillColor(vg, tc(t->primary));
-        else
-            nvgFillColor(vg, tc(t->surface_container_high));
-        nvgFill(vg);
-
-        char label[8];
-        snprintf(label, sizeof(label), "%u", ws->idx);
-        nvgFontFaceId(vg, bar->render->font_ui);
-        nvgFontSize(vg, 13.0f);
-        nvgFillColor(vg, ws->is_focused || ws->is_urgent ? tc(t->primary_text)
-                                                          : tc(t->surface_text));
-        nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
-        nvgText(vg, x + pill / 2.0f, cy, label, NULL);
-
-        x += pill + gap;
+        if (ws->is_focused) {
+            nvgBeginPath(vg);
+            nvgRoundedRect(vg, x, cy - pill_h / 2.0f, pill_w, pill_h, pill_h / 2.0f);
+            nvgFillColor(vg, tc(ws->is_urgent ? t->error : t->primary));
+            nvgFill(vg);
+            x += pill_w + gap;
+        } else {
+            nvgBeginPath(vg);
+            nvgCircle(vg, x + dot / 2.0f, cy, dot / 2.0f);
+            if (ws->is_urgent)
+                nvgFillColor(vg, tc(t->error));
+            else if (ws->is_active)
+                nvgFillColor(vg, tc(t->surface_variant_text));
+            else
+                nvgFillColor(vg, tc_alpha(t->outline, 150));
+            nvgFill(vg);
+            x += dot + gap;
+        }
     }
     return x;
 }
