@@ -10,6 +10,7 @@
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
+#include <ctype.h>
 #include <GLES2/gl2.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -143,8 +144,24 @@ static void draw_focused_window(dc_bar *bar, float start_x)
     if (!win || !focused_window_on_output(bar, win))
         return;
 
-    const char *text = win->title[0] ? win->title : win->app_id;
-    if (!text[0])
+    /* Pretty app name from the app_id (last dotted component, capitalised),
+     * then "AppName · Title" like DMS. */
+    char app_name[64] = {0};
+    if (win->app_id[0]) {
+        const char *base = strrchr(win->app_id, '.');
+        base = base ? base + 1 : win->app_id;
+        snprintf(app_name, sizeof(app_name), "%s", base);
+        app_name[0] = (char)toupper((unsigned char)app_name[0]);
+    }
+
+    char label[DC_NIRI_TITLE_MAX + 96];
+    if (app_name[0] && win->title[0])
+        snprintf(label, sizeof(label), "%s \xc2\xb7 %s", app_name, win->title);
+    else if (win->title[0])
+        snprintf(label, sizeof(label), "%s", win->title);
+    else
+        snprintf(label, sizeof(label), "%s", app_name);
+    if (!label[0])
         return;
 
     NVGcontext *vg = bar->render->vg;
@@ -160,7 +177,7 @@ static void draw_focused_window(dc_bar *bar, float start_x)
     nvgFontSize(vg, 14.0f);
     nvgFillColor(vg, tc(dc_theme_current->surface_text));
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
-    nvgText(vg, x, bar->logical_height / 2.0f, text, NULL);
+    nvgText(vg, x, bar->logical_height / 2.0f, label, NULL);
     nvgRestore(vg);
 }
 
