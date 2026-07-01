@@ -16,11 +16,12 @@ niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
 
 ## Current status — Milestone 2 in progress 🔨 (clock + workspaces working)
 - **Builds clean** (gcc + wayland-scanner, `make` → `./bin/dankc`, ~1.2 MB with nanovg, zero warnings).
-- **Runs on niri**: layer-shell bar per output via **nanovg** — DMS **green palette**, **workspace pills**
-  (green focus), **focused-window title**, centered **live clock**, right-side **status icons**
-  (wifi/bluetooth/volume, Material Symbols) + **battery**. From the **niri IPC EventStream** (per-output).
-  **Crisp on HiDPI** (fractional-scale + viewport). Icons use static Material Icons Round (the variable
-  Material Symbols crashes stb_truetype). Verified live on HDMI-A-1 @1x + eDP-1 @1.25x.
+- **Runs on niri**: layer-shell bar per output via **nanovg**, closely matching DMS. LEFT: apps-grid
+  launcher · workspace green-pill + grey dots (sorted) · app icon (PNG+SVG) + "AppName · Title". CENTER:
+  time + date. RIGHT: full DMS status cluster (signal/clipboard/notification/battery+%/wifi/bluetooth/
+  volume) with DMS colours. DMS **green palette** (#1d211b bg). **Crisp on HiDPI** (fractional-scale).
+  App icons via XDG icon-theme (nanovg PNG + nanosvg SVG). NOTE: right-cluster state (wifi/bt/volume/
+  notif) is still STATIC — M3 sd-bus services will make it live. Battery % is real (sysfs).
 - **Footprint:** Pss ≈ **30 MB** for two GPU bars, vs DMS `qs` Pss ≈ 477 MB.
 - Vendored: nanovg (GLES3, `third_party/nanovg`), cJSON (`third_party/cjson`); Inter bundled
   (`assets/fonts/InterVariable.ttf`).

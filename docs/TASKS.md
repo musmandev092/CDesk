@@ -36,8 +36,9 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
   (widgets sit directly on #1d211b, no per-widget pill backgrounds). Skipped by design.
 - [x] **T4 Clock + date.** Center shows "HH:MM  Www D" (24h time + date), centered as a group, matching
   DMS. Weather segment deferred to the weather/geolocation service. TODO: honour 12h when !use24HourClock.
-- [x] **T5 Focused app: name (text).** Shows "AppName · Title" (pretty name from app_id) like DMS. The
-  app ICON still needs T6 (icon-theme resolution). Minor: some titles carry a stray glyph — strip later.
+- [x] **T5 Focused app: icon + name.** Shows the app ICON (PNG + SVG via nanosvg) + "AppName · Title" like
+  DMS. Added the far-left apps-grid launcher icon too. Left section now fully mirrors DMS. Minor: some
+  titles carry a stray box-drawing glyph — strip later.
 - [x] **T6 App-icon resolution (XDG icon theme).** src/services/icons.c resolves app_id -> .desktop Icon=
   -> PNG file (icon-theme dirs + hicolor + pixmaps); bar decodes via nanovg/stb_image + caches per app.
   PNG works; SVG-only icons (Alacritty etc.) need nanosvg — FOLLOW-UP: vendor nanosvg for SVG icons.
