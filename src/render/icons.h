@@ -22,6 +22,7 @@
 #define DC_ICON_SETTINGS 0xe8b8
 #define DC_ICON_SEARCH 0xe8b6
 #define DC_ICON_APPS 0xe5c3
+#define DC_ICON_MUSIC_NOTE 0xe405
 #define DC_ICON_WIDGETS 0xe1bd
 #define DC_ICON_POWER 0xf8c7
 #define DC_ICON_DARK_MODE 0xe51c

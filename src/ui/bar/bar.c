@@ -9,6 +9,7 @@
 #include "services/battery.h"
 #include "services/bluez.h"
 #include "services/icons.h"
+#include "services/mpris.h"
 #include "services/net.h"
 #include "theme/theme.h"
 #include "wayland/egl.h"
@@ -225,8 +226,9 @@ static void draw_focused_window(dc_bar *bar, float start_x)
 }
 
 /* Center cluster: "HH:MM  Www D", matching DMS (weather is a separate widget,
- * added once the weather service lands). Honours use24HourClock. */
-static void draw_clock(dc_bar *bar)
+ * added once the weather service lands). Honours use24HourClock. Returns the x
+ * of the group's left edge (so the media widget can sit to its left). */
+static float draw_clock(dc_bar *bar)
 {
     NVGcontext *vg = bar->render->vg;
     const dc_theme *t = dc_theme_current;
@@ -262,6 +264,40 @@ static void draw_clock(dc_bar *bar)
     nvgFontSize(vg, 13.0f);
     nvgFillColor(vg, tc(t->surface_variant_text));
     nvgText(vg, x + time_w + gap, cy, date_str, NULL);
+    return x;
+}
+
+/* Now-playing media (music note + title), shown left of the clock only while a
+ * player is actually playing — like DMS. */
+static void draw_media(dc_bar *bar, float right_x)
+{
+    dc_mpris_info media;
+    if (!dc_mpris_read(&media) || !media.playing || !media.title[0])
+        return;
+
+    NVGcontext *vg = bar->render->vg;
+    const dc_theme *t = dc_theme_current;
+    const float cy = bar->logical_height / 2.0f;
+
+    nvgFontFaceId(vg, bar->render->font_ui);
+    nvgFontSize(vg, 13.0f);
+    float bounds[4];
+    nvgTextBounds(vg, 0.0f, 0.0f, media.title, NULL, bounds);
+    float title_w = bounds[2] - bounds[0];
+    const float max_w = 240.0f;
+    if (title_w > max_w)
+        title_w = max_w;
+    const float title_x = right_x - title_w;
+
+    nvgSave(vg);
+    nvgScissor(vg, title_x, 0.0f, title_w, bar->logical_height);
+    nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+    nvgFillColor(vg, tc(t->surface_text));
+    nvgText(vg, title_x, cy, media.title, NULL);
+    nvgRestore(vg);
+
+    dc_render_icon(bar->render, DC_ICON_MUSIC_NOTE, title_x - 8.0f, cy, 17.0f, t->primary,
+                   NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
 }
 
 /* Battery indicator (vector pictograph + percentage) ending at `right_edge`.
@@ -409,7 +445,8 @@ void dc_bar_render(dc_bar *bar)
     float launcher_end = draw_launcher(bar);
     float workspaces_end = draw_workspaces(bar, launcher_end);
     draw_focused_window(bar, workspaces_end);
-    draw_clock(bar);
+    float clock_left = draw_clock(bar);
+    draw_media(bar, clock_left - 16.0f);
     draw_right_cluster(bar);
     nvgEndFrame(bar->render->vg);
 
