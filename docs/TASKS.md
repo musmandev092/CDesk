@@ -82,8 +82,10 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
   GetCapabilities/GetServerInformation + Closed/ActionInvoked signals, urgency+image hints, replaces_id,
   per-urgency lifetimes, 1 Hz expiry). Top-right toast stack (dc_toasts): up to 4 cards (avatar/app/
   summary/body, critical accent), click-to-dismiss with input-region passthrough. Declines the name if a
-  daemon already owns it. Verified on an isolated session bus. TODO later: notification CENTER/history
-  panel, action buttons, inline images.
+  daemon already owns it. Verified on an isolated session bus. Notification CENTER DONE: 64-entry history
+  ring (archives on expire/dismiss/close), top-right popout with cards + "Clear all" + entrance anim,
+  opened from the bar bell (precise hit region). TODO later: action buttons, inline images, history scroll,
+  grouping.
 - [x] **T21 App launcher** — DONE: centered wlr-layer overlay with exclusive keyboard focus, search
   field + ranked desktop-entry results (icons via dc_icon_resolve), type-to-filter, Up/Down/Enter/Esc,
   click-to-launch. Backed by apps.c (XDG scan + fuzzy search) and xkb keyboard input in wl.c. Opens from

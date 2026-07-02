@@ -24,8 +24,8 @@ niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
   (rfkill/wpctl/brightnessctl), dismiss on outside click.
 - **Volume OSD** (T19): transient bottom-center overlay, auto-hide, pops on volume change.
 - **Notifications** (T20): full org.freedesktop.Notifications server + top-right toast stack (max 4
-  cards, avatar/app/summary/body, critical accent, click-to-dismiss). Declines the name if a daemon
-  already owns it. History/center panel + action buttons deferred.
+  cards, click-to-dismiss) + notification CENTER popout (64-entry history, cards + Clear-all, opened from
+  the bar bell). Declines the name if a daemon already owns it. Action buttons/images deferred.
 - **App launcher** (T21): centered spotlight overlay with keyboard focus (xkb), fuzzy desktop-entry
   search + icons, type/arrows/enter/click to launch. Opens from the bar launcher button.
 - **Config + themes** (T26): ~/.config/dankc/config.json (cJSON) — theme/clock24h/showDate/animation
@@ -37,9 +37,9 @@ niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
   gallium threads for the display fd. Now uses thread-safe prepare_read/read_events + a wall-clock loop
   tick. See memory `dankc-wayland-dispatch-deadlock`.
 - **Footprint:** RSS ≈ **145 MB** for two GPU bars incl. Mesa (Pss lower), vs DMS `qs` ≈ 477 MB.
-- **Next:** T23 clipboard history (wlr-data-control, safe/testable), then apply anim to toasts/OSD +
-  workspace pill. T22 lock screen DEFERRED: needs the user awake to test PAM auth — locking the live
-  session with unverified code risks a lockout.
+- **Next:** exit animations (panels currently pop away on hide); workspace-focus pill animation; then
+  T23 clipboard (needs `wl-clipboard` installed to verify) and T22 lock screen (DEFERRED — needs the user
+  awake to test PAM auth; locking the live session with unverified code risks a lockout).
 - Vendored: nanovg (GLES3, `third_party/nanovg`), cJSON (`third_party/cjson`); Inter bundled
   (`assets/fonts/InterVariable.ttf`).
 
