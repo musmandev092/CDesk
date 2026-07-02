@@ -140,6 +140,17 @@ typedef struct {
 
 #define DC_BAR_MAX_HITS 32
 
+/* Phases of the media-title marquee loop (docs/12-BAR-SPEC.md sec.4 music),
+ * matching DMS Media.qml's SequentialAnimation exactly: pause -> scroll out
+ * -> pause -> scroll back -> repeat. This is a bounce, not a wrap-around
+ * loop, so there is no gap/separator to reproduce. */
+typedef enum {
+    DC_MARQUEE_PAUSE_START,
+    DC_MARQUEE_SCROLL_OUT,
+    DC_MARQUEE_PAUSE_END,
+    DC_MARQUEE_SCROLL_BACK,
+} dc_marquee_phase;
+
 struct dc_bar {
     dc_wayland *wl;
     dc_output *output;
@@ -184,6 +195,23 @@ struct dc_bar {
     bool ws_active_init;
     dc_anim ws_anim;
     struct wl_callback *ws_frame_cb;
+
+    /* Media title/artist marquee (docs/12-BAR-SPEC.md sec.4 music: "2s pause,
+     * 60ms/px"), self-driven by frame callbacks exactly like ws_anim above.
+     * It isn't a dc_anim because it's an infinite pause/scroll/pause/scroll
+     * cycle rather than a finite tween, so it keeps its own phase state
+     * machine (bar_update_marquee() in layout_media()). media_marquee_active
+     * is recomputed at the top of every dc_bar_render() and only set back to
+     * true that same frame if the music widget actually drew an overflowing,
+     * playing, non-static label — the instant playback pauses, the text
+     * shrinks to fit, or animations are disabled, this drops to false and
+     * media_frame_done() stops re-arming, returning the bar to its normal
+     * ~1Hz cadence. */
+    char media_marquee_label[DC_NIRI_TITLE_MAX]; /* label the phase timer belongs to */
+    dc_marquee_phase media_marquee_phase;
+    int64_t media_marquee_phase_start_ms;
+    bool media_marquee_active;
+    struct wl_callback *media_frame_cb;
 
     int logical_width;  /* from the layer-surface configure */
     int logical_height;
@@ -898,12 +926,95 @@ static void draw_clock_pill(dc_bar *bar, const dc_pill *p)
 
 /* --- music (media) --------------------------------------------------------- */
 
-/* 20x20 music_note (primary) + "Title • Artist" (elided to ~200px) + a
- * prev/play-pause/next transport, matching DMS's Media.qml horizontal layout
- * (docs/12-BAR-SPEC.md sec.4 music). Hidden entirely (returns 0) when no
- * MPRIS player is present. Shared measure/draw, like the widgets above;
- * pushes the three transport hit rects itself when drawing (custom_hit —
- * the whole pill is not one click target here, docs/12-BAR-SPEC.md sec.5). */
+/* DMS Media.qml's SequentialAnimation constants (verified against
+ * quickshell/Modules/DankBar/Widgets/Media.qml): 2s pause at each end, then a
+ * linear scroll at 60ms per overflow pixel (minimum 1s so short overflows
+ * don't whip past). */
+#define DC_MARQUEE_PAUSE_MS 2000
+#define DC_MARQUEE_MS_PER_PX 60.0f
+#define DC_MARQUEE_MIN_SCROLL_MS 1000
+
+/* Reset the marquee phase machine to a clean "not scrolling" state — called
+ * whenever the music widget draws a static (non-animating) label this frame,
+ * so playback resuming (or the title changing back to something that
+ * overflows) always restarts from a fresh pause instead of resuming mid-cycle
+ * against a stale wall-clock timestamp. */
+static void bar_reset_marquee(dc_bar *bar)
+{
+    bar->media_marquee_phase = DC_MARQUEE_PAUSE_START;
+    bar->media_marquee_phase_start_ms = 0;
+    bar->media_marquee_label[0] = '\0';
+}
+
+/* Advance (and return the current px offset of) the marquee's infinite
+ * pause/scroll-out/pause/scroll-back cycle. Only called from the draw pass
+ * when overflow+playing+animations-enabled all hold this frame — the caller
+ * is responsible for setting bar->media_marquee_active so dc_bar_render()
+ * knows to keep re-arming the frame callback (docs/12-BAR-SPEC.md sec.4
+ * music / sec.7 S6). */
+static float bar_update_marquee(dc_bar *bar, const char *label, float overflow_px)
+{
+    if (overflow_px < 0.0f)
+        overflow_px = 0.0f;
+
+    int64_t now = dc_anim_now_ms();
+    if (strcmp(bar->media_marquee_label, label) != 0) {
+        /* New/changed track: DMS's mediaText.onTextChanged restarts the whole
+         * SequentialAnimation from the top. */
+        snprintf(bar->media_marquee_label, sizeof(bar->media_marquee_label), "%s", label);
+        bar->media_marquee_phase = DC_MARQUEE_PAUSE_START;
+        bar->media_marquee_phase_start_ms = now;
+    }
+
+    int scroll_ms = (int)fmaxf(DC_MARQUEE_MIN_SCROLL_MS, overflow_px * DC_MARQUEE_MS_PER_PX);
+    int64_t elapsed = now - bar->media_marquee_phase_start_ms;
+    float offset = 0.0f;
+
+    switch (bar->media_marquee_phase) {
+    case DC_MARQUEE_PAUSE_START:
+        offset = 0.0f;
+        if (elapsed >= DC_MARQUEE_PAUSE_MS) {
+            bar->media_marquee_phase = DC_MARQUEE_SCROLL_OUT;
+            bar->media_marquee_phase_start_ms = now;
+        }
+        break;
+    case DC_MARQUEE_SCROLL_OUT:
+        if (elapsed >= scroll_ms) {
+            bar->media_marquee_phase = DC_MARQUEE_PAUSE_END;
+            bar->media_marquee_phase_start_ms = now;
+            offset = overflow_px;
+        } else {
+            offset = ((float)elapsed / (float)scroll_ms) * overflow_px;
+        }
+        break;
+    case DC_MARQUEE_PAUSE_END:
+        offset = overflow_px;
+        if (elapsed >= DC_MARQUEE_PAUSE_MS) {
+            bar->media_marquee_phase = DC_MARQUEE_SCROLL_BACK;
+            bar->media_marquee_phase_start_ms = now;
+        }
+        break;
+    case DC_MARQUEE_SCROLL_BACK:
+        if (elapsed >= scroll_ms) {
+            bar->media_marquee_phase = DC_MARQUEE_PAUSE_START;
+            bar->media_marquee_phase_start_ms = now;
+            offset = 0.0f;
+        } else {
+            offset = overflow_px * (1.0f - (float)elapsed / (float)scroll_ms);
+        }
+        break;
+    }
+
+    return offset;
+}
+
+/* 20x20 music_note (primary) + "Title • Artist" (elided to ~200px, or
+ * marquee-scrolled while playing and overflowing — docs/12-BAR-SPEC.md
+ * sec.4 music) + a prev/play-pause/next transport, matching DMS's Media.qml
+ * horizontal layout. Hidden entirely (returns 0) when no MPRIS player is
+ * present. Shared measure/draw, like the widgets above; pushes the three
+ * transport hit rects itself when drawing (custom_hit — the whole pill is
+ * not one click target here, docs/12-BAR-SPEC.md sec.5). */
 static float layout_media(dc_bar *bar, float x0, bool draw)
 {
     dc_mpris_info info;
@@ -912,6 +1023,7 @@ static float layout_media(dc_bar *bar, float x0, bool draw)
 
     NVGcontext *vg = bar->render->vg;
     const dc_theme *t = dc_theme_current;
+    const dc_config *cfg = dc_config_current;
     const float cy = bar_cy(bar);
     const float icon_sz = 20.0f;
     const float btn_sm = 20.0f;
@@ -947,10 +1059,37 @@ static float layout_media(dc_bar *bar, float x0, bool draw)
 
     nvgFontFaceId(vg, bar->render->font_ui);
     nvgFontSize(vg, DC_BAR_TEXT_SIZE);
-    bar_ellipsize(vg, label, text_max);
     float bounds[4];
     nvgTextBounds(vg, 0.0f, 0.0f, label, NULL, bounds);
-    float label_w = bounds[2] - bounds[0];
+    float raw_w = bounds[2] - bounds[0];
+
+    /* DMS: needsScrolling = implicitWidth > textContainer.width — the
+     * marquee only ever engages on genuine overflow, never on text that
+     * already fits inside the box. Scrolling is further gated on `playing`
+     * (DMS itself scrolls even while paused, as long as a track is loaded;
+     * this C port intentionally narrows that to "playing" so a paused/idle
+     * overflowing title can't hold the bar off its ~1Hz idle cadence
+     * forever) and on animationsEnabled, matching every other frame-callback
+     * animation in this file. */
+    bool overflow = raw_w > text_max;
+    bool marquee_wanted = overflow && playing && cfg->animations_enabled;
+
+    float label_w;
+    float marquee_offset = 0.0f;
+    if (marquee_wanted) {
+        label_w = text_max;
+        if (draw) {
+            marquee_offset = bar_update_marquee(bar, label, raw_w - text_max + 5.0f);
+            bar->media_marquee_active = true;
+        }
+    } else {
+        if (draw)
+            bar_reset_marquee(bar);
+        if (overflow)
+            bar_ellipsize(vg, label, text_max);
+        nvgTextBounds(vg, 0.0f, 0.0f, label, NULL, bounds);
+        label_w = bounds[2] - bounds[0];
+    }
 
     float x = x0;
 
@@ -966,7 +1105,18 @@ static float layout_media(dc_bar *bar, float x0, bool draw)
         nvgFontSize(vg, DC_BAR_TEXT_SIZE);
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(t->surface_text));
-        nvgText(vg, x, cy, label, NULL);
+        if (marquee_wanted) {
+            /* Full (non-ellipsized) label shifted left by the current
+             * scroll offset, clipped to the reserved text_max box — same
+             * nvgSave/nvgScissor/nvgRestore idiom as toasts.c's summary
+             * line. */
+            nvgSave(vg);
+            nvgScissor(vg, x, cy - DC_BAR_TEXT_SIZE, label_w, DC_BAR_TEXT_SIZE * 2.0f);
+            nvgText(vg, x - marquee_offset, cy, label, NULL);
+            nvgRestore(vg);
+        } else {
+            nvgText(vg, x, cy, label, NULL);
+        }
     }
     x += label_w + gap;
 
@@ -1663,6 +1813,25 @@ static void ws_frame_done(void *data, struct wl_callback *cb, uint32_t time)
         dc_bar_render(bar);
 }
 
+/* Same self-terminating pattern as ws_frame_done() above, driving the media
+ * marquee instead of the workspace morph: re-fires only while the most
+ * recent render actually animated the marquee (bar->media_marquee_active,
+ * recomputed fresh every dc_bar_render() call), so it stops re-arming the
+ * instant playback pauses, the label stops overflowing, or animations get
+ * disabled — never a free-running timer. */
+static void media_frame_done(void *data, struct wl_callback *cb, uint32_t time);
+static const struct wl_callback_listener media_frame_listener = {.done = media_frame_done};
+
+static void media_frame_done(void *data, struct wl_callback *cb, uint32_t time)
+{
+    dc_bar *bar = data;
+    DC_UNUSED(time);
+    wl_callback_destroy(cb);
+    bar->media_frame_cb = NULL;
+    if (bar->media_marquee_active)
+        dc_bar_render(bar);
+}
+
 /* --- hover overlay --------------------------------------------------------- */
 
 /* Visual height (px) of the shape at a given hit region — hit rects
@@ -1769,6 +1938,12 @@ void dc_bar_render(dc_bar *bar)
     draw_bar_background(bar);
 
     bar->hit_count = 0;
+    /* Recomputed by layout_media() below (draw pass only) if the music
+     * widget is present, playing, overflowing, and animating this frame —
+     * defaulting to false here means a widget that's absent this frame (or
+     * that just went static) can never leave a stale frame-callback loop
+     * running (docs/12-BAR-SPEC.md sec.4 music / sec.7 S6). */
+    bar->media_marquee_active = false;
     const dc_config *cfg = dc_config_current;
     layout_left(bar, cfg->bar_left_widgets, cfg->bar_left_widgets_n);
     layout_center(bar, cfg->bar_center_widgets, cfg->bar_center_widgets_n);
@@ -1784,6 +1959,12 @@ void dc_bar_render(dc_bar *bar)
     if (dc_anim_active(&bar->ws_anim) && !bar->ws_frame_cb) {
         bar->ws_frame_cb = wl_surface_frame(bar->surface);
         wl_callback_add_listener(bar->ws_frame_cb, &ws_frame_listener, bar);
+    }
+    /* Same idea for the media marquee (docs/12-BAR-SPEC.md sec.4 music):
+     * re-arm only while this frame actually animated it. */
+    if (bar->media_marquee_active && !bar->media_frame_cb) {
+        bar->media_frame_cb = wl_surface_frame(bar->surface);
+        wl_callback_add_listener(bar->media_frame_cb, &media_frame_listener, bar);
     }
 
     dc_egl_swap(bar->egl, &bar->egl_window);
@@ -1847,6 +2028,11 @@ static void layer_surface_handle_closed(void *data, struct zwlr_layer_surface_v1
     if (bar->ws_frame_cb) {
         wl_callback_destroy(bar->ws_frame_cb);
         bar->ws_frame_cb = NULL;
+    }
+    /* Same reasoning for the media-marquee frame callback. */
+    if (bar->media_frame_cb) {
+        wl_callback_destroy(bar->media_frame_cb);
+        bar->media_frame_cb = NULL;
     }
 }
 
@@ -1991,6 +2177,8 @@ void dc_bar_destroy(dc_bar *bar)
         return;
     if (bar->ws_frame_cb)
         wl_callback_destroy(bar->ws_frame_cb);
+    if (bar->media_frame_cb)
+        wl_callback_destroy(bar->media_frame_cb);
     if (bar->egl_ready)
         dc_egl_window_finish(&bar->egl_window, bar->egl);
     if (bar->viewport)
