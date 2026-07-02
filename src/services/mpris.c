@@ -76,6 +76,33 @@ static void read_metadata(const char *player, dc_mpris_info *info)
                 snprintf(info->artist, sizeof(info->artist), "%s", artist);
             sd_bus_message_exit_container(reply);
             sd_bus_message_exit_container(reply);
+        } else if (key && strcmp(key, "mpris:artUrl") == 0) {
+            const char *val = NULL;
+            sd_bus_message_enter_container(reply, 'v', "s");
+            sd_bus_message_read_basic(reply, 's', &val);
+            sd_bus_message_exit_container(reply);
+            if (val)
+                snprintf(info->art_url, sizeof(info->art_url), "%s", val);
+        } else if (key && strcmp(key, "mpris:length") == 0) {
+            /* Length is a{sv}-boxed int64 ('x') on most players, but some use
+             * uint64 ('t'); read whichever the variant actually holds. */
+            char type = 0;
+            const char *contents = NULL;
+            if (sd_bus_message_peek_type(reply, &type, &contents) > 0 && type == 'v' && contents) {
+                sd_bus_message_enter_container(reply, 'v', contents);
+                if (contents[0] == 't') {
+                    uint64_t len = 0;
+                    sd_bus_message_read_basic(reply, 't', &len);
+                    info->length_us = (int64_t)len;
+                } else {
+                    int64_t len = 0;
+                    sd_bus_message_read_basic(reply, 'x', &len);
+                    info->length_us = len;
+                }
+                sd_bus_message_exit_container(reply);
+            } else {
+                sd_bus_message_skip(reply, "v");
+            }
         } else {
             sd_bus_message_skip(reply, "v");
         }
@@ -105,6 +132,21 @@ static void refresh(dc_mpris_info *info)
     }
 
     read_metadata(player, info);
+
+    /* Player.Position is a plain int64 property (microseconds), not part of
+     * Metadata (docs/13-POPOUTS-SPEC.md sec.5 progress bar). */
+    sd_bus_error perr = SD_BUS_ERROR_NULL;
+    sd_bus_message *preply = NULL;
+    if (sd_bus_get_property(g_user, player, DC_MPRIS_PATH, DC_MPRIS_PLAYER_IFACE, "Position", &perr,
+                            &preply, "x") >= 0) {
+        int64_t pos = 0;
+        if (sd_bus_message_read_basic(preply, 'x', &pos) > 0)
+            info->position_us = pos;
+        sd_bus_message_unref(preply);
+    } else {
+        sd_bus_error_free(&perr);
+    }
+
     free(player);
 }
 

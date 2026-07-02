@@ -7,6 +7,7 @@
 #define DC_SERVICES_MPRIS_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 struct dc_dbus;
 
@@ -15,6 +16,13 @@ typedef struct dc_mpris_info {
     bool playing; /* PlaybackStatus == "Playing" */
     char title[256];
     char artist[128];
+    /* Dashboard Media tab (docs/13-POPOUTS-SPEC.md sec.5): album art + a
+     * progress bar. `art_url` is the raw mpris:artUrl (file://, http(s)://, or
+     * empty). Position/Length are microseconds (MPRIS units); 0 when a player
+     * doesn't report them. */
+    char art_url[512];
+    int64_t position_us;
+    int64_t length_us;
 } dc_mpris_info;
 
 /* Bind the session bus (from dc_dbus). Call once at startup. */

@@ -19,4 +19,10 @@ int dc_sysmon_cpu_percent(void);
 /* (MemTotal - MemAvailable) / MemTotal * 100, from the most recent poll. */
 int dc_sysmon_mem_percent(void);
 
+/* CPU package temperature in whole degrees Celsius from the most recent poll
+ * (first usable /sys/class/thermal zone, else a hwmon tempN_input), or -1 if
+ * no sensor is readable. Used by the dashboard Overview's temperature meter
+ * (docs/13-POPOUTS-SPEC.md sec.5). */
+int dc_sysmon_temp_c(void);
+
 #endif /* DC_SERVICES_SYSMON_H */

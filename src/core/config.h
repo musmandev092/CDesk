@@ -45,6 +45,7 @@ typedef struct dc_config {
     double weather_lat;
     double weather_lon;
     bool weather_fahrenheit;
+    char weather_location[64]; /* display name for the dashboard Weather tab */
 
     /* Left/center/right widget ids, in display order (left-to-right within
      * each section; see dc_bar's layout pass for how each section anchors). */
