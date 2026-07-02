@@ -12,6 +12,7 @@
 #include "services/icons.h"
 #include "services/mpris.h"
 #include "services/net.h"
+#include "services/tray.h"
 #include "theme/theme.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
@@ -65,6 +66,14 @@ struct dc_bar {
     /* Center x of the notification-bell + clipboard icons (dynamic; hit-test). */
     float notif_cx;
     float clip_cx;
+
+    /* System tray (StatusNotifier) + a per-name nanovg image cache. */
+    struct dc_tray *tray;
+    struct {
+        char name[DC_TRAY_STR];
+        int image;
+    } tray_cache[DC_TRAY_MAX];
+    int tray_cache_n;
 
     int logical_width;  /* from the layer-surface configure */
     int logical_height;
@@ -372,6 +381,58 @@ static float draw_battery(dc_bar *bar, float right_edge)
  * wifi, battery+%, notifications, clipboard, signal. State is static until the
  * sd-bus services (M3) drive it; colours follow DMS (wifi/signal green,
  * bluetooth info-blue, battery green, rest surfaceText). */
+/* Resolve+load a tray icon by name, cached per name (nanovg image handle). */
+static int get_tray_image(dc_bar *bar, const char *name)
+{
+    for (int i = 0; i < bar->tray_cache_n; i++)
+        if (strcmp(bar->tray_cache[i].name, name) == 0)
+            return bar->tray_cache[i].image;
+
+    int img = 0;
+    char *path = dc_icon_resolve(name, 20, 1);
+    if (path) {
+        img = dc_render_load_icon(bar->render, path, 20);
+        free(path);
+    }
+    if (bar->tray_cache_n < DC_TRAY_MAX) {
+        snprintf(bar->tray_cache[bar->tray_cache_n].name,
+                 sizeof(bar->tray_cache[bar->tray_cache_n].name), "%s", name);
+        bar->tray_cache[bar->tray_cache_n].image = img;
+        bar->tray_cache_n++;
+    }
+    return img;
+}
+
+/* Tray items, drawn to the left of the signal icon (x decreasing). */
+static void draw_tray(dc_bar *bar, float *x, float cy, float isize, float step)
+{
+    if (!bar->tray)
+        return;
+    const dc_tray_item *items[DC_TRAY_MAX];
+    int n = dc_tray_items(bar->tray, items, DC_TRAY_MAX);
+    NVGcontext *vg = bar->render->vg;
+    for (int i = 0; i < n; i++) {
+        *x -= step;
+        int img = items[i]->icon_name[0] ? get_tray_image(bar, items[i]->icon_name) : 0;
+        if (img > 0) {
+            NVGpaint pat = nvgImagePattern(vg, *x - isize, cy - isize / 2.0f, isize, isize, 0.0f,
+                                           img, 1.0f);
+            nvgBeginPath(vg);
+            nvgRect(vg, *x - isize, cy - isize / 2.0f, isize, isize);
+            nvgFillPaint(vg, pat);
+            nvgFill(vg);
+        } else {
+            /* Fallback: a small dot for pixmap-only / unresolved items. */
+            nvgBeginPath(vg);
+            nvgCircle(vg, *x - isize / 2.0f, cy, 4.0f);
+            nvgFillColor(vg, nvgRGBA(dc_theme_current->surface_text.r,
+                                     dc_theme_current->surface_text.g,
+                                     dc_theme_current->surface_text.b, 200));
+            nvgFill(vg);
+        }
+    }
+}
+
 static void draw_right_cluster(dc_bar *bar)
 {
     const dc_theme *t = dc_theme_current;
@@ -423,6 +484,8 @@ static void draw_right_cluster(dc_bar *bar)
     bar->clip_cx = x - isize / 2.0f;
     x -= step;
     dc_render_icon(bar->render, DC_ICON_SIGNAL_CELLULAR_ALT, x, cy, isize, t->primary, align);
+
+    draw_tray(bar, &x, cy, isize, step);
 }
 
 void dc_bar_render(dc_bar *bar)
@@ -570,6 +633,11 @@ struct wl_surface *dc_bar_surface(dc_bar *bar)
 dc_output *dc_bar_output(dc_bar *bar)
 {
     return bar->output;
+}
+
+void dc_bar_set_tray(dc_bar *bar, struct dc_tray *tray)
+{
+    bar->tray = tray;
 }
 
 dc_bar_region dc_bar_hittest(dc_bar *bar, double x, double y)

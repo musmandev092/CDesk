@@ -17,6 +17,7 @@
 #include "services/audio.h"
 #include "services/mpris.h"
 #include "services/notifications.h"
+#include "services/tray.h"
 #include "theme/theme.h"
 #include "ui/bar/bar.h"
 #include "ui/clip_picker.h"
@@ -324,6 +325,7 @@ int main(int argc, char **argv)
     dc_bluez_init(dbus);
     dc_mpris_init(dbus);
     dc_notifications *notifications = dc_notifications_create(dbus);
+    dc_tray *tray = dc_tray_create(dbus);
 
     dc_render render = {0};
     struct bar_set set = {0};
@@ -337,6 +339,10 @@ int main(int argc, char **argv)
     }
     if (set.count == 0)
         dc_warn("no outputs found; nothing to display");
+
+    for (int i = 0; i < set.count; i++)
+        dc_bar_set_tray(set.bars[i], tray);
+    dc_tray_set_changed_cb(tray, niri_changed, &set); /* re-render bars on tray change */
 
     dc_control_center *control_center = dc_control_center_create(wl, &egl, &render);
     dc_osd *osd = dc_osd_create(wl, &egl, &render);
@@ -420,6 +426,7 @@ int main(int argc, char **argv)
     dc_loop_run(g_loop);
 
     dc_info("shutting down");
+    dc_tray_destroy(tray);
     dc_settings_destroy(settings);
     dc_clip_picker_destroy(clip_picker);
     dc_clipboard_destroy(clipboard);

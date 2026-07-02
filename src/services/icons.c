@@ -8,8 +8,8 @@
 #include <unistd.h>
 
 /* Icon-theme sizes to try, bar-friendly sizes first. */
-static const char *const ICON_SIZES[] = {"24x24",   "32x32",   "48x48", "16x16",
-                                         "64x64",   "128x128", "256x256"};
+static const char *const ICON_SIZES[] = {"24x24", "22x22",   "32x32",   "48x48",  "16x16",
+                                         "36x36", "64x64",   "128x128", "256x256"};
 
 static char *dup_if_readable(const char *path)
 {

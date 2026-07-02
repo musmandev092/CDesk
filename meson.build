@@ -74,7 +74,7 @@ src = files(
   'src/services/battery.c', 'src/services/audio.c', 'src/services/net.c',
   'src/services/dbus.c', 'src/services/bluez.c', 'src/services/mpris.c',
   'src/services/icons.c', 'src/services/apps.c', 'src/services/notifications.c',
-  'src/services/clipboard.c',
+  'src/services/clipboard.c', 'src/services/tray.c',
   'src/niri/niri.c',
   'src/theme/theme.c',
   'src/ipc/control.c',
