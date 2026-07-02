@@ -43,8 +43,13 @@ bool dc_dashboard_visible(dc_dashboard *d);
 struct wl_surface *dc_dashboard_surface(dc_dashboard *d);
 
 /* Left click at surface-local logical (x, y): tab bar, calendar chevrons,
- * media transport, forecast/weather pills. */
+ * media transport, forecast/weather pills, wallpaper thumbnails. */
 void dc_dashboard_handle_click(dc_dashboard *d, double x, double y);
+
+/* Wheel scroll over the dashboard: offsets the Wallpapers tab's grid (no-op
+ * on the other tabs). `steps_v` is debounced whole steps, like the other
+ * popouts' handle_scroll entry points (see main.c handle_bar_axis). */
+void dc_dashboard_handle_scroll(dc_dashboard *d, int steps_v);
 
 /* Re-render if visible (call on the 1 Hz clock tick so the clock/meters/media
  * progress stay live). */

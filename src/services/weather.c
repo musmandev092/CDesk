@@ -1,5 +1,6 @@
 #include "services/weather.h"
 
+#include <ctype.h>
 #include <fcntl.h>
 #include <math.h>
 #include <poll.h>
@@ -18,7 +19,12 @@
 #define DC_WEATHER_REFRESH_SEC (15 * 60)
 #define DC_WEATHER_RETRY_SEC (2 * 60)
 #define DC_WEATHER_FETCH_TIMEOUT_SEC 10 /* guards against a hung curl */
-#define DC_WEATHER_BUF_CAP 8192          /* daily block + current extras */
+#define DC_WEATHER_BUF_CAP 16384         /* daily + hourly blocks + current extras */
+#define DC_WEATHER_HOURLY_REQUEST 36     /* ask for a few hours of margin past 24 (see
+                                           * start_fetch(): open-meteo's forecast_hours
+                                           * already starts at "now", but the extra
+                                           * margin keeps the defensive time-array scan
+                                           * below correct even if it doesn't). */
 
 static struct {
     bool configured;
@@ -153,6 +159,54 @@ static bool parse_response(void)
                 }
             }
 
+            /* Next-24h hourly forecast: parallel arrays keyed by index, same
+             * shape as `daily` above. open-meteo's `forecast_hours` request
+             * parameter already starts the array at the current hour, but we
+             * defensively scan for the first entry whose timestamp is >= now
+             * in case that ever isn't true (DST edges, clock skew, ...). */
+            const cJSON *hourly = cJSON_GetObjectItemCaseSensitive(root, "hourly");
+            if (cJSON_IsObject(hourly)) {
+                const cJSON *htime = cJSON_GetObjectItemCaseSensitive(hourly, "time");
+                const cJSON *hcode = cJSON_GetObjectItemCaseSensitive(hourly, "weather_code");
+                const cJSON *htemp = cJSON_GetObjectItemCaseSensitive(hourly, "temperature_2m");
+                int total = cJSON_IsArray(htime) ? cJSON_GetArraySize(htime) : 0;
+                if (cJSON_IsArray(hcode) && cJSON_IsArray(htemp) && total > 0) {
+                    time_t now = time(NULL);
+                    struct tm tmnow;
+                    localtime_r(&now, &tmnow);
+                    char now_key[64]; /* generous: keeps -Wformat-truncation quiet */
+                    snprintf(now_key, sizeof(now_key), "%04d-%02d-%02dT%02d:00",
+                             tmnow.tm_year + 1900, tmnow.tm_mon + 1, tmnow.tm_mday, tmnow.tm_hour);
+
+                    int start = 0;
+                    for (int i = 0; i < total; i++) {
+                        const cJSON *ti = cJSON_GetArrayItem(htime, i);
+                        if (cJSON_IsString(ti) && ti->valuestring &&
+                            strcmp(ti->valuestring, now_key) >= 0) {
+                            start = i;
+                            break;
+                        }
+                    }
+
+                    int n = 0;
+                    for (int i = start; i < total && n < 24; i++, n++) {
+                        dc_weather_hourly *hh = &st.hourly[n];
+                        const cJSON *c = cJSON_GetArrayItem(hcode, i);
+                        const cJSON *tt = cJSON_GetArrayItem(htemp, i);
+                        const cJSON *ti = cJSON_GetArrayItem(htime, i);
+                        hh->weather_code = cJSON_IsNumber(c) ? c->valueint : 0;
+                        hh->temp_c = cJSON_IsNumber(tt) ? (int)lround(tt->valuedouble) : 0;
+                        hh->hour = 0;
+                        if (cJSON_IsString(ti) && ti->valuestring) {
+                            const char *t = strchr(ti->valuestring, 'T');
+                            if (t && isdigit((unsigned char)t[1]) && isdigit((unsigned char)t[2]))
+                                hh->hour = (t[1] - '0') * 10 + (t[2] - '0');
+                        }
+                    }
+                    st.hourly_count = n;
+                }
+            }
+
             g_weather.cache = st;
             g_weather.have_cache = true;
             ok = true;
@@ -230,14 +284,16 @@ static void drain_fetch(void)
 
 static void start_fetch(void)
 {
-    char url[512];
+    char url[640];
     snprintf(url, sizeof(url),
               "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
               "&current=temperature_2m,weather_code,is_day,apparent_temperature,"
               "relative_humidity_2m,wind_speed_10m,surface_pressure,precipitation_probability"
               "&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset"
+              "&hourly=temperature_2m,weather_code&forecast_hours=%d"
               "&forecast_days=7&timezone=auto&temperature_unit=%s",
-              g_weather.lat, g_weather.lon, g_weather.fahrenheit ? "fahrenheit" : "celsius");
+              g_weather.lat, g_weather.lon, DC_WEATHER_HOURLY_REQUEST,
+              g_weather.fahrenheit ? "fahrenheit" : "celsius");
 
     int fds[2];
     if (pipe(fds) < 0) {

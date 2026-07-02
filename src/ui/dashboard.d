@@ -6,7 +6,8 @@ src/ui/dashboard.o: src/ui/dashboard.c src/ui/dashboard.h src/core/anim.h \
  protocol/generated/fractional-scale-v1-client-protocol.h \
  third_party/nanovg/nanovg.h \
  protocol/generated/viewporter-client-protocol.h \
- protocol/generated/wlr-layer-shell-unstable-v1-client-protocol.h
+ protocol/generated/wlr-layer-shell-unstable-v1-client-protocol.h \
+ third_party/nanovg/stb_image.h
 src/ui/dashboard.h:
 src/core/anim.h:
 src/core/config.h:
@@ -26,3 +27,4 @@ protocol/generated/fractional-scale-v1-client-protocol.h:
 third_party/nanovg/nanovg.h:
 protocol/generated/viewporter-client-protocol.h:
 protocol/generated/wlr-layer-shell-unstable-v1-client-protocol.h:
+third_party/nanovg/stb_image.h:

@@ -17,12 +17,14 @@
 
 #include <GLES2/gl2.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <math.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -31,6 +33,12 @@
 #include "nanovg.h"
 #include "viewporter-client-protocol.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
+
+/* Declarations only (no STB_IMAGE_IMPLEMENTATION): nanovg.c already provides
+ * the (non-static) stbi_load/stbi_image_free symbols this TU links against,
+ * so the Wallpapers tab can decode+downscale its own thumbnails instead of
+ * handing nvgCreateImage() a full-size image per grid cell. */
+#include "stb_image.h"
 
 /* Popout size: DMS's DankDashPopout.qml popupWidth 700 + the OverviewTab's
  * ~410px content plus the tab bar, matching the user's live reference
@@ -56,6 +64,7 @@ typedef enum {
     HIT_MEDIA_NEXT,
     HIT_WEATHER_DAILY,
     HIT_WEATHER_HOURLY,
+    HIT_WALLPAPER_ITEM, /* payload = index into dc_dashboard::walls */
 } dash_hit_kind;
 
 typedef struct {
@@ -63,6 +72,23 @@ typedef struct {
     dash_hit_kind kind;
     int payload;
 } dash_hit;
+
+/* --- Wallpapers tab grid (docs/13-POPOUTS-SPEC.md sec.5) ------------------
+ * A directory of images scanned once per (re)open, decoded+downscaled into
+ * small nvg-image thumbnails a couple at a time (never more than
+ * DC_WALL_DECODE_BUDGET per draw call) so opening the tab never stalls a
+ * frame. Thumbnails are cached in-memory for the life of the dc_dashboard and
+ * only dropped when the source directory changes. */
+#define DC_WALL_MAX 256
+#define DC_WALL_THUMB_MAX 256 /* thumbnail max width/height, px */
+#define DC_WALL_DECODE_BUDGET 2 /* thumbnails decoded per draw call */
+
+typedef struct {
+    char path[512];
+    int thumb_img; /* nvg image handle, 0 = not yet loaded/failed */
+    int thumb_w, thumb_h;
+    bool tried; /* a decode was attempted (success or failure) */
+} dc_wall_entry;
 
 struct dc_dashboard {
     dc_wayland *wl;
@@ -93,12 +119,21 @@ struct dc_dashboard {
 
     dc_dash_tab tab;
     int cal_month_offset; /* months forward/back from the current month */
+    bool weather_hourly;  /* Weather tab: false = Daily pill, true = Hourly pill */
 
     /* Album-art cache (Media tab + Overview mini-card). One handle at a time. */
     char art_url[512];
     char art_path[512];
     int art_img;
     bool art_pending;
+
+    /* Wallpapers tab grid (see dc_wall_entry above). */
+    char wall_dir[512];
+    bool wall_scanned;
+    bool wall_pending; /* undecoded thumbnails remain: keep frame-stepping */
+    dc_wall_entry walls[DC_WALL_MAX];
+    int wall_count;
+    float wall_scroll, wall_scroll_max;
 
     dash_hit hits[DC_DASH_MAX_HITS];
     int hit_count;
@@ -121,7 +156,7 @@ static void dash_frame_done(void *data, struct wl_callback *cb, uint32_t time)
     d->frame_cb = NULL;
     if (!d->visible)
         return;
-    if (dc_anim_active(&d->anim))
+    if (dc_anim_active(&d->anim) || (d->wall_pending && !d->closing))
         dash_render(d);
     else if (d->closing)
         dash_teardown(d);
@@ -987,6 +1022,64 @@ static void draw_forecast_card(dc_dashboard *d, float x, float y, float w, float
     nvgText(vg, x + w / 2.0f, y + h - 18.0f, temps, NULL);
 }
 
+/* "2 PM" / "14:00" depending on the clock format, matching draw_clock_card's
+ * 12/24h handling. */
+static void hour_label(int hour24, bool clock_24h, char *out, size_t sz)
+{
+    if (clock_24h) {
+        snprintf(out, sz, "%02d:00", hour24);
+        return;
+    }
+    int h12 = hour24 % 12;
+    if (h12 == 0)
+        h12 = 12;
+    snprintf(out, sz, "%d %s", h12, hour24 < 12 ? "AM" : "PM");
+}
+
+/* One hourly-forecast card: hour label, icon, single temperature. Twin of
+ * draw_forecast_card() but for dc_weather_hourly (no min/max, "Now" instead
+ * of "Today" for the first entry). */
+static void draw_hour_card(dc_dashboard *d, float x, float y, float w, float h, bool now,
+                           const dc_weather_hourly *hr, bool clock_24h)
+{
+    NVGcontext *vg = d->render->vg;
+    const dc_theme *t = dc_theme_current;
+
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, x, y, w, h, 10.0f);
+    nvgFillColor(vg, now ? tc_alpha(t->primary, 40) : tc(t->surface_container_highest));
+    nvgFill(vg);
+    if (now) {
+        nvgStrokeColor(vg, tc(t->primary));
+        nvgStrokeWidth(vg, 1.5f);
+        nvgStroke(vg);
+    }
+
+    char label[16];
+    if (now)
+        snprintf(label, sizeof(label), "Now");
+    else
+        hour_label(hr->hour, clock_24h, label, sizeof(label));
+    nvgFontFaceId(vg, d->render->font_ui);
+    nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+    nvgFontSize(vg, 12.0f);
+    nvgFillColor(vg, now ? tc(t->primary) : tc(t->surface_text));
+    nvgText(vg, x + w / 2.0f, y + 18.0f, label, NULL);
+
+    int icon = weather_codepoint(dc_weather_icon_name(hr->weather_code, true));
+    dc_render_icon(d->render, icon, x + w / 2.0f, y + h / 2.0f + 4.0f, 26.0f, t->surface_text,
+                   NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+
+    char temp[16];
+    snprintf(temp, sizeof(temp), "%d\xc2\xb0", hr->temp_c);
+    /* Reset the font face: dc_render_icon() above left the icon font
+     * selected, in which "°" renders as tofu. */
+    nvgFontFaceId(vg, d->render->font_ui);
+    nvgFontSize(vg, 13.0f);
+    nvgFillColor(vg, tc(t->surface_variant_text));
+    nvgText(vg, x + w / 2.0f, y + h - 16.0f, temp, NULL);
+}
+
 static void draw_weather_tab(dc_dashboard *d, float w, float h)
 {
     NVGcontext *vg = d->render->vg;
@@ -1053,70 +1146,418 @@ static void draw_weather_tab(dc_dashboard *d, float w, float h)
     draw_weather_stat(d, grid_x + col_w, row1, DC_ICON_WB_TWILIGHT, "Sunrise", sr[0] ? sr : "--");
     draw_weather_stat(d, grid_x + 2.0f * col_w, row1, DC_ICON_BEDTIME, "Sunset", ss[0] ? ss : "--");
 
-    /* Daily / Hourly pills. */
+    /* Daily / Hourly pills (docs/13-POPOUTS-SPEC.md sec.5: DankFilterChips —
+     * the active pill is filled primary, the inactive one a plain surface
+     * chip). */
     const float pill_y = cy0 + cur_h + 16.0f;
     const float pill_h = 30.0f;
+    const bool hourly = d->weather_hourly;
+
     nvgBeginPath(vg);
     nvgRoundedRect(vg, cx0, pill_y, 72.0f, pill_h, pill_h / 2.0f);
-    nvgFillColor(vg, tc(t->primary));
+    nvgFillColor(vg, hourly ? tc(t->surface_container_highest) : tc(t->primary));
     nvgFill(vg);
+    nvgFontFaceId(vg, d->render->font_ui);
     nvgFontSize(vg, 13.0f);
     nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
-    nvgFillColor(vg, tc(t->primary_text));
+    nvgFillColor(vg, hourly ? tc(t->surface_variant_text) : tc(t->primary_text));
     nvgText(vg, cx0 + 36.0f, pill_y + pill_h / 2.0f, "Daily", NULL);
     push_hit(d, cx0, pill_y, cx0 + 72.0f, pill_y + pill_h, HIT_WEATHER_DAILY, 0);
 
     nvgBeginPath(vg);
     nvgRoundedRect(vg, cx0 + 80.0f, pill_y, 72.0f, pill_h, pill_h / 2.0f);
-    nvgFillColor(vg, tc(t->surface_container_highest));
+    nvgFillColor(vg, hourly ? tc(t->primary) : tc(t->surface_container_highest));
     nvgFill(vg);
-    nvgFillColor(vg, tc_alpha(t->surface_variant_text, 140)); /* dimmed: Hourly TODO */
+    nvgFillColor(vg, hourly ? tc(t->primary_text) : tc(t->surface_variant_text));
     nvgText(vg, cx0 + 116.0f, pill_y + pill_h / 2.0f, "Hourly", NULL);
     push_hit(d, cx0 + 80.0f, pill_y, cx0 + 152.0f, pill_y + pill_h, HIT_WEATHER_HOURLY, 0);
 
-    /* 7-day forecast cards. */
+    /* Forecast row: 7-day cards, or the next-24h hourly strip. */
     const float fc_y = pill_y + pill_h + 16.0f;
     const float fc_gap = 8.0f;
     const float fc_h = h - fc_y - DC_DASH_MARGIN;
-    const float fc_w = (cw - 6.0f * fc_gap) / 7.0f;
-    int n = ws.daily_count;
-    for (int i = 0; i < 7 && i < n; i++) {
-        float fx = cx0 + (fc_w + fc_gap) * (float)i;
-        draw_forecast_card(d, fx, fc_y, fc_w, fc_h, i, &ws.daily[i], i == 0, unit);
+
+    if (!hourly) {
+        const float fc_w = (cw - 6.0f * fc_gap) / 7.0f;
+        int n = ws.daily_count;
+        for (int i = 0; i < 7 && i < n; i++) {
+            float fx = cx0 + (fc_w + fc_gap) * (float)i;
+            draw_forecast_card(d, fx, fc_y, fc_w, fc_h, i, &ws.daily[i], i == 0, unit);
+        }
+    } else if (ws.hourly_count == 0) {
+        nvgFontFaceId(vg, d->render->font_ui);
+        nvgFontSize(vg, 13.0f);
+        nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+        nvgFillColor(vg, tc(t->surface_variant_text));
+        nvgText(vg, cx0 + cw / 2.0f, fc_y + fc_h / 2.0f, "Hourly forecast unavailable", NULL);
+    } else {
+        /* Fit as many hourly cards as the row width comfortably allows
+         * (DMS's "dense" hourly view shows ~10 on a same-width popout). */
+        const int show_max = 8;
+        int show = ws.hourly_count < show_max ? ws.hourly_count : show_max;
+        const float hc_w = (cw - (float)(show - 1) * fc_gap) / (float)show;
+        for (int i = 0; i < show; i++) {
+            float fx = cx0 + (hc_w + fc_gap) * (float)i;
+            draw_hour_card(d, fx, fc_y, hc_w, fc_h, i == 0, &ws.hourly[i], cfg->clock_24h);
+        }
     }
 }
 
-/* --- Wallpapers tab (empty state) ---------------------------------------- */
+/* --- Wallpapers tab (grid browser, docs/13-POPOUTS-SPEC.md sec.5) --------- */
+
+/* stb_image (nanovg's vendored copy) has no webp decoder, so .webp is
+ * deliberately excluded from the scan filter. */
+static bool wall_ext_ok(const char *name)
+{
+    const char *dot = strrchr(name, '.');
+    if (!dot)
+        return false;
+    return strcasecmp(dot, ".jpg") == 0 || strcasecmp(dot, ".jpeg") == 0 ||
+           strcasecmp(dot, ".png") == 0 || strcasecmp(dot, ".bmp") == 0 ||
+           strcasecmp(dot, ".gif") == 0;
+}
+
+/* Resolve the wallpaper directory: dirname of the configured wallpaper (like
+ * DMS's WallpaperTab.loadWallpaperDirectory()), else ~/Pictures/wallpapers if
+ * it exists, else ~/Pictures. */
+static void wall_pick_dir(char *out, size_t sz)
+{
+    const dc_config *cfg = dc_config_current;
+    if (cfg->wallpaper[0] && cfg->wallpaper[0] != '#') {
+        snprintf(out, sz, "%s", cfg->wallpaper);
+        char *slash = strrchr(out, '/');
+        if (slash && slash != out) {
+            *slash = '\0';
+            return;
+        }
+    }
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) {
+        snprintf(out, sz, "/usr/share/backgrounds");
+        return;
+    }
+    snprintf(out, sz, "%s/Pictures/wallpapers", home);
+    struct stat st;
+    if (stat(out, &st) == 0 && S_ISDIR(st.st_mode))
+        return;
+    snprintf(out, sz, "%s/Pictures", home);
+}
+
+static int wall_cmp(const void *a, const void *b)
+{
+    return strcmp(((const dc_wall_entry *)a)->path, ((const dc_wall_entry *)b)->path);
+}
+
+/* Re-list d->wall_dir into d->walls (name-sorted, like DMS's default sort).
+ * Called from the draw pass, so the GL context is current and stale thumbnail
+ * images can be deleted safely. */
+static void wall_rescan(dc_dashboard *d)
+{
+    for (int i = 0; i < d->wall_count; i++)
+        if (d->walls[i].thumb_img > 0)
+            nvgDeleteImage(d->render->vg, d->walls[i].thumb_img);
+    d->wall_count = 0;
+    d->wall_scroll = 0.0f;
+    d->wall_scanned = true;
+
+    DIR *dir = opendir(d->wall_dir);
+    if (!dir)
+        return;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL && d->wall_count < DC_WALL_MAX) {
+        if (ent->d_name[0] == '.' || !wall_ext_ok(ent->d_name))
+            continue;
+        char full[1024];
+        snprintf(full, sizeof(full), "%s/%s", d->wall_dir, ent->d_name);
+        struct stat st;
+        if (stat(full, &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+        dc_wall_entry *e = &d->walls[d->wall_count];
+        memset(e, 0, sizeof(*e));
+        if (snprintf(e->path, sizeof(e->path), "%.511s", full) >= (int)sizeof(e->path))
+            continue; /* path too long to store faithfully: skip */
+        d->wall_count++;
+    }
+    closedir(dir);
+    qsort(d->walls, (size_t)d->wall_count, sizeof(d->walls[0]), wall_cmp);
+    dc_debug("wallpapers: %d image(s) in %s", d->wall_count, d->wall_dir);
+}
+
+/* Decode e->path and box-sample it down to a <=DC_WALL_THUMB_MAX thumbnail
+ * nvg image. One full-size decode per call — the caller budgets these. */
+static void wall_decode(dc_dashboard *d, dc_wall_entry *e)
+{
+    e->tried = true;
+    int sw = 0, sh = 0, n = 0;
+    unsigned char *src = stbi_load(e->path, &sw, &sh, &n, 4);
+    if (!src || sw <= 0 || sh <= 0) {
+        if (src)
+            stbi_image_free(src);
+        return;
+    }
+
+    int tw = sw, th = sh;
+    if (tw > DC_WALL_THUMB_MAX || th > DC_WALL_THUMB_MAX) {
+        float s = (float)DC_WALL_THUMB_MAX / (float)(sw > sh ? sw : sh);
+        tw = (int)((float)sw * s);
+        th = (int)((float)sh * s);
+        if (tw < 1)
+            tw = 1;
+        if (th < 1)
+            th = 1;
+    }
+
+    unsigned char *dst = malloc((size_t)tw * (size_t)th * 4);
+    if (dst) {
+        for (int y = 0; y < th; y++) {
+            int sy0 = (int)((long)y * sh / th);
+            int sy1 = (int)((long)(y + 1) * sh / th);
+            if (sy1 <= sy0)
+                sy1 = sy0 + 1;
+            for (int x = 0; x < tw; x++) {
+                int sx0 = (int)((long)x * sw / tw);
+                int sx1 = (int)((long)(x + 1) * sw / tw);
+                if (sx1 <= sx0)
+                    sx1 = sx0 + 1;
+                unsigned int acc[4] = {0, 0, 0, 0};
+                int cnt = 0;
+                for (int yy = sy0; yy < sy1; yy++) {
+                    const unsigned char *row = src + ((size_t)yy * (size_t)sw + (size_t)sx0) * 4;
+                    for (int xx = sx0; xx < sx1; xx++, row += 4) {
+                        acc[0] += row[0];
+                        acc[1] += row[1];
+                        acc[2] += row[2];
+                        acc[3] += row[3];
+                        cnt++;
+                    }
+                }
+                unsigned char *out = dst + ((size_t)y * (size_t)tw + (size_t)x) * 4;
+                out[0] = (unsigned char)(acc[0] / (unsigned int)cnt);
+                out[1] = (unsigned char)(acc[1] / (unsigned int)cnt);
+                out[2] = (unsigned char)(acc[2] / (unsigned int)cnt);
+                out[3] = (unsigned char)(acc[3] / (unsigned int)cnt);
+            }
+        }
+        e->thumb_img = nvgCreateImageRGBA(d->render->vg, tw, th, 0, dst);
+        e->thumb_w = tw;
+        e->thumb_h = th;
+        free(dst);
+    }
+    stbi_image_free(src);
+}
+
+/* Best-effort $PATH lookup (no shell): true if `name` is executable. */
+static bool cmd_exists(const char *name)
+{
+    const char *path = getenv("PATH");
+    if (!path)
+        return false;
+    while (*path) {
+        const char *colon = strchr(path, ':');
+        size_t len = colon ? (size_t)(colon - path) : strlen(path);
+        if (len > 0 && len < 400) {
+            char buf[512];
+            snprintf(buf, sizeof(buf), "%.*s/%.100s", (int)len, path, name);
+            if (access(buf, X_OK) == 0)
+                return true;
+        }
+        path += len;
+        if (*path == ':')
+            path++;
+    }
+    return false;
+}
+
+/* dankc doesn't draw a wallpaper layer of its own (the dynamic-color engine
+ * only samples the image file), so apply the wallpaper to the compositor the
+ * standard niri way: (re)spawn swaybg when it's installed. No-op otherwise —
+ * the config + palette still update. */
+static void wall_apply_compositor(const char *path)
+{
+    if (!cmd_exists("swaybg")) {
+        dc_info("wallpaper: swaybg not installed; config/palette updated only");
+        return;
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+        }
+        /* Replace pattern: retire the previous instance, then take over. */
+        pid_t k = fork();
+        if (k == 0) {
+            execlp("pkill", "pkill", "-x", "swaybg", (char *)NULL);
+            _exit(127);
+        }
+        usleep(100 * 1000); /* let the old instance exit */
+        execlp("swaybg", "swaybg", "-m", "fill", "-i", path, (char *)NULL);
+        _exit(127);
+    }
+}
+
+/* Click on a thumbnail: persist config `wallpaper`, re-derive the palette when
+ * dynamicColor is on (dc_config_reapply -> apply_theme -> dc_dynamic_from_
+ * image), repaint live surfaces, and set the compositor wallpaper.
+ * DANKC_WALL_DRY=1 keeps it in-memory only (no config.json write, no swaybg)
+ * for UI verification against a real config. */
+static void wall_set_active(dc_dashboard *d, const dc_wall_entry *e)
+{
+    DC_UNUSED(d);
+    dc_config *cfg = dc_config_mut();
+    if (strcmp(cfg->wallpaper, e->path) == 0)
+        return;
+    snprintf(cfg->wallpaper, sizeof(cfg->wallpaper), "%s", e->path);
+    dc_config_reapply(); /* stock theme + dynamic-color overlay when enabled */
+    if (!getenv("DANKC_WALL_DRY")) {
+        dc_config_save();
+        wall_apply_compositor(e->path);
+    }
+    dc_config_notify_changed(); /* bars pick up the (possibly) new palette */
+    dc_info("wallpaper set: %s%s", e->path, getenv("DANKC_WALL_DRY") ? " (dry)" : "");
+}
 
 static void draw_wallpapers_tab(dc_dashboard *d, float w, float h)
 {
     NVGcontext *vg = d->render->vg;
     const dc_theme *t = dc_theme_current;
-    const float cx = w / 2.0f;
-    const float cy = DC_DASH_TABBAR_H + (h - DC_DASH_TABBAR_H) * 0.42f;
+    const dc_config *cfg = dc_config_current;
+    const float cx0 = DC_DASH_PAD + DC_DASH_MARGIN;
+    const float cw = w - 2.0f * (DC_DASH_PAD + DC_DASH_MARGIN);
+    const float list_y0 = DC_DASH_TABBAR_H + 12.0f;
+    const float footer_h = 26.0f;
+    const float list_h = h - list_y0 - DC_DASH_MARGIN - footer_h;
+    const float list_y1 = list_y0 + list_h;
 
+    /* (Re)scan when the resolved directory changed (incl. the first draw). */
+    char dir[512];
+    wall_pick_dir(dir, sizeof(dir));
+    if (!d->wall_scanned || strcmp(dir, d->wall_dir) != 0) {
+        snprintf(d->wall_dir, sizeof(d->wall_dir), "%s", dir);
+        wall_rescan(d);
+    }
+
+    d->wall_pending = false;
+
+    if (d->wall_count == 0) {
+        const float ecx = w / 2.0f;
+        const float ecy = list_y0 + list_h * 0.42f;
+        dc_render_icon(d->render, DC_ICON_WALLPAPER, ecx, ecy - 34.0f, 40.0f,
+                       t->surface_variant_text, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+        nvgFontFaceId(vg, d->render->font_ui);
+        nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+        nvgFontSize(vg, 16.0f);
+        nvgFillColor(vg, tc(t->surface_variant_text));
+        nvgText(vg, ecx, ecy + 8.0f, "No wallpapers found", NULL);
+        nvgFontSize(vg, 13.0f);
+        char sub[560];
+        snprintf(sub, sizeof(sub), "No images in %s", d->wall_dir);
+        dash_ellipsize(vg, sub, sizeof(sub), cw - 40.0f);
+        nvgText(vg, ecx, ecy + 34.0f, sub, NULL);
+        return;
+    }
+
+    /* 4-column grid, DMS WallpaperTab.qml's cell shape (wider than tall). */
+    const float gap = 8.0f;
+    const int cols = 4;
+    const float cell_w = (cw - (float)(cols - 1) * gap) / (float)cols;
+    const float cell_h = cell_w * 0.60f;
+    const int rows = (d->wall_count + cols - 1) / cols;
+    const float content_h = (float)rows * (cell_h + gap) - gap;
+    d->wall_scroll_max = content_h > list_h ? content_h - list_h : 0.0f;
+    if (d->wall_scroll < 0.0f)
+        d->wall_scroll = 0.0f;
+    if (d->wall_scroll > d->wall_scroll_max)
+        d->wall_scroll = d->wall_scroll_max;
+
+    int budget = DC_WALL_DECODE_BUDGET;
+
+    nvgSave(vg);
+    nvgScissor(vg, cx0, list_y0, cw, list_h);
+    for (int i = 0; i < d->wall_count; i++) {
+        const float x = cx0 + (float)(i % cols) * (cell_w + gap);
+        const float y = list_y0 + (float)(i / cols) * (cell_h + gap) - d->wall_scroll;
+        if (y + cell_h < list_y0 || y > list_y1)
+            continue; /* off-screen: don't draw, don't decode */
+
+        dc_wall_entry *e = &d->walls[i];
+        if (!e->tried) {
+            if (budget > 0) {
+                wall_decode(d, e);
+                budget--;
+            } else {
+                d->wall_pending = true; /* keep frame-stepping until decoded */
+            }
+        }
+
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, x, y, cell_w, cell_h, 10.0f);
+        nvgFillColor(vg, tc(t->surface_container_highest));
+        nvgFill(vg);
+
+        if (e->thumb_img > 0) {
+            /* Aspect-cover the cell with the thumbnail. */
+            float sx = cell_w / (float)e->thumb_w;
+            float sy = cell_h / (float)e->thumb_h;
+            float s = sx > sy ? sx : sy;
+            float iw = (float)e->thumb_w * s;
+            float ih = (float)e->thumb_h * s;
+            NVGpaint pat = nvgImagePattern(vg, x + (cell_w - iw) / 2.0f, y + (cell_h - ih) / 2.0f,
+                                           iw, ih, 0.0f, e->thumb_img, 1.0f);
+            nvgBeginPath(vg);
+            nvgRoundedRect(vg, x, y, cell_w, cell_h, 10.0f);
+            nvgFillPaint(vg, pat);
+            nvgFill(vg);
+        } else {
+            /* Placeholder while pending (or after a failed decode). */
+            dc_color dim = t->surface_variant_text;
+            dim.a = e->tried ? 70 : 140;
+            dc_render_icon(d->render, DC_ICON_WALLPAPER, x + cell_w / 2.0f, y + cell_h / 2.0f,
+                           24.0f, dim, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+        }
+
+        /* Highlight the currently active wallpaper (DMS: 3px primary ring). */
+        if (cfg->wallpaper[0] && strcmp(cfg->wallpaper, e->path) == 0) {
+            nvgBeginPath(vg);
+            nvgRoundedRect(vg, x + 1.5f, y + 1.5f, cell_w - 3.0f, cell_h - 3.0f, 9.0f);
+            nvgStrokeColor(vg, tc(t->primary));
+            nvgStrokeWidth(vg, 3.0f);
+            nvgStroke(vg);
+        }
+
+        /* Hit target clipped to the visible list area. */
+        float hy0 = y < list_y0 ? list_y0 : y;
+        float hy1 = y + cell_h > list_y1 ? list_y1 : y + cell_h;
+        if (hy1 > hy0)
+            push_hit(d, x, hy0, x + cell_w, hy1, HIT_WALLPAPER_ITEM, i);
+    }
+    nvgRestore(vg);
+
+    /* Scrollbar thumb (processes-popout pattern). */
+    if (d->wall_scroll_max > 0.0f) {
+        float track_x = cx0 + cw - 3.0f;
+        float thumb_h = list_h * (list_h / content_h);
+        if (thumb_h < 24.0f)
+            thumb_h = 24.0f;
+        float thumb_y = list_y0 + (list_h - thumb_h) * (d->wall_scroll / d->wall_scroll_max);
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, track_x, thumb_y, 3.0f, thumb_h, 1.5f);
+        nvgFillColor(vg, tc_alpha(t->outline, 140));
+        nvgFill(vg);
+    }
+
+    /* Footer: count + directory, centered (DMS footer's page indicator slot). */
+    char foot[600];
+    snprintf(foot, sizeof(foot), "%d wallpaper%s  \xc2\xb7  %s", d->wall_count,
+             d->wall_count == 1 ? "" : "s", d->wall_dir);
     nvgFontFaceId(vg, d->render->font_ui);
     nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
-    nvgFontSize(vg, 16.0f);
-    nvgFillColor(vg, tc(t->surface_variant_text));
-    nvgText(vg, cx, cy, "No wallpapers found", NULL);
-    nvgFontSize(vg, 13.0f);
-    nvgText(vg, cx, cy + 30.0f, "Click the folder icon below to browse", NULL);
-
-    /* Footer with a folder-browse icon. */
-    const float fy = h - 40.0f;
-    dc_render_icon(d->render, DC_ICON_SKIP_PREVIOUS, cx - 80.0f, fy, 20.0f, t->surface_variant_text,
-                   NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
-    /* dc_render_icon() left the icon font selected; back to the UI font. */
-    nvgFontFaceId(vg, d->render->font_ui);
-    nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
-    nvgFontSize(vg, 13.0f);
-    nvgFillColor(vg, tc(t->surface_variant_text));
-    nvgText(vg, cx, fy, "No wallpapers", NULL);
-    dc_render_icon(d->render, DC_ICON_SKIP_NEXT, cx + 80.0f, fy, 20.0f, t->surface_variant_text,
-                   NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
-    dc_render_icon(d->render, DC_ICON_FOLDER, cx + 100.0f, fy, 20.0f, t->surface_text,
-                   NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+    nvgFontSize(vg, 12.0f);
+    dash_ellipsize(vg, foot, sizeof(foot), cw - 20.0f);
+    nvgFillColor(vg, tc_alpha(t->surface_variant_text, 180));
+    nvgText(vg, w / 2.0f, list_y1 + footer_h / 2.0f + 2.0f, foot, NULL);
 }
 
 /* --- frame ---------------------------------------------------------------- */
@@ -1215,7 +1656,7 @@ static void dash_render(dc_dashboard *d)
 
     nvgEndFrame(vg);
 
-    if ((dc_anim_active(&d->anim) || d->closing) && !d->frame_cb) {
+    if ((dc_anim_active(&d->anim) || d->closing || d->wall_pending) && !d->frame_cb) {
         d->frame_cb = wl_surface_frame(d->surface);
         wl_callback_add_listener(d->frame_cb, &dash_frame_listener, d);
     }
@@ -1281,6 +1722,7 @@ static void dash_show(dc_dashboard *d, dc_output *output, dc_dash_tab tab)
     d->egl_ready = false;
     d->tab = tab;
     d->cal_month_offset = 0;
+    d->weather_hourly = false; /* DMS WeatherTab defaults to Daily per open */
     d->scale120 = (output && output->scale > 0 ? output->scale : 1) * DC_SCALE_BASE;
     dc_anim_start(&d->anim, DC_DUR_MEDIUM, DC_EASE_EXPRESSIVE);
 
@@ -1449,12 +1891,42 @@ void dc_dashboard_handle_click(dc_dashboard *d, double x, double y)
             dash_render(d);
             return;
         case HIT_WEATHER_DAILY:
+            if (d->weather_hourly) {
+                d->weather_hourly = false;
+                dash_render(d);
+            }
+            return;
         case HIT_WEATHER_HOURLY:
-            return; /* Daily is the only implemented view (Hourly TODO). */
+            if (!d->weather_hourly) {
+                d->weather_hourly = true;
+                dash_render(d);
+            }
+            return;
+        case HIT_WALLPAPER_ITEM:
+            if (hit->payload >= 0 && hit->payload < d->wall_count) {
+                wall_set_active(d, &d->walls[hit->payload]);
+                dash_render(d);
+            }
+            return;
         case HIT_NONE:
             return;
         }
     }
+}
+
+void dc_dashboard_handle_scroll(dc_dashboard *d, int steps_v)
+{
+    if (!d->visible || d->closing || d->tab != DC_DASH_WALLPAPERS)
+        return;
+    float s = d->wall_scroll + (float)steps_v * 48.0f;
+    if (s < 0.0f)
+        s = 0.0f;
+    if (s > d->wall_scroll_max)
+        s = d->wall_scroll_max;
+    if (s == d->wall_scroll)
+        return;
+    d->wall_scroll = s;
+    dash_render(d);
 }
 
 void dc_dashboard_destroy(dc_dashboard *d)
@@ -1463,5 +1935,7 @@ void dc_dashboard_destroy(dc_dashboard *d)
         return;
     if (d->visible)
         dash_teardown(d);
+    /* Thumbnail nvg images are intentionally not deleted here: destroy runs
+     * at process exit only (see main.c), where GL teardown is skipped. */
     free(d);
 }

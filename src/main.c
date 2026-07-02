@@ -524,6 +524,7 @@ struct axis_ctx {
     dc_processes *processes;
     dc_launcher *launcher;
     dc_settings *settings;
+    dc_dashboard *dashboard;
 };
 
 /* Scroll on a bar surface: vertical wheel -> workspace focus, horizontal ->
@@ -564,6 +565,11 @@ static void handle_bar_axis(struct wl_surface *surface, int steps_v, int steps_h
     }
     if (dc_settings_visible(actx->settings) && surface == dc_settings_surface(actx->settings)) {
         dc_settings_handle_scroll(actx->settings, steps_v);
+        return;
+    }
+    if (dc_dashboard_visible(actx->dashboard) &&
+        surface == dc_dashboard_surface(actx->dashboard)) {
+        dc_dashboard_handle_scroll(actx->dashboard, steps_v); /* Wallpapers grid */
         return;
     }
 
@@ -715,7 +721,8 @@ int main(int argc, char **argv)
                             .clip_picker = clip_picker,
                             .processes = processes,
                             .launcher = launcher,
-                            .settings = settings};
+                            .settings = settings,
+                            .dashboard = dashboard};
     dc_wayland_set_axis_cb(wl, handle_bar_axis, &actx);
 
     struct control_ctx control_ctx = {.wl = wl,

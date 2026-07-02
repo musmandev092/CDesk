@@ -24,9 +24,12 @@ Weather w/ 7-day forecast/Media w/ album art/Wallpapers; clock/music/weather chi
 Plus: full-Unicode fallback fonts + monochrome emoji; **Makefile now does header dep
 tracking (-MMD)** — stale-.o struct mismatches previously caused phantom "corruption";
 dc_render_icon now saves/restores nvg state (recurring garbled-text class killed).
-Remaining polish: power menu modal, tuned power-profile backend, marquee, Hourly forecast,
-wallpaper browser, notif action-images, HarfBuzz shaping, P7 perf (damage tracking, poll
-reduction, font subsetting). Plugins (T29) still deferred.
+Remaining polish: power menu modal, tuned power-profile backend, marquee, notif
+action-images, HarfBuzz shaping, P7 perf (damage tracking, poll reduction, font
+subsetting). Hourly forecast + wallpaper grid browser DONE (wt/dash): weather.c
+fetches &hourly=..., Weather tab Daily/Hourly pills toggle a next-24h strip;
+Wallpapers tab is a lazy-thumbnail 4-col grid (stb decode + box-sample, 2/frame),
+click = config wallpaper + dynamic color + swaybg-if-present, wheel scroll. Plugins (T29) still deferred.
 
 ## Previous status — bar parity DONE ✅ (S1–S6, 2026-07-02); panels parity next
 Bar now pixel-matches the user's live DMS bottom bar (docs/12-BAR-SPEC.md, commits

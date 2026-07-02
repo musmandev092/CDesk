@@ -19,6 +19,16 @@ typedef struct dc_weather_daily {
     char sunset[8];  /* "HH:MM" local time, or "" */
 } dc_weather_daily;
 
+/* One hour of the next-24h hourly forecast (open-meteo `hourly` block;
+ * docs/13-POPOUTS-SPEC.md sec.5 Weather tab "Hourly" pill). `hour` is the
+ * local hour-of-day (0-23) this entry represents, parsed straight from the
+ * returned ISO timestamp so the label stays correct across midnight. */
+typedef struct dc_weather_hourly {
+    int weather_code;
+    int temp_c; /* same unit as dc_weather_state.temp_c */
+    int hour;   /* 0-23, local time */
+} dc_weather_hourly;
+
 typedef struct dc_weather_state {
     bool valid;        /* a successful fetch has populated the fields below */
     int temp_c;         /* rounded current temperature, in the unit requested at
@@ -42,6 +52,11 @@ typedef struct dc_weather_state {
     /* 7-day daily forecast, [0] = today. `daily_count` is 0 when absent. */
     dc_weather_daily daily[7];
     int daily_count;
+
+    /* Next-24h hourly forecast, [0] = the current hour. `hourly_count` is 0
+     * when absent (older/limited responses). */
+    dc_weather_hourly hourly[24];
+    int hourly_count;
 } dc_weather_state;
 
 /* Configure the fixed location + unit and arm the first fetch. Does not block
