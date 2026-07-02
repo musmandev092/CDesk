@@ -504,11 +504,17 @@ void dc_render_icon(dc_render *render, int codepoint, float x, float y, float si
     int len = utf8_encode(codepoint, glyph);
     glyph[len] = '\0';
 
+    /* Save/restore the full nvg state (font face, size, fill, align): leaking
+     * the icon font into the caller's subsequent nvgText/nvgTextBounds calls
+     * has caused garbled-text bugs in three separate widgets (media label,
+     * notif-center Clear button, launcher footer). Never again. */
+    nvgSave(render->vg);
     nvgFontFaceId(render->vg, render->font_icons);
     nvgFontSize(render->vg, size);
     nvgFillColor(render->vg, nvgRGBA(color.r, color.g, color.b, color.a));
     nvgTextAlign(render->vg, align_nvg);
     nvgText(render->vg, x, y, glyph, NULL);
+    nvgRestore(render->vg);
 }
 
 int dc_render_load_icon(dc_render *render, const char *path, int size)

@@ -347,7 +347,9 @@ static void draw_list_row(dc_launcher *l, const dc_app *app, float x, float y, f
         return;
 
     nvgSave(vg);
-    nvgScissor(vg, text_x, y, text_w, DC_LAUNCHER_ROW_H);
+    /* Intersect (not replace) so a row straddling the list bottom stays
+     * clipped by the outer list scissor instead of bleeding into the footer. */
+    nvgIntersectScissor(vg, text_x, y, text_w, DC_LAUNCHER_ROW_H);
 
     bool has_desc = app->desc[0] != '\0';
     float name_cy = has_desc ? y + 21.0f : row_cy;
@@ -398,7 +400,7 @@ static void draw_grid_cell(dc_launcher *l, const dc_app *app, float x, float y, 
     }
 
     nvgSave(vg);
-    nvgScissor(vg, x + 4.0f, icy + isz + 4.0f, w - 8.0f, h - (isz + 8.0f));
+    nvgIntersectScissor(vg, x + 4.0f, icy + isz + 4.0f, w - 8.0f, h - (isz + 8.0f));
     nvgFontFaceId(vg, l->render->font_ui);
     nvgFontSize(vg, 12.0f);
     nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_TOP);
