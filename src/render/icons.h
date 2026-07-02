@@ -25,6 +25,7 @@
 #define DC_ICON_VOLUME_DOWN 0xe04d
 #define DC_ICON_VOLUME_OFF 0xe04f
 #define DC_ICON_MIC 0xe31d
+#define DC_ICON_MIC_OFF 0xe02b
 #define DC_ICON_NOTIFICATIONS 0xe7f5
 #define DC_ICON_CONTENT_PASTE 0xe14f
 #define DC_ICON_SETTINGS 0xe8b8
@@ -33,13 +34,27 @@
 #define DC_ICON_MUSIC_NOTE 0xe405
 #define DC_ICON_WIDGETS 0xe1bd
 #define DC_ICON_POWER 0xf8c7
-#define DC_ICON_LOCK 0xe897
+/* NOTE: was 0xe897, which parsing the bundled font's cmap directly shows is
+ * unassigned (renders as blank space) -- not a valid Material Symbols
+ * codepoint at all (0xe899 is "lock"; 0xe898 is "lock_open"). Fixed while
+ * adding the Control Center header's lock button (docs/13-POPOUTS-SPEC.md
+ * sec.1), which also fixes the pre-existing lock-screen icon (ui/lock.c). */
+#define DC_ICON_LOCK 0xe899
 #define DC_ICON_DARK_MODE 0xe51c
 #define DC_ICON_LIGHT_MODE 0xe518
 #define DC_ICON_CLOSE 0xe5cd
 #define DC_ICON_DONE 0xe876
 #define DC_ICON_CHEVRON_RIGHT 0xe5cc
 #define DC_ICON_EXPAND_MORE 0xe5cf
+#define DC_ICON_EDIT 0xf097
+#define DC_ICON_PERSON 0xf0d3
+/* Control Center's nightMode/darkMode toggle tiles use these two, not
+ * DARK_MODE/LIGHT_MODE above (docs/13-POPOUTS-SPEC.md sec.1; matches
+ * Modules/ControlCenter/Models/WidgetModel.qml's coreWidgetDefinitions). */
+#define DC_ICON_NIGHTLIGHT 0xf03d
+#define DC_ICON_CONTRAST 0xeb37
+/* Control Center brightness slider icon (BrightnessSliderRow.qml). */
+#define DC_ICON_BRIGHTNESS_MEDIUM 0xe1ae
 
 /* music (media) transport (docs/12-BAR-SPEC.md sec.4/6). */
 #define DC_ICON_SKIP_PREVIOUS 0xe045
