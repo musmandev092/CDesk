@@ -17,6 +17,8 @@ struct wp_viewporter;
 struct wp_fractional_scale_manager_v1;
 struct zwlr_data_control_manager_v1;
 struct ext_session_lock_manager_v1;
+struct wp_cursor_shape_manager_v1;
+struct wp_cursor_shape_device_v1;
 struct xkb_context;
 struct xkb_keymap;
 struct xkb_state;
@@ -37,6 +39,27 @@ typedef void (*dc_click_cb)(struct wl_surface *surface, double x, double y, void
 /* A key press: `keysym` is the xkb keysym; `utf8` is its text (may be empty). */
 typedef void (*dc_key_cb)(uint32_t keysym, const char *utf8, void *user_data);
 
+/* Pointer motion (and entry) over `surface`, in surface-local logical
+ * coordinates. Fired for every motion event — callers that only care about
+ * hover-region changes must debounce themselves (docs/12-BAR-SPEC.md sec.5). */
+typedef void (*dc_motion_cb)(struct wl_surface *surface, double x, double y, void *user_data);
+
+/* Pointer left `surface` entirely (no coordinates — there is nowhere "on
+ * surface" for them to refer to). */
+typedef void (*dc_leave_cb)(struct wl_surface *surface, void *user_data);
+
+/* One "step" of scroll on `surface`: `steps_v`/`steps_h` are signed step
+ * counts (positive = scroll down / right), already debounced from raw axis
+ * deltas — see dc_wayland_set_axis_cb(). Usually +-1, but may be larger for a
+ * single fast flick. */
+typedef void (*dc_axis_cb)(struct wl_surface *surface, int steps_v, int steps_h, void *user_data);
+
+/* Cursor shapes DankC actually uses (docs/12-BAR-SPEC.md sec.5). */
+typedef enum {
+    DC_CURSOR_DEFAULT,
+    DC_CURSOR_POINTER,
+} dc_cursor_shape;
+
 typedef struct dc_wayland {
     struct wl_display *display;
     struct wl_registry *registry;
@@ -48,15 +71,34 @@ typedef struct dc_wayland {
     struct wp_fractional_scale_manager_v1 *fractional_scale_mgr;
     struct zwlr_data_control_manager_v1 *data_control_manager;
     struct ext_session_lock_manager_v1 *session_lock_manager;
+    struct wp_cursor_shape_manager_v1 *cursor_shape_manager;
     struct wl_seat *seat;
 
     /* Pointer state. */
     struct wl_pointer *pointer;
+    struct wp_cursor_shape_device_v1 *cursor_shape_device; /* NULL if unavailable */
+    uint32_t pointer_enter_serial; /* latest wl_pointer.enter serial (cursor-shape set_shape) */
     struct wl_surface *pointer_surface;
     double pointer_x;
     double pointer_y;
     dc_click_cb click_cb;
     void *click_data;
+    dc_motion_cb motion_cb;
+    void *motion_data;
+    dc_leave_cb leave_cb;
+    void *leave_data;
+
+    /* Scroll-axis debouncing state (docs/12-BAR-SPEC.md sec.5): continuous
+     * (touchpad) sources accumulate in wl_fixed units across frames until a
+     * DC_AXIS_STEP_THRESHOLD-sized chunk is consumed; discrete (wheel)
+     * sources report whole steps directly, reset every frame. */
+    double axis_accum_v;
+    double axis_accum_h;
+    int axis_discrete_v;
+    int axis_discrete_h;
+    bool axis_has_discrete;
+    dc_axis_cb axis_cb;
+    void *axis_data;
 
     /* Keyboard state (xkb). */
     struct wl_keyboard *keyboard;
@@ -74,6 +116,22 @@ void dc_wayland_set_click_cb(dc_wayland *wl, dc_click_cb cb, void *user_data);
 /* Set the handler for keyboard input (used by the launcher/lock screen). Keys
  * are only delivered while a DankC surface holds keyboard focus. */
 void dc_wayland_set_key_cb(dc_wayland *wl, dc_key_cb cb, void *user_data);
+
+/* Set the handler for pointer motion (hover tracking; docs/12-BAR-SPEC.md
+ * sec.5). Fired on every wl_pointer.motion and wl_pointer.enter. */
+void dc_wayland_set_motion_cb(dc_wayland *wl, dc_motion_cb cb, void *user_data);
+
+/* Set the handler for pointer leaving a surface (clears hover state). */
+void dc_wayland_set_leave_cb(dc_wayland *wl, dc_leave_cb cb, void *user_data);
+
+/* Set the handler for debounced scroll-wheel steps (docs/12-BAR-SPEC.md
+ * sec.5: scrollYBehavior/scrollXBehavior). */
+void dc_wayland_set_axis_cb(dc_wayland *wl, dc_axis_cb cb, void *user_data);
+
+/* Set the pointer's cursor image via wp_cursor_shape_manager_v1, if the
+ * compositor offers it (niri does). No-op (cursor stays whatever it was) if
+ * the protocol or a pointer device is unavailable. */
+void dc_wayland_set_cursor(dc_wayland *wl, dc_cursor_shape shape);
 
 /* Connect to $WAYLAND_DISPLAY and bind globals. Returns NULL on failure.
  * Caller owns the result and must call dc_wayland_destroy(). */

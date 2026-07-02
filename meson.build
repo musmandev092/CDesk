@@ -44,6 +44,7 @@ protocols = [
   'protocol/xdg-shell.xml',
   'protocol/viewporter.xml',
   'protocol/fractional-scale-v1.xml',
+  'protocol/cursor-shape-v1.xml',
 ]
 
 proto_src = []

@@ -18,6 +18,14 @@
 #include "xdg-shell-client-protocol.h"
 #include "viewporter-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
+#include "cursor-shape-v1-client-protocol.h"
+
+/* Continuous (touchpad) scroll sources report many tiny wl_fixed deltas per
+ * gesture; a wheel "click" is conventionally 10 wl_fixed units (matching
+ * libinput/most compositors), so that's also the debounce threshold for
+ * turning accumulated continuous motion into discrete steps
+ * (docs/12-BAR-SPEC.md sec.5). */
+#define DC_AXIS_STEP_THRESHOLD 10.0
 
 /* --- wl_output ---------------------------------------------------------- */
 
@@ -107,10 +115,22 @@ static void pointer_handle_enter(void *data, struct wl_pointer *pointer, uint32_
 {
     dc_wayland *wl = data;
     DC_UNUSED(pointer);
-    DC_UNUSED(serial);
     wl->pointer_surface = surface;
+    wl->pointer_enter_serial = serial;
     wl->pointer_x = wl_fixed_to_double(sx);
     wl->pointer_y = wl_fixed_to_double(sy);
+    /* Scroll-axis accumulation is pointer-global, not per-surface; drop any
+     * sub-threshold carry from whatever was under the pointer before so a
+     * scroll gesture that crosses a surface boundary mid-flight can't
+     * misattribute a step to the surface just entered (docs/12-BAR-SPEC.md
+     * sec.5). */
+    wl->axis_accum_v = 0.0;
+    wl->axis_accum_h = 0.0;
+    wl->axis_discrete_v = 0;
+    wl->axis_discrete_h = 0;
+    wl->axis_has_discrete = false;
+    if (wl->motion_cb)
+        wl->motion_cb(surface, wl->pointer_x, wl->pointer_y, wl->motion_data);
 }
 
 static void pointer_handle_leave(void *data, struct wl_pointer *pointer, uint32_t serial,
@@ -121,6 +141,8 @@ static void pointer_handle_leave(void *data, struct wl_pointer *pointer, uint32_
     DC_UNUSED(serial);
     if (wl->pointer_surface == surface)
         wl->pointer_surface = NULL;
+    if (wl->leave_cb)
+        wl->leave_cb(surface, wl->leave_data);
 }
 
 static void pointer_handle_motion(void *data, struct wl_pointer *pointer, uint32_t time,
@@ -131,6 +153,8 @@ static void pointer_handle_motion(void *data, struct wl_pointer *pointer, uint32
     DC_UNUSED(time);
     wl->pointer_x = wl_fixed_to_double(sx);
     wl->pointer_y = wl_fixed_to_double(sy);
+    if (wl->motion_cb && wl->pointer_surface)
+        wl->motion_cb(wl->pointer_surface, wl->pointer_x, wl->pointer_y, wl->motion_data);
 }
 
 static void pointer_handle_button(void *data, struct wl_pointer *pointer, uint32_t serial,
@@ -145,23 +169,75 @@ static void pointer_handle_button(void *data, struct wl_pointer *pointer, uint32
         wl->click_cb(wl->pointer_surface, wl->pointer_x, wl->pointer_y, wl->click_data);
 }
 
+/* Continuous-source axis delta: accumulate in wl_fixed units (docs/12-BAR-SPEC.md
+ * sec.5). Discrete (wheel) sources also send one of these per notch alongside
+ * axis_discrete; when axis_discrete showed up this frame we trust its whole-step
+ * count instead (see pointer_handle_frame()), so the accumulation here is only
+ * ever consumed for continuous (touchpad) sources. */
 static void pointer_handle_axis(void *data, struct wl_pointer *pointer, uint32_t time,
                                 uint32_t axis, wl_fixed_t value)
 {
-    DC_UNUSED(data);
+    dc_wayland *wl = data;
     DC_UNUSED(pointer);
     DC_UNUSED(time);
-    DC_UNUSED(axis);
-    DC_UNUSED(value);
+    double v = wl_fixed_to_double(value);
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+        wl->axis_accum_v += v;
+    else if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
+        wl->axis_accum_h += v;
 }
 
-/* wl_pointer v5+ groups events with a trailing frame; axis_* variants also
- * arrive. libwayland aborts on any NULL listener slot for the bound version, so
- * every event through the seat-bind version (7) needs at least a no-op stub. */
+/* wl_pointer v5+ groups an input batch's events behind a trailing frame; this
+ * is where accumulated axis motion for the batch turns into debounced steps
+ * and gets dispatched. libwayland aborts on any NULL listener slot for the
+ * bound version, so every event through the seat-bind version (7) needs at
+ * least a stub — this one does real work instead. */
 static void pointer_handle_frame(void *data, struct wl_pointer *pointer)
 {
-    DC_UNUSED(data);
+    dc_wayland *wl = data;
     DC_UNUSED(pointer);
+
+    if (wl->pointer_surface && wl->axis_cb) {
+        int steps_v = 0, steps_h = 0;
+        if (wl->axis_has_discrete) {
+            /* Wheel: axis_discrete already reports whole steps this frame.
+             * Wheels also send a same-frame continuous axis delta alongside
+             * axis_discrete but never send axis_stop, so that companion
+             * accumulator must be drained here too — otherwise it silently
+             * piles up across every wheel notch and gets misinterpreted as
+             * extra continuous-source steps the next time a touchpad scrolls
+             * (docs/12-BAR-SPEC.md sec.5). */
+            steps_v = wl->axis_discrete_v;
+            steps_h = wl->axis_discrete_h;
+            wl->axis_accum_v = 0.0;
+            wl->axis_accum_h = 0.0;
+        } else {
+            /* Touchpad/continuous: drain whole DC_AXIS_STEP_THRESHOLD-sized
+             * chunks, leaving any remainder to accumulate into future frames. */
+            while (wl->axis_accum_v >= DC_AXIS_STEP_THRESHOLD) {
+                steps_v++;
+                wl->axis_accum_v -= DC_AXIS_STEP_THRESHOLD;
+            }
+            while (wl->axis_accum_v <= -DC_AXIS_STEP_THRESHOLD) {
+                steps_v--;
+                wl->axis_accum_v += DC_AXIS_STEP_THRESHOLD;
+            }
+            while (wl->axis_accum_h >= DC_AXIS_STEP_THRESHOLD) {
+                steps_h++;
+                wl->axis_accum_h -= DC_AXIS_STEP_THRESHOLD;
+            }
+            while (wl->axis_accum_h <= -DC_AXIS_STEP_THRESHOLD) {
+                steps_h--;
+                wl->axis_accum_h += DC_AXIS_STEP_THRESHOLD;
+            }
+        }
+        if (steps_v != 0 || steps_h != 0)
+            wl->axis_cb(wl->pointer_surface, steps_v, steps_h, wl->axis_data);
+    }
+
+    wl->axis_discrete_v = 0;
+    wl->axis_discrete_h = 0;
+    wl->axis_has_discrete = false;
 }
 
 static void pointer_handle_axis_source(void *data, struct wl_pointer *pointer, uint32_t axis_source)
@@ -171,22 +247,30 @@ static void pointer_handle_axis_source(void *data, struct wl_pointer *pointer, u
     DC_UNUSED(axis_source);
 }
 
+/* Scroll gesture ended: drop any sub-threshold remainder so a later, unrelated
+ * gesture doesn't inherit a stale fractional carry (docs/12-BAR-SPEC.md sec.5). */
 static void pointer_handle_axis_stop(void *data, struct wl_pointer *pointer, uint32_t time,
                                      uint32_t axis)
 {
-    DC_UNUSED(data);
+    dc_wayland *wl = data;
     DC_UNUSED(pointer);
     DC_UNUSED(time);
-    DC_UNUSED(axis);
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+        wl->axis_accum_v = 0.0;
+    else if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
+        wl->axis_accum_h = 0.0;
 }
 
 static void pointer_handle_axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis,
                                          int32_t discrete)
 {
-    DC_UNUSED(data);
+    dc_wayland *wl = data;
     DC_UNUSED(pointer);
-    DC_UNUSED(axis);
-    DC_UNUSED(discrete);
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+        wl->axis_discrete_v += discrete;
+    else if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
+        wl->axis_discrete_h += discrete;
+    wl->axis_has_discrete = true;
 }
 
 static const struct wl_pointer_listener pointer_listener = {
@@ -303,8 +387,15 @@ static void seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t 
     if ((caps & WL_SEAT_CAPABILITY_POINTER) && !wl->pointer) {
         wl->pointer = wl_seat_get_pointer(seat);
         wl_pointer_add_listener(wl->pointer, &pointer_listener, wl);
+        if (wl->cursor_shape_manager)
+            wl->cursor_shape_device =
+                wp_cursor_shape_manager_v1_get_pointer(wl->cursor_shape_manager, wl->pointer);
         dc_debug("pointer acquired");
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && wl->pointer) {
+        if (wl->cursor_shape_device) {
+            wp_cursor_shape_device_v1_destroy(wl->cursor_shape_device);
+            wl->cursor_shape_device = NULL;
+        }
         wl_pointer_release(wl->pointer);
         wl->pointer = NULL;
     }
@@ -362,6 +453,9 @@ static void registry_handle_global(void *data, struct wl_registry *registry, uin
     } else if (strcmp(interface, ext_session_lock_manager_v1_interface.name) == 0) {
         wl->session_lock_manager =
             wl_registry_bind(registry, name, &ext_session_lock_manager_v1_interface, 1);
+    } else if (strcmp(interface, wp_cursor_shape_manager_v1_interface.name) == 0) {
+        wl->cursor_shape_manager =
+            wl_registry_bind(registry, name, &wp_cursor_shape_manager_v1_interface, 1);
     } else if (strcmp(interface, wl_seat_interface.name) == 0) {
         wl->seat = wl_registry_bind(registry, name, &wl_seat_interface, DC_MIN(version, 7u));
         wl_seat_add_listener(wl->seat, &seat_listener, wl);
@@ -505,6 +599,44 @@ void dc_wayland_set_key_cb(dc_wayland *wl, dc_key_cb cb, void *user_data)
 {
     wl->key_cb = cb;
     wl->key_data = user_data;
+}
+
+void dc_wayland_set_motion_cb(dc_wayland *wl, dc_motion_cb cb, void *user_data)
+{
+    wl->motion_cb = cb;
+    wl->motion_data = user_data;
+}
+
+void dc_wayland_set_leave_cb(dc_wayland *wl, dc_leave_cb cb, void *user_data)
+{
+    wl->leave_cb = cb;
+    wl->leave_data = user_data;
+}
+
+void dc_wayland_set_axis_cb(dc_wayland *wl, dc_axis_cb cb, void *user_data)
+{
+    wl->axis_cb = cb;
+    wl->axis_data = user_data;
+}
+
+void dc_wayland_set_cursor(dc_wayland *wl, dc_cursor_shape shape)
+{
+    /* Lazily create the device on first use rather than only in
+     * seat_handle_capabilities(): the registry doesn't guarantee the
+     * cursor-shape-manager global is bound before the seat's first
+     * capabilities event is processed, and binding it here instead means a
+     * global-ordering fluke can never permanently disable the cursor for the
+     * whole session (docs/12-BAR-SPEC.md sec.5). */
+    if (!wl->cursor_shape_device && wl->cursor_shape_manager && wl->pointer)
+        wl->cursor_shape_device =
+            wp_cursor_shape_manager_v1_get_pointer(wl->cursor_shape_manager, wl->pointer);
+    if (!wl->cursor_shape_device)
+        return; /* protocol unavailable on this compositor, or no pointer yet */
+
+    uint32_t proto_shape = (shape == DC_CURSOR_POINTER) ? WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER
+                                                         : WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
+    wp_cursor_shape_device_v1_set_shape(wl->cursor_shape_device, wl->pointer_enter_serial,
+                                        proto_shape);
 }
 
 void dc_wayland_integrate(dc_wayland *wl, struct dc_loop *loop)

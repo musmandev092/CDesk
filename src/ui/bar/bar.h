@@ -60,4 +60,15 @@ typedef enum {
  * dc_tray_items() enumeration (clicking is still a no-op until S6). */
 dc_bar_region dc_bar_hittest(dc_bar *bar, double x, double y, int *out_payload);
 
+/* Pointer motion over this bar's surface, in surface-local logical
+ * coordinates (docs/12-BAR-SPEC.md sec.3/5): hit-tests, updates the cursor
+ * shape, and re-renders — but only when the hovered region actually changed,
+ * not on every motion event. Wire to dc_wayland_set_motion_cb() via a
+ * surface-matching dispatcher (see main.c's click handler for the pattern). */
+void dc_bar_pointer_motion(dc_bar *bar, double x, double y);
+
+/* Pointer left this bar's surface entirely: clears hover state/cursor and
+ * re-renders if anything was actually hovered. */
+void dc_bar_pointer_leave(dc_bar *bar);
+
 #endif /* DC_UI_BAR_BAR_H */

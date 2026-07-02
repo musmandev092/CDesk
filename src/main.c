@@ -332,6 +332,65 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
     }
 }
 
+/* Pointer motion over a bar surface: forward to hover tracking, which
+ * internally re-renders only on a hover-region change (docs/12-BAR-SPEC.md
+ * sec.5). Other DankC surfaces (popups, launcher) don't have per-pixel hover
+ * yet, so a miss here is a silent no-op. */
+static void handle_bar_motion(struct wl_surface *surface, double x, double y, void *data)
+{
+    struct bar_set *set = data;
+    for (int i = 0; i < set->count; i++) {
+        if (dc_bar_surface(set->bars[i]) == surface) {
+            dc_bar_pointer_motion(set->bars[i], x, y);
+            return;
+        }
+    }
+}
+
+/* Pointer left a surface entirely: clear hover on whichever bar it was (if
+ * any — popups don't track hover). */
+static void handle_bar_leave(struct wl_surface *surface, void *data)
+{
+    struct bar_set *set = data;
+    for (int i = 0; i < set->count; i++) {
+        if (dc_bar_surface(set->bars[i]) == surface) {
+            dc_bar_pointer_leave(set->bars[i]);
+            return;
+        }
+    }
+}
+
+/* Scroll on a bar surface: vertical wheel -> workspace focus, horizontal ->
+ * column focus (docs/12-BAR-SPEC.md sec.5 — the user's live config,
+ * scrollYBehavior=workspace/scrollXBehavior=column; other behavior modes
+ * aren't wired up, since dankc's config doesn't expose them yet). `steps_v`/
+ * `steps_h` are already debounced into whole steps by dc_wayland (wl.c); one
+ * niri action fires per callback regardless of step magnitude, so a single
+ * fast flick can't spawn a pile of `niri msg` processes. */
+static void handle_bar_axis(struct wl_surface *surface, int steps_v, int steps_h, void *data)
+{
+    struct bar_set *set = data;
+    bool on_bar = false;
+    for (int i = 0; i < set->count; i++) {
+        if (dc_bar_surface(set->bars[i]) == surface) {
+            on_bar = true;
+            break;
+        }
+    }
+    if (!on_bar)
+        return;
+
+    if (steps_v > 0)
+        dc_niri_focus_workspace_down();
+    else if (steps_v < 0)
+        dc_niri_focus_workspace_up();
+
+    if (steps_h > 0)
+        dc_niri_focus_column_right();
+    else if (steps_h < 0)
+        dc_niri_focus_column_left();
+}
+
 int main(int argc, char **argv)
 {
     /* Client modes exit immediately without starting the shell. */
@@ -431,6 +490,9 @@ int main(int argc, char **argv)
                              .settings = settings,
                              .notifications = notifications};
     dc_wayland_set_click_cb(wl, handle_bar_click, &cctx);
+    dc_wayland_set_motion_cb(wl, handle_bar_motion, &set);
+    dc_wayland_set_leave_cb(wl, handle_bar_leave, &set);
+    dc_wayland_set_axis_cb(wl, handle_bar_axis, &set);
 
     struct control_ctx control_ctx = {.wl = wl,
                                       .launcher = launcher,

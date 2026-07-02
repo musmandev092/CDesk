@@ -59,4 +59,13 @@ const dc_niri_window *dc_niri_focused_window(const dc_niri *niri);
  * on a second IPC connection. */
 void dc_niri_focus_workspace(int idx);
 
+/* Bar scroll behaviors (docs/12-BAR-SPEC.md sec.5: scrollYBehavior=workspace,
+ * scrollXBehavior=column — the user's live config, the only behaviors
+ * implemented so far). Same fire-and-forget `niri msg action` shape as
+ * dc_niri_focus_workspace(). */
+void dc_niri_focus_workspace_down(void);
+void dc_niri_focus_workspace_up(void);
+void dc_niri_focus_column_left(void);
+void dc_niri_focus_column_right(void);
+
 #endif /* DC_NIRI_NIRI_H */

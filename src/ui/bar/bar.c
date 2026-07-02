@@ -1,5 +1,6 @@
 #include "ui/bar/bar.h"
 
+#include "core/anim.h"
 #include "core/config.h"
 #include "core/log.h"
 #include "dc.h"
@@ -80,6 +81,24 @@ static inline NVGcolor tc_alpha(dc_color c, int alpha)
     return nvgRGBA(c.r, c.g, c.b, (unsigned char)alpha);
 }
 
+/* Per-channel linear interpolation between two already-converted nanovg
+ * colors (docs/12-BAR-SPEC.md sec.4 workspaceSwitcher: the capsule
+ * color-crossfade that rides along with the width morph). `t` is clamped to
+ * [0,1] so callers can pass raw animation progress unchecked. */
+static inline NVGcolor color_lerp(NVGcolor a, NVGcolor b, float t)
+{
+    if (t < 0.0f)
+        t = 0.0f;
+    if (t > 1.0f)
+        t = 1.0f;
+    NVGcolor c;
+    c.r = a.r + (b.r - a.r) * t;
+    c.g = a.g + (b.g - a.g) * t;
+    c.b = a.b + (b.b - a.b) * t;
+    c.a = a.a + (b.a - a.a) * t;
+    return c;
+}
+
 /* Theme.outlineButton = withAlpha(outline, 0.5) — clock/focusedWindow bullet
  * separators (docs/12-BAR-SPEC.md sec.4; verified against DMS Theme.qml). */
 static inline NVGcolor bar_outline_button(const dc_theme *t)
@@ -141,6 +160,23 @@ struct dc_bar {
      * layout pass; docs/12-BAR-SPEC.md sec.5). */
     dc_bar_hit hits[DC_BAR_MAX_HITS];
     int hit_count;
+
+    /* Hover state (docs/12-BAR-SPEC.md sec.3/5): the region+payload under the
+     * pointer as of the last hittest, used both to decide whether a motion
+     * event is worth a re-render (dc_bar_pointer_motion()) and, during
+     * render, to know which hit rect to paint the hover overlay onto. */
+    dc_bar_region hover_region;
+    int hover_payload;
+
+    /* Workspace capsule morph animation (docs/12-BAR-SPEC.md sec.4/7 S6):
+     * tracks this output's active workspace id across renders so a change can
+     * kick off a width/color tween, self-driven by frame callbacks (see
+     * bar_update_ws_anim(), ws_frame_done()) independent of the 1Hz tick. */
+    uint64_t ws_active_id;
+    uint64_t ws_prev_active_id;
+    bool ws_active_init;
+    dc_anim ws_anim;
+    struct wl_callback *ws_frame_cb;
 
     int logical_width;  /* from the layer-surface configure */
     int logical_height;
@@ -251,6 +287,22 @@ static void bar_push_hit(dc_bar *bar, float x0, float x1, dc_bar_region region, 
     h->y1 = bar->rect_y + bar->rect_h;
     h->region = region;
     h->payload = payload;
+}
+
+/* Topmost hit rect containing (x,y), or NULL — last-drawn-wins, matching
+ * what's visually on top when rects overlap by a rounding pixel
+ * (docs/12-BAR-SPEC.md sec.5). Shared by dc_bar_hittest() (click/scroll
+ * dispatch) and draw_hover_overlay() (paint the hover highlight at the same
+ * rect a click would land on). */
+static const dc_bar_hit *bar_find_hit(const dc_bar *bar, double x, double y)
+{
+    for (int i = bar->hit_count - 1; i >= 0; i--) {
+        const dc_bar_hit *h = &bar->hits[i];
+        if (x < (double)h->x0 || x > (double)h->x1 || y < (double)h->y0 || y > (double)h->y1)
+            continue;
+        return h;
+    }
+    return NULL;
 }
 
 /* --- launcherButton / clipboard / notificationButton: single centered icon */
@@ -367,6 +419,14 @@ static float layout_workspaces(dc_bar *bar, float x0, bool draw)
     const float y = cy - h / 2.0f;
     const float active_w = dc_bar_ws_active_width(cfg);
     const float inactive_w = dc_bar_ws_inactive_width(cfg);
+    /* Morph animation (docs/12-BAR-SPEC.md sec.4/7 S6): progress is shared by
+     * whichever capsule is growing (the newly active one) and whichever is
+     * shrinking (the previously active one) this frame — see
+     * bar_update_ws_anim(). Computed once for both the measure pass
+     * (draw=false) and the draw pass so the row's total width never differs
+     * between them (it drives place_widget()'s pill width via measure). */
+    const bool anim_running = dc_anim_active(&bar->ws_anim);
+    const float anim_p = anim_running ? dc_anim_progress(&bar->ws_anim) : 1.0f;
     float x = x0;
     bool any = false;
 
@@ -375,16 +435,28 @@ static float layout_workspaces(dc_bar *bar, float x0, bool draw)
         if (bar->output->name && ws->output[0] && strcmp(ws->output, bar->output->name) != 0)
             continue;
 
-        float item_w = ws->is_active ? active_w : inactive_w;
-        if (draw) {
-            NVGcolor fill;
-            if (ws->is_urgent)
-                fill = tc(t->error);
-            else if (ws->is_active)
-                fill = tc(t->primary);
-            else
-                fill = bar_surface_text_alpha(t);
+        float item_w;
+        NVGcolor fill;
+        if (ws->is_urgent) {
+            item_w = ws->is_active ? active_w : inactive_w;
+            fill = tc(t->error);
+        } else if (anim_running && ws->id == bar->ws_active_id) {
+            /* Growing: just became active. */
+            item_w = inactive_w + (active_w - inactive_w) * anim_p;
+            fill = color_lerp(bar_surface_text_alpha(t), tc(t->primary), anim_p);
+        } else if (anim_running && ws->id == bar->ws_prev_active_id) {
+            /* Shrinking: was active a moment ago. */
+            item_w = active_w + (inactive_w - active_w) * anim_p;
+            fill = color_lerp(tc(t->primary), bar_surface_text_alpha(t), anim_p);
+        } else if (ws->is_active) {
+            item_w = active_w;
+            fill = tc(t->primary);
+        } else {
+            item_w = inactive_w;
+            fill = bar_surface_text_alpha(t);
+        }
 
+        if (draw) {
             float radius = dc_bar_clamp_radius(DC_BAR_CORNER_RADIUS, item_w, h);
             nvgBeginPath(vg);
             nvgRoundedRect(vg, x, y, item_w, h, radius);
@@ -1507,6 +1579,123 @@ static void draw_bar_background(dc_bar *bar)
     nvgFill(vg);
 }
 
+/* --- workspace capsule morph animation ------------------------------------ */
+
+/* Detect an active-workspace change on this bar's output and, if one just
+ * happened, kick off the width/color morph (docs/12-BAR-SPEC.md sec.4/7 S6).
+ * Called once per render, before layout_workspaces() reads bar->ws_anim /
+ * ws_active_id / ws_prev_active_id. The first observation after bar creation
+ * just primes ws_active_id — no morph plays for the initial state. */
+static void bar_update_ws_anim(dc_bar *bar)
+{
+    if (!bar->niri)
+        return;
+
+    int count = 0;
+    const dc_niri_workspace *workspaces = dc_niri_workspaces(bar->niri, &count);
+    uint64_t active_id = 0;
+    for (int i = 0; i < count; i++) {
+        const dc_niri_workspace *ws = &workspaces[i];
+        if (bar->output->name && ws->output[0] && strcmp(ws->output, bar->output->name) != 0)
+            continue;
+        if (ws->is_active) {
+            active_id = ws->id;
+            break;
+        }
+    }
+    if (active_id == 0)
+        return; /* no active workspace on this output this frame */
+
+    if (!bar->ws_active_init) {
+        bar->ws_active_id = active_id;
+        bar->ws_active_init = true;
+        return;
+    }
+    if (active_id != bar->ws_active_id) {
+        bar->ws_prev_active_id = bar->ws_active_id;
+        bar->ws_active_id = active_id;
+        dc_anim_start(&bar->ws_anim, DC_DUR_MEDIUM, DC_EASE_EMPHASIZED);
+    }
+}
+
+/* Frame callback that keeps the workspace morph animating independently of
+ * the bar's normal 1Hz clock-driven redraw (docs/12-BAR-SPEC.md sec.7 S6) —
+ * same self-terminating pattern as launcher.c/controlcenter.c's entrance
+ * animations: re-arm only while dc_anim_active(), so an idle bar costs 0
+ * extra frames. */
+static void ws_frame_done(void *data, struct wl_callback *cb, uint32_t time);
+static const struct wl_callback_listener ws_frame_listener = {.done = ws_frame_done};
+
+static void ws_frame_done(void *data, struct wl_callback *cb, uint32_t time)
+{
+    dc_bar *bar = data;
+    DC_UNUSED(time);
+    wl_callback_destroy(cb);
+    bar->ws_frame_cb = NULL;
+    if (dc_anim_active(&bar->ws_anim))
+        dc_bar_render(bar);
+}
+
+/* --- hover overlay --------------------------------------------------------- */
+
+/* Visual height (px) of the shape at a given hit region — hit rects
+ * themselves are padded to the full bar height for a forgiving click target
+ * (bar_push_hit()), so this is the only place that needs each region's
+ * actual on-screen size (docs/12-BAR-SPEC.md sec.3/4). Anything not listed
+ * (including DC_BAR_REGION_NONE) falls back to the standard BasePill height —
+ * harmless, since draw_hover_overlay() skips NONE before this is used. */
+static float bar_hover_height(const dc_config *cfg, dc_bar_region region)
+{
+    switch (region) {
+    case DC_BAR_REGION_WORKSPACE:
+        return dc_bar_widget_thickness(cfg) * 0.5f;
+    case DC_BAR_REGION_MEDIA_PREV:
+    case DC_BAR_REGION_MEDIA_NEXT:
+        return 20.0f;
+    case DC_BAR_REGION_MEDIA_PLAY:
+        return 24.0f;
+    case DC_BAR_REGION_TRAY:
+        return DC_BAR_TRAY_CHIP;
+    default:
+        return dc_bar_widget_thickness(cfg);
+    }
+}
+
+/* Hover bg (docs/12-BAR-SPEC.md sec.3): withAlpha(blend(surfaceContainerHigh,
+ * primary, 0.10), max(0.30, widgetTransparency)), painted on top of whichever
+ * hit rect the pointer is currently over — sized to that region's own visual
+ * shape (bar_hover_height()), not the taller click target, so full pills get
+ * a stadium and circular sub-regions (media transport, tray chips) get a
+ * circle via the same stadium/circle radius clamp normal drawing uses.
+ * Non-interactive widgets (focusedWindow, cpu/mem/weather) push hits with
+ * region DC_BAR_REGION_NONE, so they never reach here. */
+static void draw_hover_overlay(dc_bar *bar)
+{
+    if (!bar->wl->pointer || bar->wl->pointer_surface != bar->surface)
+        return;
+
+    const dc_bar_hit *hit = bar_find_hit(bar, bar->wl->pointer_x, bar->wl->pointer_y);
+    if (!hit || hit->region == DC_BAR_REGION_NONE)
+        return;
+
+    const dc_config *cfg = dc_config_current;
+    const dc_theme *t = dc_theme_current;
+    float h = bar_hover_height(cfg, hit->region);
+    float w = hit->x1 - hit->x0;
+    float y = bar_cy(bar) - h / 2.0f;
+    float radius = dc_bar_clamp_radius(h / 2.0f, w, h);
+
+    NVGcolor blended = color_lerp(tc(t->surface_container_high), tc(t->primary), 0.10f);
+    float alpha = fmaxf(0.30f, cfg->bar_widget_transparency);
+
+    NVGcontext *vg = bar->render->vg;
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, hit->x0, y, w, h, radius);
+    nvgFillColor(vg, nvgRGBA((unsigned char)(blended.r * 255.0f), (unsigned char)(blended.g * 255.0f),
+                            (unsigned char)(blended.b * 255.0f), (unsigned char)(alpha * 255.0f)));
+    nvgFill(vg);
+}
+
 void dc_bar_render(dc_bar *bar)
 {
     if (!bar->configured || bar->phys_width <= 0)
@@ -1536,6 +1725,8 @@ void dc_bar_render(dc_bar *bar)
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
+    bar_update_ws_anim(bar);
+
     float pixel_ratio = (float)bar->scale120 / DC_SCALE_BASE;
     nvgBeginFrame(bar->render->vg, bar->logical_width, bar->logical_height, pixel_ratio);
     draw_bar_shadow(bar);
@@ -1547,7 +1738,17 @@ void dc_bar_render(dc_bar *bar)
     layout_center(bar, cfg->bar_center_widgets, cfg->bar_center_widgets_n);
     layout_right(bar, cfg->bar_right_widgets, cfg->bar_right_widgets_n);
 
+    draw_hover_overlay(bar);
+
     nvgEndFrame(bar->render->vg);
+
+    /* Re-arm only while the morph animation is still running (idle = 0 extra
+     * frames), matching launcher.c/controlcenter.c's entrance-animation
+     * pattern (docs/12-BAR-SPEC.md sec.7 S6). */
+    if (dc_anim_active(&bar->ws_anim) && !bar->ws_frame_cb) {
+        bar->ws_frame_cb = wl_surface_frame(bar->surface);
+        wl_callback_add_listener(bar->ws_frame_cb, &ws_frame_listener, bar);
+    }
 
     dc_egl_swap(bar->egl, &bar->egl_window);
 }
@@ -1679,26 +1880,45 @@ dc_bar_region dc_bar_hittest(dc_bar *bar, double x, double y, int *out_payload)
 {
     if (out_payload)
         *out_payload = 0;
+    const dc_bar_hit *hit = bar_find_hit(bar, x, y);
+    if (!hit)
+        return DC_BAR_REGION_NONE;
+    if (out_payload)
+        *out_payload = hit->payload;
+    return hit->region;
+}
 
-    /* Reverse order: workspaceSwitcher's per-capsule hits are pushed after
-     * (inside) its section, but any widget's rect could in principle overlap
-     * a neighbour by a rounding pixel — last-drawn-wins matches what's on
-     * top visually. */
-    for (int i = bar->hit_count - 1; i >= 0; i--) {
-        const dc_bar_hit *h = &bar->hits[i];
-        if (x < (double)h->x0 || x > (double)h->x1 || y < (double)h->y0 || y > (double)h->y1)
-            continue;
-        if (out_payload)
-            *out_payload = h->payload;
-        return h->region;
-    }
-    return DC_BAR_REGION_NONE;
+void dc_bar_pointer_motion(dc_bar *bar, double x, double y)
+{
+    int payload = 0;
+    dc_bar_region region = dc_bar_hittest(bar, x, y, &payload);
+    if (region == bar->hover_region && payload == bar->hover_payload)
+        return; /* still the same region — nothing to repaint (docs/12-BAR-SPEC.md sec.5) */
+
+    bar->hover_region = region;
+    bar->hover_payload = payload;
+    dc_wayland_set_cursor(bar->wl,
+                          region != DC_BAR_REGION_NONE ? DC_CURSOR_POINTER : DC_CURSOR_DEFAULT);
+    dc_bar_render(bar);
+}
+
+void dc_bar_pointer_leave(dc_bar *bar)
+{
+    if (bar->hover_region == DC_BAR_REGION_NONE)
+        return; /* nothing was hovered — no repaint needed */
+
+    bar->hover_region = DC_BAR_REGION_NONE;
+    bar->hover_payload = 0;
+    dc_wayland_set_cursor(bar->wl, DC_CURSOR_DEFAULT);
+    dc_bar_render(bar);
 }
 
 void dc_bar_destroy(dc_bar *bar)
 {
     if (!bar)
         return;
+    if (bar->ws_frame_cb)
+        wl_callback_destroy(bar->ws_frame_cb);
     if (bar->egl_ready)
         dc_egl_window_finish(&bar->egl_window, bar->egl);
     if (bar->viewport)

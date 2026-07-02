@@ -365,3 +365,36 @@ void dc_niri_focus_workspace(int idx)
     }
     /* Parent: fire-and-forget, reaped by main's SIGCHLD = SIG_IGN. */
 }
+
+/* Fire-and-forget `niri msg action <name>` with no further arguments — the
+ * shared shape behind the scroll-driven focus actions below (docs/12-BAR-SPEC.md
+ * sec.5). */
+static void niri_spawn_action(const char *name)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("niri", "niri", "msg", "action", name, (char *)NULL);
+        _exit(127);
+    }
+    /* Parent: fire-and-forget, reaped by main's SIGCHLD = SIG_IGN. */
+}
+
+void dc_niri_focus_workspace_down(void)
+{
+    niri_spawn_action("focus-workspace-down");
+}
+
+void dc_niri_focus_workspace_up(void)
+{
+    niri_spawn_action("focus-workspace-up");
+}
+
+void dc_niri_focus_column_left(void)
+{
+    niri_spawn_action("focus-column-left");
+}
+
+void dc_niri_focus_column_right(void)
+{
+    niri_spawn_action("focus-column-right");
+}
