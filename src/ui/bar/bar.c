@@ -1434,8 +1434,8 @@ static const dc_bar_widget_def *find_widget(const char *id)
         {"systemTray", measure_tray, draw_tray_pill, false, true, DC_BAR_REGION_NONE},
         {"clipboard", measure_clipboard, draw_clipboard_pill, true, false,
          DC_BAR_REGION_CLIPBOARD},
-        {"cpuUsage", measure_cpu, draw_cpu_pill, true, false, DC_BAR_REGION_NONE},
-        {"memUsage", measure_mem, draw_mem_pill, true, false, DC_BAR_REGION_NONE},
+        {"cpuUsage", measure_cpu, draw_cpu_pill, true, false, DC_BAR_REGION_CPU},
+        {"memUsage", measure_mem, draw_mem_pill, true, false, DC_BAR_REGION_MEM},
         {"notificationButton", measure_notif, draw_notif_pill, true, false,
          DC_BAR_REGION_NOTIFICATIONS},
         /* battery -> control center for now (docs/12-BAR-SPEC.md sec.5: "battery→battery
@@ -1688,8 +1688,10 @@ static float bar_hover_height(const dc_config *cfg, dc_bar_region region)
  * shape (bar_hover_height()), not the taller click target, so full pills get
  * a stadium and circular sub-regions (media transport, tray chips) get a
  * circle via the same stadium/circle radius clamp normal drawing uses.
- * Non-interactive widgets (focusedWindow, cpu/mem/weather) push hits with
- * region DC_BAR_REGION_NONE, so they never reach here. */
+ * Non-interactive widgets (focusedWindow, weather) push hits with region
+ * DC_BAR_REGION_NONE, so they never reach here. cpuUsage/memUsage became
+ * clickable (-> the Processes popout) when that popout was added, so they no
+ * longer fall in that bucket. */
 static void draw_hover_overlay(dc_bar *bar)
 {
     if (!bar->wl->pointer || bar->wl->pointer_surface != bar->surface)

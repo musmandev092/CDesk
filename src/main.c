@@ -29,6 +29,7 @@
 #include "ui/lock.h"
 #include "ui/notifcenter.h"
 #include "ui/osd.h"
+#include "ui/processes.h"
 #include "ui/settings.h"
 #include "ui/toasts.h"
 #include "wayland/egl.h"
@@ -70,6 +71,7 @@ struct tick_ctx {
     dc_wayland *wl;
     dc_notifications *notifications;
     dc_lock *lock;
+    dc_processes *processes;
     int last_volume;
     bool last_muted;
     bool have_last;
@@ -83,6 +85,10 @@ static void clock_tick(void *data)
     dc_notifications_tick(ctx->notifications);
     dc_lock_tick(ctx->lock);
     dc_sysmon_poll(); /* self-limits to 3s (docs/12-BAR-SPEC.md sec.4 cpuUsage/memUsage) */
+    /* Both self-limit/no-op while the Processes popout is closed (docs/13-
+     * POPOUTS-SPEC.md: "2s poll only while open, no background cost"). */
+    dc_sysmon_poll_processes();
+    dc_processes_refresh(ctx->processes);
     render_all(ctx->set);
 
     dc_audio_info audio;
@@ -128,6 +134,7 @@ struct click_ctx {
     dc_launcher *launcher;
     dc_notif_center *notif_center;
     dc_clip_picker *clip_picker;
+    dc_processes *processes;
     dc_settings *settings;
     dc_notifications *notifications;
 };
@@ -142,6 +149,7 @@ static void logind_lock(void *data)
 struct kbd_ctx {
     dc_launcher *launcher;
     dc_clip_picker *clip_picker;
+    dc_processes *processes;
     dc_lock *lock;
 };
 
@@ -152,6 +160,8 @@ static void handle_key(uint32_t keysym, const char *utf8, void *data)
         dc_lock_handle_key(k->lock, keysym, utf8);
     else if (dc_clip_picker_visible(k->clip_picker))
         dc_clip_picker_handle_key(k->clip_picker, keysym, utf8);
+    else if (dc_processes_visible(k->processes))
+        dc_processes_handle_key(k->processes, keysym, utf8);
     else
         dc_launcher_handle_key(k->launcher, keysym, utf8);
 }
@@ -163,6 +173,7 @@ struct control_ctx {
     dc_control_center *control_center;
     dc_notif_center *notif_center;
     dc_clip_picker *clip_picker;
+    dc_processes *processes;
     dc_settings *settings;
     dc_lock *lock;
     dc_notifications *notifications;
@@ -204,6 +215,11 @@ static void control_dispatch(const char *cmd, void *data)
     }
     else if (strcmp(cmd, "clipboard") == 0 || strcmp(cmd, "clipboard toggle") == 0)
         dc_clip_picker_toggle(c->clip_picker, out);
+    else if (strcmp(cmd, "processes") == 0 || strcmp(cmd, "processes toggle") == 0 ||
+             strcmp(cmd, "processes cpu") == 0)
+        dc_processes_toggle(c->processes, out, DC_PROCESSES_SORT_CPU);
+    else if (strcmp(cmd, "processes memory") == 0)
+        dc_processes_toggle(c->processes, out, DC_PROCESSES_SORT_MEM);
     else if (strcmp(cmd, "settings") == 0 || strcmp(cmd, "settings toggle") == 0)
         dc_settings_toggle(c->settings, out);
     else if (strcmp(cmd, "lock") == 0)
@@ -254,6 +270,7 @@ static void print_keybinds(void)
            "    Mod+N            { spawn \"dankc\" \"ctl\" \"notifications\"; }\n"
            "    Mod+Shift+C      { spawn \"dankc\" \"ctl\" \"control-center\"; }\n"
            "    Mod+V            { spawn \"dankc\" \"ctl\" \"clipboard\"; }\n"
+           "    Mod+Shift+Slash  { spawn \"dankc\" \"ctl\" \"processes\"; }\n"
            "    Print            { spawn \"dankc\" \"ctl\" \"screenshot\"; }\n"
            "    Mod+Print        { spawn \"dankc\" \"ctl\" \"screenshot-region\"; }\n"
            "    Mod+Shift+P      { spawn \"dankc\" \"ctl\" \"color-picker\"; }\n"
@@ -293,6 +310,11 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
         return;
     }
 
+    if (dc_processes_visible(ctx->processes) && surface == dc_processes_surface(ctx->processes)) {
+        dc_processes_handle_click(ctx->processes, x, y);
+        return;
+    }
+
     if (dc_settings_visible(ctx->settings) && surface == dc_settings_surface(ctx->settings)) {
         dc_settings_handle_click(ctx->settings, x, y);
         return;
@@ -322,11 +344,17 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
             dc_mpris_play_pause();
         } else if (region == DC_BAR_REGION_MEDIA_NEXT) {
             dc_mpris_next();
+        } else if (region == DC_BAR_REGION_CPU) {
+            dc_processes_toggle(ctx->processes, dc_bar_output(bar), DC_PROCESSES_SORT_CPU);
+        } else if (region == DC_BAR_REGION_MEM) {
+            dc_processes_toggle(ctx->processes, dc_bar_output(bar), DC_PROCESSES_SORT_MEM);
         } else {
             if (dc_control_center_visible(cc))
                 dc_control_center_hide(cc);
             if (dc_notif_center_visible(ctx->notif_center))
                 dc_notif_center_hide(ctx->notif_center);
+            if (dc_processes_visible(ctx->processes))
+                dc_processes_hide(ctx->processes);
         }
         return;
     }
@@ -368,6 +396,7 @@ struct axis_ctx {
     struct bar_set *set;
     dc_notif_center *notif_center;
     dc_clip_picker *clip_picker;
+    dc_processes *processes;
 };
 
 /* Scroll on a bar surface: vertical wheel -> workspace focus, horizontal ->
@@ -382,7 +411,8 @@ struct axis_ctx {
  * offsets the active tab's card list instead — the axis routing itself is
  * already generic (see above), so this only needed a surface check + a call
  * into dc_notif_center_handle_scroll(). Same pattern for the clipboard
- * picker's row list (docs/13-POPOUTS-SPEC.md sec.4). */
+ * picker's row list (docs/13-POPOUTS-SPEC.md sec.4) and the Processes
+ * popout's process table. */
 static void handle_bar_axis(struct wl_surface *surface, int steps_v, int steps_h, void *data)
 {
     struct axis_ctx *actx = data;
@@ -395,6 +425,10 @@ static void handle_bar_axis(struct wl_surface *surface, int steps_v, int steps_h
     if (dc_clip_picker_visible(actx->clip_picker) &&
         surface == dc_clip_picker_surface(actx->clip_picker)) {
         dc_clip_picker_handle_scroll(actx->clip_picker, steps_v);
+        return;
+    }
+    if (dc_processes_visible(actx->processes) && surface == dc_processes_surface(actx->processes)) {
+        dc_processes_handle_scroll(actx->processes, steps_v);
         return;
     }
 
@@ -492,8 +526,13 @@ int main(int argc, char **argv)
 
     dc_launcher *launcher = dc_launcher_create(wl, &egl, &render);
     dc_lock *lock = dc_lock_create(wl, &egl, &render);
-    struct tick_ctx tick = {
-        .set = &set, .osd = osd, .wl = wl, .notifications = notifications, .lock = lock};
+    dc_processes *processes = dc_processes_create(wl, &egl, &render);
+    struct tick_ctx tick = {.set = &set,
+                            .osd = osd,
+                            .wl = wl,
+                            .notifications = notifications,
+                            .lock = lock,
+                            .processes = processes};
 
     g_loop = dc_loop_create();
     dc_wayland_integrate(wl, g_loop);
@@ -507,7 +546,8 @@ int main(int argc, char **argv)
     dc_clip_picker *clip_picker = dc_clip_picker_create(wl, &egl, &render, clipboard);
     dc_settings *settings = dc_settings_create(wl, &egl, &render);
 
-    struct kbd_ctx kbd = {.launcher = launcher, .clip_picker = clip_picker, .lock = lock};
+    struct kbd_ctx kbd = {
+        .launcher = launcher, .clip_picker = clip_picker, .processes = processes, .lock = lock};
     dc_wayland_set_key_cb(wl, handle_key, &kbd);
 
     struct click_ctx cctx = {.set = &set,
@@ -516,12 +556,16 @@ int main(int argc, char **argv)
                              .launcher = launcher,
                              .notif_center = notif_center,
                              .clip_picker = clip_picker,
+                             .processes = processes,
                              .settings = settings,
                              .notifications = notifications};
     dc_wayland_set_click_cb(wl, handle_bar_click, &cctx);
     dc_wayland_set_motion_cb(wl, handle_bar_motion, &set);
     dc_wayland_set_leave_cb(wl, handle_bar_leave, &set);
-    struct axis_ctx actx = {.set = &set, .notif_center = notif_center, .clip_picker = clip_picker};
+    struct axis_ctx actx = {.set = &set,
+                            .notif_center = notif_center,
+                            .clip_picker = clip_picker,
+                            .processes = processes};
     dc_wayland_set_axis_cb(wl, handle_bar_axis, &actx);
 
     struct control_ctx control_ctx = {.wl = wl,
@@ -529,6 +573,7 @@ int main(int argc, char **argv)
                                       .control_center = control_center,
                                       .notif_center = notif_center,
                                       .clip_picker = clip_picker,
+                                      .processes = processes,
                                       .settings = settings,
                                       .lock = lock,
                                       .notifications = notifications};
@@ -580,6 +625,7 @@ int main(int argc, char **argv)
     dc_lock_destroy(lock);
     dc_settings_destroy(settings);
     dc_clip_picker_destroy(clip_picker);
+    dc_processes_destroy(processes);
     dc_clipboard_destroy(clipboard);
     dc_control_destroy(control);
     dc_launcher_destroy(launcher);

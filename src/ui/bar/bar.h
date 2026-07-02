@@ -60,6 +60,10 @@ typedef enum {
     DC_BAR_REGION_MEDIA_PREV,
     DC_BAR_REGION_MEDIA_PLAY,
     DC_BAR_REGION_MEDIA_NEXT,
+    /* cpuUsage/memUsage open the Processes popout (docs/13-POPOUTS-SPEC.md
+     * Processes popout), pre-sorted by the metric that was clicked. */
+    DC_BAR_REGION_CPU,
+    DC_BAR_REGION_MEM,
 } dc_bar_region;
 
 /* Which region a surface-local logical coordinate falls in, from the last

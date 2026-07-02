@@ -104,4 +104,10 @@
 #define DC_ICON_SUBJECT 0xe8d2      /* long-text-entry fallback glyph */
 #define DC_ICON_IMAGE 0xe3f4        /* image-entry fallback glyph (thumbnail decode failure) */
 
+/* Processes popout (docs/13-POPOUTS-SPEC.md; ProcessListPopout.qml /
+ * ProcessesView.qml). Values taken from DMS's own MaterialSymbolsRounded
+ * .codepoints file and confirmed present in the bundled TTF's cmap. */
+#define DC_ICON_ANALYTICS 0xef3e /* header "Processes" icon */
+#define DC_ICON_SCHEDULE 0xefd6  /* uptime clock glyph in the distro info row */
+
 #endif /* DC_RENDER_ICONS_H */
