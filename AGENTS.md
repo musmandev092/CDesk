@@ -32,12 +32,13 @@ niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
   prefs, DMS defaults. All 10 DMS DARK stock themes selectable via dc_theme_set (stock_themes.inc,
   generated). Bar clock honours 12/24h + showDate.
 - **Animation engine** (T9): core/anim.c — DMS durations + easing (incl. expressive overshoot),
-  config-scaled. Fade+scale entrance on launcher + control center via frame callbacks (self-terminating).
+  config-scaled. Entrance + EXIT animations (fade+scale/slide) on launcher, control center, notif center,
+  OSD, and toasts via self-terminating frame callbacks.
 - **FIXED the frozen clock**: it was a loop-wide deadlock — blocking `wl_display_dispatch()` raced Mesa's
   gallium threads for the display fd. Now uses thread-safe prepare_read/read_events + a wall-clock loop
   tick. See memory `dankc-wayland-dispatch-deadlock`.
 - **Footprint:** RSS ≈ **145 MB** for two GPU bars incl. Mesa (Pss lower), vs DMS `qs` ≈ 477 MB.
-- **Next:** exit animations (panels currently pop away on hide); workspace-focus pill animation; then
+- **Next:** workspace-focus pill animation (needs bar frame-callback driving); OSD/toast exit fade; then
   T23 clipboard (needs `wl-clipboard` installed to verify) and T22 lock screen (DEFERRED — needs the user
   awake to test PAM auth; locking the live session with unverified code risks a lockout).
 - Vendored: nanovg (GLES3, `third_party/nanovg`), cJSON (`third_party/cjson`); Inter bundled
