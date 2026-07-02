@@ -16,6 +16,7 @@ struct xdg_wm_base;
 struct wp_viewporter;
 struct wp_fractional_scale_manager_v1;
 struct zwlr_data_control_manager_v1;
+struct ext_session_lock_manager_v1;
 struct xkb_context;
 struct xkb_keymap;
 struct xkb_state;
@@ -46,6 +47,7 @@ typedef struct dc_wayland {
     struct wp_viewporter *viewporter;
     struct wp_fractional_scale_manager_v1 *fractional_scale_mgr;
     struct zwlr_data_control_manager_v1 *data_control_manager;
+    struct ext_session_lock_manager_v1 *session_lock_manager;
     struct wl_seat *seat;
 
     /* Pointer state. */

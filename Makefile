@@ -7,7 +7,7 @@ CXX         ?= c++
 PKG_CONFIG  ?= pkg-config
 WAYLAND_SCANNER ?= wayland-scanner
 
-PKGS := wayland-client wayland-egl egl glesv2 libsystemd xkbcommon
+PKGS := wayland-client wayland-egl egl glesv2 libsystemd xkbcommon pam
 
 WARNINGS := -Wall -Wextra -Wshadow -Wvla -Wpointer-arith -Wno-unused-parameter
 INCLUDES := -Isrc -Iprotocol/generated -Ithird_party/nanovg -Ithird_party/nanosvg -Ithird_party/cjson

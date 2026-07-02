@@ -15,6 +15,7 @@
 #include "services/clipboard.h"
 #include "services/dbus.h"
 #include "services/audio.h"
+#include "services/logind.h"
 #include "services/mpris.h"
 #include "services/notifications.h"
 #include "services/tray.h"
@@ -23,6 +24,7 @@
 #include "ui/clip_picker.h"
 #include "ui/controlcenter.h"
 #include "ui/launcher.h"
+#include "ui/lock.h"
 #include "ui/notifcenter.h"
 #include "ui/osd.h"
 #include "ui/settings.h"
@@ -65,6 +67,7 @@ struct tick_ctx {
     dc_osd *osd;
     dc_wayland *wl;
     dc_notifications *notifications;
+    dc_lock *lock;
     int last_volume;
     bool last_muted;
     bool have_last;
@@ -76,6 +79,7 @@ static void clock_tick(void *data)
 {
     struct tick_ctx *ctx = data;
     dc_notifications_tick(ctx->notifications);
+    dc_lock_tick(ctx->lock);
     render_all(ctx->set);
 
     dc_audio_info audio;
@@ -124,16 +128,25 @@ struct click_ctx {
     dc_settings *settings;
 };
 
+/* logind asked us to lock (pre-sleep / lock-session). */
+static void logind_lock(void *data)
+{
+    dc_lock_engage(data);
+}
+
 /* Keyboard input routed to whichever keyboard-grabbing overlay is open. */
 struct kbd_ctx {
     dc_launcher *launcher;
     dc_clip_picker *clip_picker;
+    dc_lock *lock;
 };
 
 static void handle_key(uint32_t keysym, const char *utf8, void *data)
 {
     struct kbd_ctx *k = data;
-    if (dc_clip_picker_visible(k->clip_picker))
+    if (dc_lock_active(k->lock)) /* lock takes all input while engaged */
+        dc_lock_handle_key(k->lock, keysym, utf8);
+    else if (dc_clip_picker_visible(k->clip_picker))
         dc_clip_picker_handle_key(k->clip_picker, keysym, utf8);
     else
         dc_launcher_handle_key(k->launcher, keysym, utf8);
@@ -147,6 +160,7 @@ struct control_ctx {
     dc_notif_center *notif_center;
     dc_clip_picker *clip_picker;
     dc_settings *settings;
+    dc_lock *lock;
 };
 
 static struct dc_output *first_output(struct dc_wayland *wl)
@@ -184,6 +198,10 @@ static void control_dispatch(const char *cmd, void *data)
         dc_clip_picker_toggle(c->clip_picker, out);
     else if (strcmp(cmd, "settings") == 0 || strcmp(cmd, "settings toggle") == 0)
         dc_settings_toggle(c->settings, out);
+    else if (strcmp(cmd, "lock") == 0)
+        dc_lock_engage(c->lock);
+    else if (strcmp(cmd, "unlock") == 0 && getenv("DANKC_LOCK_ESCAPE"))
+        dc_lock_force_unlock(c->lock); /* testing-only, env-gated */
     else if (strcmp(cmd, "screenshot") == 0)
         /* Full screen -> ~/Pictures + clipboard (needs grim + wl-copy). */
         run_sh("f=\"${XDG_PICTURES_DIR:-$HOME/Pictures}/screenshot-$(date +%Y%m%d-%H%M%S).png\"; "
@@ -357,7 +375,9 @@ int main(int argc, char **argv)
     dc_notifications_set_changed_cb(notifications, notifications_changed, &notif_ui);
 
     dc_launcher *launcher = dc_launcher_create(wl, &egl, &render);
-    struct tick_ctx tick = {.set = &set, .osd = osd, .wl = wl, .notifications = notifications};
+    dc_lock *lock = dc_lock_create(wl, &egl, &render);
+    struct tick_ctx tick = {
+        .set = &set, .osd = osd, .wl = wl, .notifications = notifications, .lock = lock};
 
     g_loop = dc_loop_create();
     dc_wayland_integrate(wl, g_loop);
@@ -371,7 +391,7 @@ int main(int argc, char **argv)
     dc_clip_picker *clip_picker = dc_clip_picker_create(wl, &egl, &render, clipboard);
     dc_settings *settings = dc_settings_create(wl, &egl, &render);
 
-    struct kbd_ctx kbd = {.launcher = launcher, .clip_picker = clip_picker};
+    struct kbd_ctx kbd = {.launcher = launcher, .clip_picker = clip_picker, .lock = lock};
     dc_wayland_set_key_cb(wl, handle_key, &kbd);
 
     struct click_ctx cctx = {.set = &set,
@@ -388,8 +408,10 @@ int main(int argc, char **argv)
                                       .control_center = control_center,
                                       .notif_center = notif_center,
                                       .clip_picker = clip_picker,
-                                      .settings = settings};
+                                      .settings = settings,
+                                      .lock = lock};
     dc_control *control = dc_control_create(g_loop, control_dispatch, &control_ctx);
+    dc_logind *logind = dc_logind_create(dbus, logind_lock, lock);
 
     struct sigaction sa = {.sa_handler = handle_signal};
     sigaction(SIGINT, &sa, NULL);
@@ -426,7 +448,9 @@ int main(int argc, char **argv)
     dc_loop_run(g_loop);
 
     dc_info("shutting down");
+    dc_logind_destroy(logind);
     dc_tray_destroy(tray);
+    dc_lock_destroy(lock);
     dc_settings_destroy(settings);
     dc_clip_picker_destroy(clip_picker);
     dc_clipboard_destroy(clipboard);

@@ -25,6 +25,7 @@
 #define DC_ICON_MUSIC_NOTE 0xe405
 #define DC_ICON_WIDGETS 0xe1bd
 #define DC_ICON_POWER 0xf8c7
+#define DC_ICON_LOCK 0xe897
 #define DC_ICON_DARK_MODE 0xe51c
 #define DC_ICON_LIGHT_MODE 0xe518
 #define DC_ICON_CLOSE 0xe5cd

@@ -21,10 +21,11 @@ egl            = dependency('egl')
 glesv2         = dependency('glesv2')
 xkbcommon      = dependency('xkbcommon')
 libsystemd     = dependency('libsystemd')          # sd-bus (swap for elogind/basu on non-systemd distros)
+pam            = cc.find_library('pam')             # lock-screen authentication
 m_dep          = cc.find_library('m', required: false)
 # Protocol XML is vendored under protocol/; only wayland-scanner is needed.
 
-deps = [wayland_client, wayland_egl, egl, glesv2, xkbcommon, libsystemd, m_dep]
+deps = [wayland_client, wayland_egl, egl, glesv2, xkbcommon, libsystemd, pam, m_dep]
 
 # --- wayland protocol generation -----------------------------------------
 wayland_scanner = find_program('wayland-scanner')
@@ -38,6 +39,7 @@ scanner_client = generator(wayland_scanner,
 protocols = [
   'protocol/wlr-layer-shell-unstable-v1.xml',
   'protocol/wlr-data-control-unstable-v1.xml',
+  'protocol/ext-session-lock-v1.xml',
   'protocol/xdg-shell.xml',
   'protocol/viewporter.xml',
   'protocol/fractional-scale-v1.xml',
@@ -71,10 +73,11 @@ src = files(
   'src/ui/bar/bar.c',
   'src/ui/controlcenter.c', 'src/ui/osd.c', 'src/ui/toasts.c',
   'src/ui/launcher.c', 'src/ui/notifcenter.c', 'src/ui/clip_picker.c', 'src/ui/settings.c',
+  'src/ui/lock.c',
   'src/services/battery.c', 'src/services/audio.c', 'src/services/net.c',
   'src/services/dbus.c', 'src/services/bluez.c', 'src/services/mpris.c',
   'src/services/icons.c', 'src/services/apps.c', 'src/services/notifications.c',
-  'src/services/clipboard.c', 'src/services/tray.c',
+  'src/services/clipboard.c', 'src/services/tray.c', 'src/services/auth.c', 'src/services/logind.c',
   'src/niri/niri.c',
   'src/theme/theme.c',
   'src/ipc/control.c',
