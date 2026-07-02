@@ -775,6 +775,10 @@ static void launcher_show(dc_launcher *l, dc_output *output)
     l->configured = false;
     l->egl_ready = false;
     l->scale120 = (output && output->scale > 0 ? output->scale : 1) * DC_SCALE_BASE;
+    /* Settings-UI default view mode (Launcher tab): re-read on every open so
+     * a change live-applies without needing a restart. */
+    l->view_mode =
+        dc_config_current->launcher_grid_view ? DC_LAUNCHER_VIEW_GRID : DC_LAUNCHER_VIEW_LIST;
     l->query[0] = '\0';
     run_search(l);
     dc_anim_start(&l->anim, DC_DUR_MEDIUM, DC_EASE_EXPRESSIVE);

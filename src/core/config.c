@@ -44,6 +44,15 @@ static dc_config config = {
     .bar_right_widgets = {"systemTray", "clipboard", "cpuUsage", "memUsage", "notificationButton",
                           "battery", "controlCenterButton"},
     .bar_right_widgets_n = 7,
+
+    /* Matches the previously-hardcoded DC_NOTIF_LOW_MS/DC_NOTIF_DEFAULT_MS
+     * and "critical never auto-expires" behavior (services/notifications.c). */
+    .notif_timeout_low_sec = 5,
+    .notif_timeout_normal_sec = 5,
+    .notif_timeout_critical_sec = 0,
+    .dnd_enabled = false,
+
+    .launcher_grid_view = false,
 };
 
 const dc_config *dc_config_current = &config;
@@ -256,6 +265,13 @@ void dc_config_load(void)
                      &config.bar_center_widgets_n);
     get_string_array(root, "barRightWidgets", config.bar_right_widgets, DC_CONFIG_WIDGETS_MAX,
                      &config.bar_right_widgets_n);
+
+    get_int(root, "notifTimeoutLow", &config.notif_timeout_low_sec, 0, 120);
+    get_int(root, "notifTimeoutNormal", &config.notif_timeout_normal_sec, 0, 120);
+    get_int(root, "notifTimeoutCritical", &config.notif_timeout_critical_sec, 0, 120);
+    get_bool(root, "dndEnabled", &config.dnd_enabled);
+
+    get_bool(root, "launcherGridView", &config.launcher_grid_view);
     cJSON_Delete(root);
 
     apply_theme();
@@ -339,12 +355,21 @@ void dc_config_save(void)
     cJSON_AddNumberToObject(root, "weatherLat", config.weather_lat);
     cJSON_AddNumberToObject(root, "weatherLon", config.weather_lon);
     cJSON_AddBoolToObject(root, "weatherFahrenheit", config.weather_fahrenheit);
+    if (config.weather_location[0])
+        cJSON_AddStringToObject(root, "weatherLocation", config.weather_location);
 
     add_string_array(root, "barLeftWidgets", config.bar_left_widgets, config.bar_left_widgets_n);
     add_string_array(root, "barCenterWidgets", config.bar_center_widgets,
                      config.bar_center_widgets_n);
     add_string_array(root, "barRightWidgets", config.bar_right_widgets,
                      config.bar_right_widgets_n);
+
+    cJSON_AddNumberToObject(root, "notifTimeoutLow", config.notif_timeout_low_sec);
+    cJSON_AddNumberToObject(root, "notifTimeoutNormal", config.notif_timeout_normal_sec);
+    cJSON_AddNumberToObject(root, "notifTimeoutCritical", config.notif_timeout_critical_sec);
+    cJSON_AddBoolToObject(root, "dndEnabled", config.dnd_enabled);
+
+    cJSON_AddBoolToObject(root, "launcherGridView", config.launcher_grid_view);
 
     char *text = cJSON_Print(root);
     cJSON_Delete(root);

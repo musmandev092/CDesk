@@ -1,5 +1,6 @@
 #include "services/notifications.h"
 
+#include "core/config.h"
 #include "core/log.h"
 #include "services/dbus.h"
 
@@ -11,11 +12,6 @@
 #define DC_NOTIF_PATH "/org/freedesktop/Notifications"
 #define DC_NOTIF_IFACE "org.freedesktop.Notifications"
 #define DC_NOTIF_NAME "org.freedesktop.Notifications"
-
-/* Default on-screen lifetime by urgency when the app passes expire_timeout=-1,
- * matching DMS: low/normal auto-dismiss, critical stays until acted on. */
-#define DC_NOTIF_DEFAULT_MS 5000
-#define DC_NOTIF_LOW_MS 5000
 
 /* Closed-notification reasons (Desktop Notifications spec). */
 #define DC_NOTIF_REASON_EXPIRED 1
@@ -192,7 +188,9 @@ static int method_notify(sd_bus_message *msg, void *userdata, sd_bus_error *err)
     slot->expire_timeout_ms = expire_timeout; /* -1 default, 0 never, >0 ms */
     slot->created_ms = now_ms();
     slot->created_wall_ms = now_wall_ms();
-    slot->popup = true;
+    /* Do Not Disturb (Notifications tab): still recorded/history-tracked, just
+     * never shown as a transient toast. */
+    slot->popup = !dc_config_current->dnd_enabled;
     slot->active = true;
     slot->status = DC_NOTIF_CURRENT; /* arrival -> Current, even for a replace */
     snprintf(slot->app_name, sizeof(slot->app_name), "%s", app_name ? app_name : "");
@@ -310,7 +308,10 @@ void dc_notifications_set_changed_cb(dc_notifications *n, dc_notif_changed_cb cb
     n->changed_data = user_data;
 }
 
-/* Milliseconds a toast should remain on-screen given its urgency/timeout. */
+/* Milliseconds a toast should remain on-screen given its urgency/timeout.
+ * Per-urgency defaults (server default, expire_timeout=-1) are settings-UI
+ * configurable (Notifications tab -> notif_timeout_*_sec; 0 = never
+ * auto-expire), matching DMS's notificationTimeoutLow/Normal/Critical. */
 static int lifetime_ms(const dc_notification *item)
 {
     if (item->expire_timeout_ms > 0)
@@ -318,11 +319,12 @@ static int lifetime_ms(const dc_notification *item)
     if (item->expire_timeout_ms == 0)
         return 0; /* never auto-expire */
     /* server default (-1) */
+    const dc_config *cfg = dc_config_current;
     if (item->urgency == DC_URGENCY_CRITICAL)
-        return 0;
+        return cfg->notif_timeout_critical_sec * 1000;
     if (item->urgency == DC_URGENCY_LOW)
-        return DC_NOTIF_LOW_MS;
-    return DC_NOTIF_DEFAULT_MS;
+        return cfg->notif_timeout_low_sec * 1000;
+    return cfg->notif_timeout_normal_sec * 1000;
 }
 
 bool dc_notifications_tick(dc_notifications *n)

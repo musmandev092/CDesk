@@ -56,6 +56,19 @@ typedef struct dc_config {
     int bar_center_widgets_n;
     char bar_right_widgets[DC_CONFIG_WIDGETS_MAX][DC_CONFIG_WIDGET_ID_MAX];
     int bar_right_widgets_n;
+
+    /* notifications (docs/08-SETTINGS-UI.md PANELS > Notifications): popup
+     * lifetime per urgency in whole seconds (0 = never auto-dismiss), and a
+     * do-not-disturb master switch that suppresses new toast popups while
+     * still recording them in the notification center. */
+    int notif_timeout_low_sec;
+    int notif_timeout_normal_sec;
+    int notif_timeout_critical_sec;
+    bool dnd_enabled;
+
+    /* launcher (docs/08-SETTINGS-UI.md DOCK & LAUNCHER): default view mode
+     * used when the launcher (re)opens -- list (false) or grid (true). */
+    bool launcher_grid_view;
 } dc_config;
 
 /* The active config. Read-only for the rest of the app. */
