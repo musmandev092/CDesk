@@ -17,4 +17,10 @@ typedef struct dc_audio_info {
 /* Read the default sink's volume + mute. Returns true on success. */
 bool dc_audio_read(dc_audio_info *out);
 
+/* Set the default sink's volume to `percent` (0-100, clamped), fire-and-forget
+ * (forks `wpctl set-volume`, like dc_audio_read()'s own popen() call but
+ * non-blocking — used from pointer-drag motion, which fires every frame and
+ * can't afford to wait on a child process). */
+void dc_audio_set_volume(int percent);
+
 #endif /* DC_SERVICES_AUDIO_H */

@@ -35,6 +35,13 @@ void dc_notif_center_refresh(dc_notif_center *nc);
  * close/dismiss/action region. */
 void dc_notif_center_handle_click(dc_notif_center *nc, double x, double y);
 
+/* Pointer motion at logical (x, y): hover tracking (tabs, Clear, header
+ * buttons, each card's own bg/close/dismiss/action region). */
+void dc_notif_center_handle_motion(dc_notif_center *nc, double x, double y);
+
+/* Pointer left the panel: clears hover. */
+void dc_notif_center_handle_leave(dc_notif_center *nc);
+
 /* Mouse wheel over the panel: scroll the active tab's card list by
  * `steps_v` debounced wheel steps (positive = down), clamped to content. */
 void dc_notif_center_handle_scroll(dc_notif_center *nc, int steps_v);

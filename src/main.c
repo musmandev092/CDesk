@@ -376,32 +376,89 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
     }
 }
 
-/* Pointer motion over a bar surface: forward to hover tracking, which
- * internally re-renders only on a hover-region change (docs/12-BAR-SPEC.md
- * sec.5). Other DankC surfaces (popups, launcher) don't have per-pixel hover
- * yet, so a miss here is a silent no-op. */
+/* Pointer motion over any DankC surface: forward to whichever one it's over
+ * — the bar's own per-pixel hover tracking (docs/12-BAR-SPEC.md sec.5), or
+ * (S7) one of the popouts' own hover/drag tracking (docs/13-POPOUTS-SPEC.md).
+ * Each target internally re-renders only when its hovered id actually
+ * changes (or, for control center's slider drag, on every motion while
+ * armed) -- this dispatch itself never redraws anything. Launcher/settings
+ * are intentionally not wired here (owned by other tasks); a miss is a
+ * silent no-op, same as before this surface list grew. wl.c's motion_cb
+ * already fires generically for wl->pointer_surface regardless of which
+ * surface that is (see pointer_handle_motion/_enter), so nothing there
+ * needed to change for this — only this dispatch grew a few more surfaces
+ * to check, mirroring handle_bar_axis's existing per-surface pattern below. */
 static void handle_bar_motion(struct wl_surface *surface, double x, double y, void *data)
 {
-    struct bar_set *set = data;
-    for (int i = 0; i < set->count; i++) {
-        if (dc_bar_surface(set->bars[i]) == surface) {
-            dc_bar_pointer_motion(set->bars[i], x, y);
+    struct click_ctx *ctx = data;
+
+    for (int i = 0; i < ctx->set->count; i++) {
+        if (dc_bar_surface(ctx->set->bars[i]) == surface) {
+            dc_bar_pointer_motion(ctx->set->bars[i], x, y);
             return;
         }
+    }
+    if (dc_control_center_visible(ctx->control_center) &&
+        surface == dc_control_center_surface(ctx->control_center)) {
+        dc_control_center_handle_motion(ctx->control_center, x, y);
+        return;
+    }
+    if (dc_notif_center_visible(ctx->notif_center) &&
+        surface == dc_notif_center_surface(ctx->notif_center)) {
+        dc_notif_center_handle_motion(ctx->notif_center, x, y);
+        return;
+    }
+    if (dc_clip_picker_visible(ctx->clip_picker) &&
+        surface == dc_clip_picker_surface(ctx->clip_picker)) {
+        dc_clip_picker_handle_motion(ctx->clip_picker, x, y);
+        return;
     }
 }
 
-/* Pointer left a surface entirely: clear hover on whichever bar it was (if
- * any — popups don't track hover). */
+/* Pointer left a surface entirely: clear hover (and, for control center, any
+ * in-progress slider drag) on whichever DankC surface it was — bar, or one
+ * of the three hover-tracking popouts. Launcher/settings don't track hover,
+ * so a miss there is a silent no-op. */
 static void handle_bar_leave(struct wl_surface *surface, void *data)
 {
-    struct bar_set *set = data;
-    for (int i = 0; i < set->count; i++) {
-        if (dc_bar_surface(set->bars[i]) == surface) {
-            dc_bar_pointer_leave(set->bars[i]);
+    struct click_ctx *ctx = data;
+
+    for (int i = 0; i < ctx->set->count; i++) {
+        if (dc_bar_surface(ctx->set->bars[i]) == surface) {
+            dc_bar_pointer_leave(ctx->set->bars[i]);
             return;
         }
     }
+    if (dc_control_center_visible(ctx->control_center) &&
+        surface == dc_control_center_surface(ctx->control_center)) {
+        dc_control_center_handle_leave(ctx->control_center);
+        return;
+    }
+    if (dc_notif_center_visible(ctx->notif_center) &&
+        surface == dc_notif_center_surface(ctx->notif_center)) {
+        dc_notif_center_handle_leave(ctx->notif_center);
+        return;
+    }
+    if (dc_clip_picker_visible(ctx->clip_picker) &&
+        surface == dc_clip_picker_surface(ctx->clip_picker)) {
+        dc_clip_picker_handle_leave(ctx->clip_picker);
+        return;
+    }
+}
+
+/* Left button released over any DankC surface: only control center currently
+ * cares (ends a slider drag armed by handle_bar_click's press — docs/13-
+ * POPOUTS-SPEC.md sec.1's button-held-motion gesture). Everything else has no
+ * press-and-hold behavior, so a miss is a silent no-op. */
+static void handle_bar_release(struct wl_surface *surface, double x, double y, void *data)
+{
+    struct click_ctx *ctx = data;
+    DC_UNUSED(x);
+    DC_UNUSED(y);
+
+    if (dc_control_center_visible(ctx->control_center) &&
+        surface == dc_control_center_surface(ctx->control_center))
+        dc_control_center_handle_release(ctx->control_center);
 }
 
 /* dc_wayland's axis_cb fires for whatever surface the pointer is currently
@@ -578,8 +635,9 @@ int main(int argc, char **argv)
                              .settings = settings,
                              .notifications = notifications};
     dc_wayland_set_click_cb(wl, handle_bar_click, &cctx);
-    dc_wayland_set_motion_cb(wl, handle_bar_motion, &set);
-    dc_wayland_set_leave_cb(wl, handle_bar_leave, &set);
+    dc_wayland_set_motion_cb(wl, handle_bar_motion, &cctx);
+    dc_wayland_set_leave_cb(wl, handle_bar_leave, &cctx);
+    dc_wayland_set_release_cb(wl, handle_bar_release, &cctx);
     struct axis_ctx actx = {.set = &set,
                             .notif_center = notif_center,
                             .clip_picker = clip_picker,

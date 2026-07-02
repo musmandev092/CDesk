@@ -8,6 +8,7 @@
 #include "render/nvg.h"
 #include "services/clipboard.h"
 #include "theme/theme.h"
+#include "ui/hover.h"
 #include "ui/popout.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
@@ -89,10 +90,20 @@ static cp_layout cp_get_layout(float w, float h)
  * drawing" convention as notifcenter.c's nc_card_hit). */
 typedef struct {
     uint64_t id;
+    int result_index; /* index into p->results as of this render */
     float row_y0, row_y1;
     float pin_x0, pin_y0, pin_x1, pin_y1;
     float del_x0, del_y0, del_x1, del_y1;
 } cp_row_hit;
+
+/* Hover ids (docs/13-POPOUTS-SPEC.md sec.4: hover bg on rows + pin/delete
+ * buttons, selection follows hover like DMS). Each row's sub-regions are
+ * packed as CP_HOVER_ROW_BASE + hit-index*3 + {0:body,1:pin,2:delete}, same
+ * dynamic-list convention as notifcenter.c's NC_HOVER_CARD_BASE. */
+#define CP_HOVER_NONE 0
+#define CP_HOVER_CLOSE 1
+#define CP_HOVER_CLEAR 2
+#define CP_HOVER_ROW_BASE 10
 
 /* Decoded-thumbnail GL texture cache, keyed by entry id -- avoids re-decoding
  * a PNG/JPEG from scratch on every single frame of the (60fps) entrance
@@ -145,6 +156,10 @@ struct dc_clip_picker {
     /* Entrance/exit scale-and-fade pivot, bar-position-aware — see
      * controlcenter.c's identical field for the full rationale. */
     float anim_ox, anim_oy;
+
+    /* Hover tracking (docs/13-POPOUTS-SPEC.md sec.4), same guard pattern as
+     * bar.c's dc_bar_pointer_motion(). */
+    int hover_id;
 };
 
 static inline NVGcolor tc(dc_color c)
@@ -362,6 +377,7 @@ static void draw_row(dc_clip_picker *p, const dc_clip_entry *e, int display_inde
     cp_row_hit *hit = &p->hits[p->hit_count++];
     memset(hit, 0, sizeof(*hit));
     hit->id = e->id;
+    hit->result_index = display_index - 1;
     hit->row_y0 = y;
     hit->row_y1 = y + DC_CP_ROW_H;
 
@@ -480,6 +496,80 @@ static void draw_row(dc_clip_picker *p, const dc_clip_entry *e, int display_inde
     nvgTextBox(vg, text_x, y + 27.0f, text_w, body, NULL);
 
     nvgRestore(vg);
+}
+
+/* Hover bg (docs/13-POPOUTS-SPEC.md sec.4; formula from bar.c's
+ * draw_hover_overlay(), shared via hover.h): painted last, on top of
+ * whatever's already drawn at that hit rect. A row body spans the full list
+ * width at its own 12px corner radius; pin/delete/close/clear are all small
+ * square hit rects, drawn as circles. `l` is the layout already computed by
+ * the caller (cp_render()), so the row body's x-span doesn't need its own
+ * per-row storage. */
+static void draw_cp_hover(dc_clip_picker *p, const cp_layout *l)
+{
+    if (p->hover_id == CP_HOVER_NONE)
+        return;
+
+    float x0 = 0, y0 = 0, x1 = 0, y1 = 0, radius = 6.0f;
+
+    if (p->hover_id == CP_HOVER_CLOSE) {
+        x0 = p->close_x0;
+        y0 = p->close_y0;
+        x1 = p->close_x1;
+        y1 = p->close_y1;
+        radius = (x1 - x0) / 2.0f;
+    } else if (p->hover_id == CP_HOVER_CLEAR) {
+        x0 = p->clear_x0;
+        y0 = p->clear_y0;
+        x1 = p->clear_x1;
+        y1 = p->clear_y1;
+        radius = (x1 - x0) / 2.0f;
+    } else if (p->hover_id >= CP_HOVER_ROW_BASE) {
+        int rel = p->hover_id - CP_HOVER_ROW_BASE;
+        int i = rel / 3, kind = rel % 3;
+        if (i < 0 || i >= p->hit_count)
+            return;
+        const cp_row_hit *hit = &p->hits[i];
+        switch (kind) {
+        case 0:
+            x0 = l->ix;
+            y0 = hit->row_y0;
+            x1 = l->ix + l->iw;
+            y1 = hit->row_y1;
+            radius = 12.0f;
+            break;
+        case 1:
+            x0 = hit->pin_x0;
+            y0 = hit->pin_y0;
+            x1 = hit->pin_x1;
+            y1 = hit->pin_y1;
+            radius = (x1 - x0) / 2.0f;
+            break;
+        case 2:
+            x0 = hit->del_x0;
+            y0 = hit->del_y0;
+            x1 = hit->del_x1;
+            y1 = hit->del_y1;
+            radius = (x1 - x0) / 2.0f;
+            break;
+        default:
+            return;
+        }
+    } else {
+        return;
+    }
+    if (x1 <= x0 || y1 <= y0)
+        return;
+
+    NVGcontext *vg = p->render->vg;
+    const dc_theme *t = dc_theme_current;
+    const dc_config *cfg = dc_config_current;
+    dc_color hc =
+        dc_hover_bg_color(t->surface_container_high, t->primary, cfg->bar_widget_transparency);
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, x0, y0, x1 - x0, y1 - y0, radius);
+    nvgFillColor(vg, nvgRGBA(hc.r, hc.g, hc.b, hc.a));
+    nvgFill(vg);
 }
 
 static void cp_render(dc_clip_picker *p)
@@ -642,6 +732,8 @@ static void cp_render(dc_clip_picker *p)
         }
     }
 
+    draw_cp_hover(p, &l);
+
     nvgEndFrame(vg);
     if ((dc_anim_active(&p->anim) || p->closing) && !p->frame_cb) {
         p->frame_cb = wl_surface_frame(p->surface);
@@ -786,6 +878,7 @@ static void cp_teardown(dc_clip_picker *p)
     p->surface = NULL;
     p->visible = false;
     p->closing = false;
+    p->hover_id = CP_HOVER_NONE;
     dc_debug("clipboard picker hidden");
 }
 
@@ -874,6 +967,30 @@ static inline bool in_rect(double x, double y, float x0, float y0, float x1, flo
     return x1 > x0 && x >= x0 && x <= x1 && y >= y0 && y <= y1;
 }
 
+/* Which interactive element (if any) sits under (x, y) -- shares the exact
+ * hit boundaries dc_clip_picker_handle_click() dispatches against (same
+ * discipline as controlcenter.c's cc_hittest() / notifcenter.c's
+ * nc_hittest()): close/clear first, then each row's pin/delete before its
+ * own body. */
+static int cp_hittest(dc_clip_picker *p, double x, double y)
+{
+    if (in_rect(x, y, p->close_x0, p->close_y0, p->close_x1, p->close_y1))
+        return CP_HOVER_CLOSE;
+    if (in_rect(x, y, p->clear_x0, p->clear_y0, p->clear_x1, p->clear_y1))
+        return CP_HOVER_CLEAR;
+
+    for (int i = 0; i < p->hit_count; i++) {
+        cp_row_hit *hit = &p->hits[i];
+        if (in_rect(x, y, hit->pin_x0, hit->pin_y0, hit->pin_x1, hit->pin_y1))
+            return CP_HOVER_ROW_BASE + i * 3 + 1;
+        if (in_rect(x, y, hit->del_x0, hit->del_y0, hit->del_x1, hit->del_y1))
+            return CP_HOVER_ROW_BASE + i * 3 + 2;
+        if (y >= (double)hit->row_y0 && y <= (double)hit->row_y1)
+            return CP_HOVER_ROW_BASE + i * 3 + 0;
+    }
+    return CP_HOVER_NONE;
+}
+
 void dc_clip_picker_handle_click(dc_clip_picker *p, double x, double y)
 {
     if (!p->visible || p->closing)
@@ -910,6 +1027,45 @@ void dc_clip_picker_handle_click(dc_clip_picker *p, double x, double y)
             return;
         }
     }
+}
+
+/* Pointer motion over the panel (docs/13-POPOUTS-SPEC.md sec.4): hover
+ * tracking, re-rendering only when the hovered id changes (same guard
+ * pattern as bar.c/controlcenter.c/notifcenter.c). Hovering a row's body
+ * also moves the keyboard selection onto it ("selection follows hover",
+ * matching DMS's DankListView) -- pin/delete/close/clear hover don't touch
+ * selection, only the row body itself does. */
+void dc_clip_picker_handle_motion(dc_clip_picker *p, double x, double y)
+{
+    if (!p->visible || p->closing)
+        return;
+
+    int id = cp_hittest(p, x, y);
+    if (id == p->hover_id)
+        return;
+
+    p->hover_id = id;
+    if (id >= CP_HOVER_ROW_BASE) {
+        int rel = id - CP_HOVER_ROW_BASE;
+        int hit_i = rel / 3, kind = rel % 3;
+        if (kind == 0 && hit_i >= 0 && hit_i < p->hit_count) {
+            int ri = p->hits[hit_i].result_index;
+            if (ri >= 0 && ri < p->result_count)
+                p->selected = ri;
+        }
+    }
+    dc_wayland_set_cursor(p->wl, id != CP_HOVER_NONE ? DC_CURSOR_POINTER : DC_CURSOR_DEFAULT);
+    cp_render(p);
+}
+
+/* Pointer left the panel entirely: clear hover. */
+void dc_clip_picker_handle_leave(dc_clip_picker *p)
+{
+    if (p->hover_id == CP_HOVER_NONE)
+        return;
+    p->hover_id = CP_HOVER_NONE;
+    dc_wayland_set_cursor(p->wl, DC_CURSOR_DEFAULT);
+    cp_render(p);
 }
 
 void dc_clip_picker_handle_scroll(dc_clip_picker *p, int steps_v)

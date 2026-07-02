@@ -33,4 +33,11 @@ void dc_clip_picker_handle_key(dc_clip_picker *p, uint32_t keysym, const char *u
 void dc_clip_picker_handle_click(dc_clip_picker *p, double x, double y);
 void dc_clip_picker_handle_scroll(dc_clip_picker *p, int steps_v);
 
+/* Pointer motion at logical (x, y): hover tracking (rows, pin/delete, close,
+ * clear); hovering a row body also moves the keyboard selection onto it. */
+void dc_clip_picker_handle_motion(dc_clip_picker *p, double x, double y);
+
+/* Pointer left the panel: clears hover. */
+void dc_clip_picker_handle_leave(dc_clip_picker *p);
+
 #endif /* DC_UI_CLIP_PICKER_H */

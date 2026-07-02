@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 /* wpctl forks a process, so cache within the same second (the bar redraws every
  * second, sometimes for multiple outputs). */
@@ -44,4 +45,26 @@ bool dc_audio_read(dc_audio_info *out)
     g_cache_ok = ok;
     g_cache_time = now;
     return ok;
+}
+
+void dc_audio_set_volume(int percent)
+{
+    if (percent < 0)
+        percent = 0;
+    if (percent > 100)
+        percent = 100;
+
+    char cmd[96];
+    snprintf(cmd, sizeof(cmd), "wpctl set-volume @DEFAULT_AUDIO_SINK@ %.2f", percent / 100.0f);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    /* Invalidate the read cache so a drag's own writes are reflected on the
+     * very next dc_audio_read() (the slider's fill needs to track the
+     * pointer immediately, not up to a second later). */
+    g_cache_time = 0;
 }
