@@ -27,11 +27,26 @@ struct dc_notifications {
     sd_bus_slot *slot;
     dc_notification store[DC_NOTIF_MAX]; /* both Current and History tabs */
     uint32_t next_id;
+    uint32_t next_image_ver; /* monotonic counter for dc_notification.image_version */
     dc_notif_changed_cb changed_cb;
     void *changed_data;
 
     bool has_unread; /* bar bell dot (docs/12-BAR-SPEC.md sec.4/6) */
 };
+
+static int select_by_status(dc_notifications *n, dc_notif_status status, const dc_notification **out,
+                            int max);
+static void enforce_history_image_cap(dc_notifications *n);
+
+/* Release a slot's decoded inline-image pixels (if any) -- must run before
+ * every memset(slot, 0, ...) and before a slot's active flag is dropped,
+ * otherwise the malloc'd buffer is orphaned for the process's lifetime. */
+static void free_slot_image(dc_notification *slot)
+{
+    free(slot->image_pixels);
+    slot->image_pixels = NULL;
+    slot->image_w = slot->image_h = 0;
+}
 
 static int64_t now_ms(void)
 {
@@ -52,6 +67,10 @@ static int64_t now_wall_ms(void)
 
 static void notify_changed(dc_notifications *n)
 {
+    /* Single choke point for every call path that can move a notification
+     * into (or leave it in) History, so the memory cap self-heals regardless
+     * of which one fired -- see enforce_history_image_cap()'s own comment. */
+    enforce_history_image_cap(n);
     if (n->changed_cb)
         n->changed_cb(n->changed_data);
 }
@@ -112,6 +131,7 @@ static void resolve_dismiss(dc_notifications *n, dc_notification *slot)
         emit_closed(n, slot->id, DC_NOTIF_REASON_DISMISSED);
     } else {
         slot->active = false; /* forget it entirely */
+        free_slot_image(slot);
     }
     notify_changed(n);
 }
