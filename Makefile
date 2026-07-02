@@ -81,9 +81,21 @@ $(TP_OBJ): %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -rf bin protocol/generated $(OBJ) $(CXX_OBJ) $(TP_OBJ) $(PROTO_O) $(DEPS)
+	rm -rf bin protocol/generated $(OBJ) $(CXX_OBJ) $(TP_OBJ) $(PROTO_O) $(DEPS) bin/test_calc
 
 DEPS := $(OBJ:.o=.d) $(CXX_OBJ:.o=.d)
 -include $(DEPS)
 
-.PHONY: all clean
+# Standalone unit test for the launcher's math evaluator (src/services/calc.c)
+# -- deliberately built with none of the Wayland/EGL/protocol machinery, just
+# the evaluator + its test driver, so it can run in any environment (no
+# niri/compositor needed).
+bin/test_calc: tests/test_calc.c src/services/calc.c src/services/calc.h
+	@mkdir -p bin
+	$(CC) -std=c11 -D_POSIX_C_SOURCE=200809L -Isrc $(WARNINGS) -O2 -g \
+		-o $@ tests/test_calc.c src/services/calc.c -lm
+
+test-calc: bin/test_calc
+	./bin/test_calc
+
+.PHONY: all clean test-calc
