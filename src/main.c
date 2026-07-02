@@ -23,6 +23,7 @@
 #include "services/weather.h"
 #include "theme/theme.h"
 #include "ui/bar/bar.h"
+#include "ui/battery_popout.h"
 #include "ui/clip_picker.h"
 #include "ui/controlcenter.h"
 #include "ui/launcher.h"
@@ -124,6 +125,7 @@ static void notifications_changed(void *data)
 struct click_ctx {
     struct bar_set *set;
     dc_control_center *control_center;
+    dc_battery_popout *battery_popout;
     dc_toasts *toasts;
     dc_launcher *launcher;
     dc_notif_center *notif_center;
@@ -161,6 +163,7 @@ struct control_ctx {
     struct dc_wayland *wl;
     dc_launcher *launcher;
     dc_control_center *control_center;
+    dc_battery_popout *battery_popout;
     dc_notif_center *notif_center;
     dc_clip_picker *clip_picker;
     dc_settings *settings;
@@ -197,6 +200,8 @@ static void control_dispatch(const char *cmd, void *data)
         dc_launcher_toggle(c->launcher, out);
     else if (strcmp(cmd, "control-center") == 0 || strcmp(cmd, "control-center toggle") == 0)
         dc_control_center_toggle(c->control_center, out);
+    else if (strcmp(cmd, "battery") == 0 || strcmp(cmd, "battery toggle") == 0)
+        dc_battery_popout_toggle(c->battery_popout, out);
     else if (strcmp(cmd, "notifications") == 0 || strcmp(cmd, "notifications toggle") == 0) {
         dc_notif_center_toggle(c->notif_center, out);
         if (dc_notif_center_visible(c->notif_center))
@@ -253,6 +258,7 @@ static void print_keybinds(void)
            "    Mod+D            { spawn \"dankc\" \"ctl\" \"launcher\"; }\n"
            "    Mod+N            { spawn \"dankc\" \"ctl\" \"notifications\"; }\n"
            "    Mod+Shift+C      { spawn \"dankc\" \"ctl\" \"control-center\"; }\n"
+           "    Mod+B            { spawn \"dankc\" \"ctl\" \"battery\"; }\n"
            "    Mod+V            { spawn \"dankc\" \"ctl\" \"clipboard\"; }\n"
            "    Print            { spawn \"dankc\" \"ctl\" \"screenshot\"; }\n"
            "    Mod+Print        { spawn \"dankc\" \"ctl\" \"screenshot-region\"; }\n"
@@ -278,6 +284,12 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
 
     if (dc_control_center_visible(cc) && surface == dc_control_center_surface(cc)) {
         dc_control_center_handle_click(cc, x, y);
+        return;
+    }
+
+    if (dc_battery_popout_visible(ctx->battery_popout) &&
+        surface == dc_battery_popout_surface(ctx->battery_popout)) {
+        dc_battery_popout_handle_click(ctx->battery_popout, x, y);
         return;
     }
 
@@ -314,6 +326,8 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
             dc_clip_picker_toggle(ctx->clip_picker, dc_bar_output(bar));
         } else if (region == DC_BAR_REGION_CONTROL_CENTER) {
             dc_control_center_toggle(cc, dc_bar_output(bar));
+        } else if (region == DC_BAR_REGION_BATTERY) {
+            dc_battery_popout_toggle(ctx->battery_popout, dc_bar_output(bar));
         } else if (region == DC_BAR_REGION_WORKSPACE) {
             dc_niri_focus_workspace(payload);
         } else if (region == DC_BAR_REGION_MEDIA_PREV) {
@@ -325,6 +339,8 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
         } else {
             if (dc_control_center_visible(cc))
                 dc_control_center_hide(cc);
+            if (dc_battery_popout_visible(ctx->battery_popout))
+                dc_battery_popout_hide(ctx->battery_popout);
             if (dc_notif_center_visible(ctx->notif_center))
                 dc_notif_center_hide(ctx->notif_center);
         }
@@ -479,6 +495,7 @@ int main(int argc, char **argv)
     dc_tray_set_changed_cb(tray, niri_changed, &set); /* re-render bars on tray change */
 
     dc_control_center *control_center = dc_control_center_create(wl, &egl, &render);
+    dc_battery_popout *battery_popout = dc_battery_popout_create(wl, &egl, &render);
     dc_osd *osd = dc_osd_create(wl, &egl, &render);
 
     dc_output *first_output = NULL;
@@ -512,6 +529,7 @@ int main(int argc, char **argv)
 
     struct click_ctx cctx = {.set = &set,
                              .control_center = control_center,
+                             .battery_popout = battery_popout,
                              .toasts = toasts,
                              .launcher = launcher,
                              .notif_center = notif_center,
@@ -527,6 +545,7 @@ int main(int argc, char **argv)
     struct control_ctx control_ctx = {.wl = wl,
                                       .launcher = launcher,
                                       .control_center = control_center,
+                                      .battery_popout = battery_popout,
                                       .notif_center = notif_center,
                                       .clip_picker = clip_picker,
                                       .settings = settings,
@@ -588,6 +607,7 @@ int main(int argc, char **argv)
     dc_notifications_destroy(notifications);
     dc_osd_destroy(osd);
     dc_control_center_destroy(control_center);
+    dc_battery_popout_destroy(battery_popout);
     for (int i = 0; i < set.count; i++)
         dc_bar_destroy(set.bars[i]);
     /* GL teardown is skipped: the process is exiting and nvgDelete needs a live
