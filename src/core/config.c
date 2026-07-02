@@ -1,5 +1,6 @@
 #include "core/config.h"
 
+#include "core/dms_import.h"
 #include "core/log.h"
 #include "theme/dynamic.h"
 #include "theme/theme.h"
@@ -195,16 +196,24 @@ static bool config_path(char *out, size_t n)
 
 void dc_config_load(void)
 {
+    /* defaults (struct initializer above) -> DMS import -> dankc's own
+     * config.json. Import runs first so any key dankc's config.json actually
+     * sets still wins (docs/12-BAR-SPEC.md sec.7, stage S5): the get_*()
+     * helpers below only touch a field when its JSON key is present, so
+     * layering config.json on top of the DMS-imported values is safe. */
+    dc_dms_import(&config);
+
     char path[512];
     if (!config_path(path, sizeof(path))) {
-        dc_info("no HOME; using default config");
+        dc_info("no HOME; using default/DMS-imported config");
         apply_theme();
         return;
     }
 
     char *text = read_file(path);
     if (!text) {
-        dc_info("no config at %s; using defaults (theme=%s)", path, config.theme_id);
+        dc_info("no config at %s; using default/DMS-imported config (theme=%s)", path,
+                config.theme_id);
         apply_theme();
         return;
     }

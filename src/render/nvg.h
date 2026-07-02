@@ -7,6 +7,7 @@
 #define DC_RENDER_NVG_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "theme/theme.h"
 
@@ -15,7 +16,8 @@ typedef struct NVGcontext NVGcontext;
 typedef struct dc_render {
     NVGcontext *vg;
     int font_ui;
-    int font_icons; /* Material Symbols Rounded; -1 if unavailable */
+    int font_icons;    /* Material Symbols Rounded; -1 if unavailable */
+    int font_fallback; /* fontconfig-located non-Latin (Arabic etc.) fallback; -1 if unavailable */
     bool ready;
 } dc_render;
 
@@ -33,5 +35,13 @@ int dc_render_load_icon(dc_render *render, const char *path, int size);
  * with a GL context current. Returns false on failure. */
 bool dc_render_ensure(dc_render *render);
 void dc_render_finish(dc_render *render);
+
+/* True if the UI font (or its fontconfig-located fallback, see nvg.c) has a
+ * glyph for `codepoint`. Used by bar.c's title sanitizer to drop codepoints
+ * that would otherwise draw as a "tofu" .notdef box instead of falling back
+ * cleanly. Fails open (returns true) before dc_render_ensure() has run or if
+ * the UI font's cmap couldn't be parsed, so it never strips text it can't
+ * positively rule out. */
+bool dc_render_font_has(uint32_t codepoint);
 
 #endif /* DC_RENDER_NVG_H */

@@ -412,65 +412,128 @@ static void draw_workspaces_pill(dc_bar *bar, const dc_pill *p)
 
 /* --- focusedWindow --------------------------------------------------------- */
 
-/* Strip codepoints the UI font can't render before building any display
- * string (docs/12-BAR-SPEC.md sec.8: focusedWindow + music titles) —
- * supplementary-plane codepoints (emoji and friends, >= U+10000), variation
- * selectors (U+FE00-U+FE0F), and private-use-area codepoints (U+E000-U+F8FF,
- * which includes the Material Symbols block itself, in case a stray one ends
- * up in a window/track title). `in`/`out` may alias the same buffer (the
- * output is always <= the input length, and bytes are only ever written at
- * an offset behind or equal to the read cursor, so memmove-through-self is
- * safe even though the ranges can overlap). Malformed UTF-8 continuation
- * bytes are dropped rather than crashing on garbage input. */
+/* Decode one UTF-8 codepoint at `s`, reporting the byte length consumed via
+ * `*out_len`. On a malformed sequence (stray continuation byte, truncated
+ * multi-byte lead), returns the sentinel BAR_UTF8_INVALID with `*out_len =
+ * 1` so the caller resyncs one byte at a time, matching the previous
+ * hand-inlined decoder's behavior. Shared by bar_sanitize_utf8() and
+ * bar_text_is_meaningless() below. */
+#define BAR_UTF8_INVALID 0xFFFFFFFFu
+
+static unsigned bar_next_utf8(const unsigned char *s, int *out_len)
+{
+    unsigned char c = *s;
+    int len;
+    unsigned cp;
+
+    if ((c & 0x80) == 0) {
+        len = 1;
+        cp = c;
+    } else if ((c & 0xE0) == 0xC0) {
+        len = 2;
+        cp = c & 0x1F;
+    } else if ((c & 0xF0) == 0xE0) {
+        len = 3;
+        cp = c & 0x0F;
+    } else if ((c & 0xF8) == 0xF0) {
+        len = 4;
+        cp = c & 0x07;
+    } else {
+        *out_len = 1;
+        return BAR_UTF8_INVALID;
+    }
+
+    for (int i = 1; i < len; i++) {
+        if ((s[i] & 0xC0) != 0x80) {
+            *out_len = 1;
+            return BAR_UTF8_INVALID;
+        }
+        cp = (cp << 6) | (s[i] & 0x3F);
+    }
+    *out_len = len;
+    return cp;
+}
+
+/* Strip codepoints neither the UI font nor its non-Latin fallback can render
+ * before building any display string (docs/12-BAR-SPEC.md sec.8:
+ * focusedWindow + music titles need "no more tofu") — plus, as before,
+ * supplementary-plane codepoints (emoji and friends, >= U+10000; dankc has
+ * no emoji glyphs to offer regardless of font coverage), variation selectors
+ * (U+FE00-U+FE0F), and private-use-area codepoints (U+E000-U+F8FF, which
+ * includes the Material Symbols block itself, in case a stray one ends up in
+ * a window/track title). A run of one or more consecutive dropped
+ * codepoints collapses into a single "…" (U+2026) instead of vanishing
+ * silently or leaving disconnected fragments.
+ *
+ * Builds into a bounded local buffer first, then copies into `out` — an
+ * ellipsis can make a dropped run GROW instead of shrink, which would break
+ * the byte-for-byte-shrinking in-place aliasing the previous version relied
+ * on. `in`/`out` may still alias (all call sites pass the same buffer for
+ * both); the copy into `out` only happens after `in` has been fully read
+ * into `tmp`, so that's safe regardless. */
 static void bar_sanitize_utf8(const char *in, char *out, size_t out_sz)
 {
+    char tmp[DC_NIRI_TITLE_MAX];
+    size_t cap = out_sz < sizeof(tmp) ? out_sz : sizeof(tmp);
+    if (cap == 0)
+        return;
+
     const unsigned char *s = (const unsigned char *)in;
     size_t oi = 0;
+    bool dropping = false; /* mid a run of collapsed-to-"…" codepoints */
 
-    while (*s && oi + 1 < out_sz) {
-        unsigned char c = *s;
+    while (*s) {
         int len;
-        unsigned cp;
-
-        if ((c & 0x80) == 0) {
-            len = 1;
-            cp = c;
-        } else if ((c & 0xE0) == 0xC0) {
-            len = 2;
-            cp = c & 0x1F;
-        } else if ((c & 0xF0) == 0xE0) {
-            len = 3;
-            cp = c & 0x0F;
-        } else if ((c & 0xF8) == 0xF0) {
-            len = 4;
-            cp = c & 0x07;
-        } else {
-            s++; /* stray continuation/invalid lead byte: drop */
-            continue;
-        }
-
-        bool ok = true;
-        for (int i = 1; i < len; i++) {
-            if ((s[i] & 0xC0) != 0x80) {
-                ok = false;
-                break;
-            }
-            cp = (cp << 6) | (s[i] & 0x3F);
-        }
-        if (!ok) {
-            s++;
+        unsigned cp = bar_next_utf8(s, &len);
+        if (cp == BAR_UTF8_INVALID) {
+            s += len;
             continue;
         }
 
         bool banned = cp >= 0x10000 || (cp >= 0xFE00 && cp <= 0xFE0F) ||
-                     (cp >= 0xE000 && cp <= 0xF8FF);
-        if (!banned && oi + (size_t)len < out_sz) {
-            memmove(out + oi, s, (size_t)len);
-            oi += (size_t)len;
+                     (cp >= 0xE000 && cp <= 0xF8FF) || !dc_render_font_has(cp);
+        if (banned) {
+            if (!dropping && oi + 3 < cap) {
+                memcpy(tmp + oi, "\xe2\x80\xa6", 3);
+                oi += 3;
+            }
+            dropping = true;
+        } else {
+            if (oi + (size_t)len < cap) {
+                memcpy(tmp + oi, s, (size_t)len);
+                oi += (size_t)len;
+            }
+            dropping = false;
         }
         s += len;
     }
-    out[oi] = '\0';
+    tmp[oi] = '\0';
+    memcpy(out, tmp, oi + 1);
+}
+
+/* True if `s` (already run through bar_sanitize_utf8()) has nothing worth
+ * showing on its own — empty, or only whitespace/punctuation/the "…"
+ * collapse marker. Used to fall back to just the app name (no bullet) when a
+ * title sanitizes down to nothing useful, e.g. a title that was entirely
+ * uncovered-script text collapses to just "…" (docs/12-BAR-SPEC.md sec.4/8:
+ * "no more tofu"). */
+static bool bar_text_is_meaningless(const char *s)
+{
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        int len;
+        unsigned cp = bar_next_utf8(p, &len);
+        if (cp == BAR_UTF8_INVALID) {
+            p += len;
+            continue;
+        }
+        if (cp == 0x2026 || (cp < 0x80 && (isspace((int)cp) || ispunct((int)cp)))) {
+            p += len;
+            continue;
+        }
+        return false;
+    }
+    return true;
 }
 
 /* Truncate a NUL-terminated UTF-8 buffer in place to at most `max_bytes`
@@ -568,6 +631,13 @@ static float layout_focused_window(dc_bar *bar, float x0, bool draw)
                 title[tl - sl] = '\0';
         }
     }
+
+    /* A title that sanitized down to nothing renderable (e.g. entirely
+     * uncovered-script text collapsed to just "…", or pure punctuation)
+     * falls back to app-name-only, no bullet (docs/12-BAR-SPEC.md sec.4/8:
+     * "no more tofu"). */
+    if (bar_text_is_meaningless(title))
+        title[0] = '\0';
 
     if (!app_name[0] && !title[0])
         return 0.0f;
@@ -761,6 +831,14 @@ static float layout_media(dc_bar *bar, float x0, bool draw)
     char artist[DC_NIRI_TITLE_MAX];
     bar_sanitize_utf8(info.title, title, sizeof(title));
     bar_sanitize_utf8(info.artist, artist, sizeof(artist));
+    /* Same "sanitized down to nothing" fallback as focusedWindow (see
+     * bar_text_is_meaningless()): a title that collapsed to just "…" reads
+     * as "Unknown Track" instead, and a meaningless artist is dropped so the
+     * label doesn't end in a dangling "• …". */
+    if (bar_text_is_meaningless(title))
+        title[0] = '\0';
+    if (bar_text_is_meaningless(artist))
+        artist[0] = '\0';
     bar_truncate_bytes(title, 100);
     bar_truncate_bytes(artist, 100);
     if (!title[0])

@@ -23,9 +23,10 @@ xkbcommon      = dependency('xkbcommon')
 libsystemd     = dependency('libsystemd')          # sd-bus (swap for elogind/basu on non-systemd distros)
 pam            = cc.find_library('pam')             # lock-screen authentication
 m_dep          = cc.find_library('m', required: false)
+fontconfig     = dependency('fontconfig')          # non-Latin fallback font lookup (render/nvg.c)
 # Protocol XML is vendored under protocol/; only wayland-scanner is needed.
 
-deps = [wayland_client, wayland_egl, egl, glesv2, xkbcommon, libsystemd, pam, m_dep]
+deps = [wayland_client, wayland_egl, egl, glesv2, xkbcommon, libsystemd, pam, m_dep, fontconfig]
 
 # --- wayland protocol generation -----------------------------------------
 wayland_scanner = find_program('wayland-scanner')
@@ -67,7 +68,8 @@ thirdparty = static_library('dankc-thirdparty',
 # --- first-party sources --------------------------------------------------
 src = files(
   'src/main.c',
-  'src/core/log.c', 'src/core/loop.c', 'src/core/config.c', 'src/core/anim.c',
+  'src/core/log.c', 'src/core/loop.c', 'src/core/config.c', 'src/core/dms_import.c',
+  'src/core/anim.c',
   'src/wayland/wl.c', 'src/wayland/egl.c',
   'src/render/nvg.c',
   'src/ui/bar/bar.c',
