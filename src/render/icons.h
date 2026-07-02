@@ -137,4 +137,11 @@
 /* FOLDER (footer "Files" pill) is defined in the dashboard block above. */
 #define DC_ICON_EXTENSION 0xe87b   /* footer "Plugins" pill (TODO, dim/disabled) */
 
+/* Power menu (docs/13-POPOUTS-SPEC.md; Modals/PowerMenuModal.qml
+ * getActionData()). LOCK/BEDTIME/POWER(=power_settings_new) are already
+ * defined above; these two round it out. Values from DMS's own
+ * MaterialSymbolsRounded .codepoints file. */
+#define DC_ICON_LOGOUT 0xe9ba
+#define DC_ICON_RESTART_ALT 0xf053
+
 #endif /* DC_RENDER_ICONS_H */
