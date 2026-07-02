@@ -12,6 +12,15 @@
 #define DC_ICON_SIGNAL_WIFI_4_BAR 0xf065
 #define DC_ICON_BLUETOOTH 0xe1a7
 #define DC_ICON_BATTERY_FULL 0xe1a5
+/* NOTE: the bundled font is a build-time subset and does NOT include the
+ * numbered battery_1_bar..battery_6_bar glyphs (0xf09c-0xf0a1) that DMS's
+ * full variable font ships — confirmed by parsing the TTF's cmap directly
+ * (they're simply absent, rendering as blank space, not tofu). battery_0_bar
+ * is the only "low" tier actually present, so that's what low-but-not-
+ * critical battery falls back to (docs/12-BAR-SPEC.md sec.4/6). */
+#define DC_ICON_BATTERY_0_BAR 0xebdc
+#define DC_ICON_BATTERY_ALERT 0xe19c
+#define DC_ICON_BATTERY_CHARGING_FULL 0xe1a3
 #define DC_ICON_VOLUME_UP 0xe050
 #define DC_ICON_VOLUME_DOWN 0xe04d
 #define DC_ICON_VOLUME_OFF 0xe04f
