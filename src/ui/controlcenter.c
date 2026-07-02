@@ -11,6 +11,7 @@
 #include "services/net.h"
 #include "theme/theme.h"
 #include "ui/bar/bar_tokens.h"
+#include "ui/hover.h"
 #include "ui/popout.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
@@ -46,6 +47,26 @@
  * sec.0/1: opens near the bar's right cluster, a few px in from the edge). */
 #define DC_CC_SIDE_MARGIN 12
 
+/* Hover/hit ids for the tiles/buttons/sliders (docs/13-POPOUTS-SPEC.md sec.1:
+ * hover bg on tiles + header action buttons, matching bar.c's per-widget hit
+ * region convention). CC_HOVER_NONE must stay 0 (default-initialized state =
+ * nothing hovered). */
+typedef enum {
+    CC_HOVER_NONE = 0,
+    CC_HOVER_BTN_LOCK,
+    CC_HOVER_BTN_POWER,
+    CC_HOVER_BTN_SETTINGS,
+    CC_HOVER_BTN_EDIT,
+    CC_HOVER_SLIDER_VOLUME,
+    CC_HOVER_SLIDER_BRIGHTNESS,
+    CC_HOVER_TILE_0_0,
+    CC_HOVER_TILE_0_1,
+    CC_HOVER_TILE_1_0,
+    CC_HOVER_TILE_1_1,
+    CC_HOVER_TILE_2_0,
+    CC_HOVER_TILE_2_1,
+} cc_hover_id;
+
 struct dc_control_center {
     dc_wayland *wl;
     dc_egl *egl;
@@ -72,6 +93,22 @@ struct dc_control_center {
      * SPEC.md sec.0): fraction of (w,h) nearest the bar-facing edge, set from
      * dc_popout_bar_adjacent() at show-time. */
     float anim_ox, anim_oy;
+
+    /* Hover tracking (docs/13-POPOUTS-SPEC.md sec.1), same guard pattern as
+     * bar.c's dc_bar_pointer_motion(): only re-render when the hovered id
+     * actually changes. */
+    cc_hover_id hover_id;
+
+    /* Slider drag (button-held-motion; docs/13-POPOUTS-SPEC.md sec.1): press
+     * inside a slider's hit rect both click-to-sets and arms this, so every
+     * subsequent motion while the button stays held keeps updating the value
+     * live, ending on release. `slider_drag_value` is the fraction currently
+     * shown (independent of the system's actual current value, so the fill
+     * tracks the pointer exactly rather than racing a wpctl/brightnessctl
+     * round-trip). */
+    bool slider_dragging;
+    int slider_drag_slot; /* 0 = volume, 1 = brightness */
+    float slider_drag_value;
 
     bool visible;
     bool configured;
@@ -173,6 +210,64 @@ static float cc_tile_y(const cc_layout *l, int row)
     return l->tiles_y0 + (float)row * (l->tile_h + l->gap);
 }
 
+/* Track geometry for slider `slot` (0=volume, 1=brightness) — the fill/track
+ * inset (32px, past the leading icon) is shared by draw_slider(), the click
+ * handler, and the drag-motion handler, so all three agree on where a
+ * pointer x maps to a fraction. */
+static void cc_slider_track(const cc_layout *l, int slot, float *track_x, float *track_w)
+{
+    *track_x = l->slot_x[slot] + 32.0f;
+    *track_w = l->slot_w - 32.0f;
+}
+
+static float cc_slider_frac_at(const cc_layout *l, int slot, double x)
+{
+    float track_x, track_w;
+    cc_slider_track(l, slot, &track_x, &track_w);
+    float frac = (float)(x - (double)track_x) / track_w;
+    if (frac < 0.0f)
+        frac = 0.0f;
+    if (frac > 1.0f)
+        frac = 1.0f;
+    return frac;
+}
+
+/* Which interactive element (if any) sits under (x, y) — shared by the click
+ * handler's dispatch and the hover-motion guard, so they can never disagree
+ * about hit boundaries (same "one function drives measure+draw" discipline
+ * as bar.c's layout_workspaces()). */
+static cc_hover_id cc_hittest(const cc_layout *l, double x, double y)
+{
+    for (int i = 0; i < 4; i++) {
+        double dx = x - (double)l->btn_cx[i];
+        double dy = y - (double)l->btn_cy;
+        if (dx * dx + dy * dy <= (double)(l->btn_r * l->btn_r))
+            return (cc_hover_id)(CC_HOVER_BTN_LOCK + i);
+    }
+
+    for (int i = 0; i < 2; i++) {
+        if (x < (double)l->slot_x[i] || x > (double)(l->slot_x[i] + l->slot_w))
+            continue;
+        if (y < (double)l->sliders_y || y > (double)(l->sliders_y + l->slider_h))
+            continue;
+        return (cc_hover_id)(CC_HOVER_SLIDER_VOLUME + i);
+    }
+
+    for (int row = 0; row < 3; row++) {
+        float ry = cc_tile_y(l, row);
+        if (y < (double)ry || y > (double)(ry + l->tile_h))
+            continue;
+        for (int col = 0; col < 2; col++) {
+            float rx = cc_tile_x(l, col);
+            if (x < (double)rx || x > (double)(rx + l->tile_w))
+                continue;
+            return (cc_hover_id)(CC_HOVER_TILE_0_0 + row * 2 + col);
+        }
+    }
+
+    return CC_HOVER_NONE;
+}
+
 /* Run a shell command detached (children auto-reaped via SIG_IGN on SIGCHLD). */
 static void run_detached(const char *cmd)
 {
@@ -205,6 +300,25 @@ static void run_self_ctl(const char *subcmd)
         execl(path, path, "ctl", subcmd, (char *)NULL);
         _exit(127);
     }
+}
+
+/* Apply a 0..1 volume fraction via the audio service's setter (docs/13-
+ * POPOUTS-SPEC.md sec.1 slider drag) -- shared by click-to-set and every
+ * motion event of a live drag. */
+static void cc_apply_volume_frac(float frac)
+{
+    dc_audio_set_volume((int)(frac * 100.0f + 0.5f));
+}
+
+/* Apply a 0..1 brightness fraction via the existing brightnessctl path
+ * (unchanged from the pre-hover click-to-set implementation; audio.h grew a
+ * setter for this task but backlight has no equivalent service yet, so this
+ * stays a direct run_detached() like before). */
+static void cc_apply_brightness_frac(float frac)
+{
+    char cmd[96];
+    snprintf(cmd, sizeof(cmd), "brightnessctl set %d%% 2>/dev/null", (int)(frac * 100.0f + 0.5f));
+    run_detached(cmd);
 }
 
 /* Current backlight brightness as 0..1, or -1 if none. */
@@ -557,6 +671,51 @@ static void recompute_physical(dc_control_center *cc)
     cc->phys_height = (cc->logical_height * cc->scale120 + DC_SCALE_BASE / 2) / DC_SCALE_BASE;
 }
 
+/* Hover bg (docs/13-POPOUTS-SPEC.md sec.1; formula from bar.c's
+ * draw_hover_overlay()): painted last, on top of whatever's already drawn at
+ * that hit rect, so callers never need their own hover-aware branch. Circles
+ * for the header buttons, rounded rects for the slider row / tiles. */
+static void draw_cc_hover(dc_control_center *cc, const cc_layout *l)
+{
+    if (cc->hover_id == CC_HOVER_NONE)
+        return;
+
+    NVGcontext *vg = cc->render->vg;
+    const dc_theme *t = dc_theme_current;
+    const dc_config *cfg = dc_config_current;
+    dc_color hc =
+        dc_hover_bg_color(t->surface_container_high, t->primary, cfg->bar_widget_transparency);
+    NVGcolor col = nvgRGBA(hc.r, hc.g, hc.b, hc.a);
+
+    if (cc->hover_id >= CC_HOVER_BTN_LOCK && cc->hover_id <= CC_HOVER_BTN_EDIT) {
+        int i = cc->hover_id - CC_HOVER_BTN_LOCK;
+        nvgBeginPath(vg);
+        nvgCircle(vg, l->btn_cx[i], l->btn_cy, l->btn_r);
+        nvgFillColor(vg, col);
+        nvgFill(vg);
+        return;
+    }
+
+    if (cc->hover_id == CC_HOVER_SLIDER_VOLUME || cc->hover_id == CC_HOVER_SLIDER_BRIGHTNESS) {
+        int i = cc->hover_id - CC_HOVER_SLIDER_VOLUME;
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, l->slot_x[i], l->sliders_y, l->slot_w, l->slider_h, 10.0f);
+        nvgFillColor(vg, col);
+        nvgFill(vg);
+        return;
+    }
+
+    if (cc->hover_id >= CC_HOVER_TILE_0_0 && cc->hover_id <= CC_HOVER_TILE_2_1) {
+        int idx = cc->hover_id - CC_HOVER_TILE_0_0;
+        int row = idx / 2, col_i = idx % 2;
+        float rx = cc_tile_x(l, col_i), ry = cc_tile_y(l, row);
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, rx, ry, l->tile_w, l->tile_h, 12.0f);
+        nvgFillColor(vg, col);
+        nvgFill(vg);
+    }
+}
+
 static void cc_render(dc_control_center *cc)
 {
     if (!cc->configured || cc->phys_width <= 0)
@@ -683,11 +842,10 @@ static void cc_render(dc_control_center *cc)
     nvgFillColor(vg, tc(t->surface_variant_text));
     nvgText(vg, text_x, l.avatar_cy + 9.0f, subtitle, NULL);
 
-    /* lock / power / settings / edit (docs/13-POPOUTS-SPEC.md sec.1). No
-     * hover-tint here: dankc's popout surfaces don't have per-pixel pointer-
-     * motion tracking wired up yet (see main.c's handle_bar_motion comment),
-     * and wiring that is out of this task's touch-scope (controlcenter.c
-     * only) -- left as a deviation rather than forcing a main.c change. */
+    /* lock / power / settings / edit (docs/13-POPOUTS-SPEC.md sec.1). Hover
+     * tint is painted by draw_cc_hover() below (on top of everything, same
+     * convention as bar.c's draw_hover_overlay()), so the icons themselves
+     * never need to know about hover state. */
     dc_render_icon(cc->render, DC_ICON_LOCK, l.btn_cx[0], l.btn_cy, 18.0f, t->surface_text,
                    NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
     dc_render_icon(cc->render, DC_ICON_POWER, l.btn_cx[1], l.btn_cy, 18.0f, t->surface_text,
@@ -710,11 +868,21 @@ static void cc_render(dc_control_center *cc)
     read_audio_device_names(sink_name, sizeof(sink_name), source_name, sizeof(source_name));
     float brightness = read_brightness();
 
-    /* --- Sliders: volume + brightness, side by side ------------------- */
+    /* --- Sliders: volume + brightness, side by side --------------------
+     * While a slider is being dragged (docs/13-POPOUTS-SPEC.md sec.1), show
+     * the dragged fraction directly rather than re-reading system state —
+     * wpctl/brightnessctl round-trip async, so reading back mid-drag would
+     * either show a stale value or race the write. */
+    float vol_frac = (cc->slider_dragging && cc->slider_drag_slot == 0)
+                         ? cc->slider_drag_value
+                         : (have_out ? audio_out.volume / 100.0f : 0.5f);
+    float bright_frac = (cc->slider_dragging && cc->slider_drag_slot == 1)
+                            ? cc->slider_drag_value
+                            : (brightness >= 0.0f ? brightness : 0.7f);
     draw_slider(cc->render, l.slot_x[0], l.sliders_y + l.slider_h / 2.0f, l.slot_w,
-               DC_ICON_VOLUME_UP, have_out ? audio_out.volume / 100.0f : 0.5f);
+               DC_ICON_VOLUME_UP, vol_frac);
     draw_slider(cc->render, l.slot_x[1], l.sliders_y + l.slider_h / 2.0f, l.slot_w,
-               DC_ICON_BRIGHTNESS_MEDIUM, brightness >= 0.0f ? brightness : 0.7f);
+               DC_ICON_BRIGHTNESS_MEDIUM, bright_frac);
 
     /* --- Tile grid: wifi/bluetooth, audioOutput/audioInput, nightMode/
      * darkMode (order per the user's controlCenterWidgets config) -------- */
@@ -770,6 +938,8 @@ static void cc_render(dc_control_center *cc)
                      DC_ICON_NIGHTLIGHT, "Night Mode", false);
     draw_toggle_tile(cc->render, cc_tile_x(&l, 1), cc_tile_y(&l, 2), l.tile_w, l.tile_h,
                      DC_ICON_CONTRAST, "Dark Mode", true);
+
+    draw_cc_hover(cc, &l);
 
     nvgEndFrame(vg);
 
@@ -894,6 +1064,8 @@ static void cc_teardown(dc_control_center *cc)
     cc->surface = NULL;
     cc->visible = false;
     cc->closing = false;
+    cc->hover_id = CC_HOVER_NONE;
+    cc->slider_dragging = false;
     dc_debug("control center hidden");
 }
 
@@ -969,31 +1141,26 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
         }
     }
 
-    /* Sliders: volume (slot 0) / brightness (slot 1), click-to-set. */
+    /* Sliders: volume (slot 0) / brightness (slot 1). Click-to-set applies
+     * immediately; the press also arms a drag (docs/13-POPOUTS-SPEC.md
+     * sec.1) so motion keeps updating the value live until button release
+     * (dc_control_center_handle_motion() / dc_control_center_handle_release()). */
     for (int i = 0; i < 2; i++) {
         if (x < (double)l.slot_x[i] || x > (double)(l.slot_x[i] + l.slot_w))
             continue;
         if (y < (double)l.sliders_y || y > (double)(l.sliders_y + l.slider_h))
             continue;
 
-        const float track_x = l.slot_x[i] + 32.0f;
-        const float track_w = l.slot_w - 32.0f;
-        float frac = (float)(x - track_x) / track_w;
-        if (frac < 0.0f)
-            frac = 0.0f;
-        if (frac > 1.0f)
-            frac = 1.0f;
+        float frac = cc_slider_frac_at(&l, i, x);
+        if (i == 0)
+            cc_apply_volume_frac(frac);
+        else
+            cc_apply_brightness_frac(frac);
 
-        if (i == 0) {
-            char cmd[96];
-            snprintf(cmd, sizeof(cmd), "wpctl set-volume @DEFAULT_AUDIO_SINK@ %.2f", frac);
-            run_detached(cmd);
-        } else {
-            char cmd[96];
-            snprintf(cmd, sizeof(cmd), "brightnessctl set %d%% 2>/dev/null",
-                     (int)(frac * 100.0f + 0.5f));
-            run_detached(cmd);
-        }
+        cc->slider_dragging = true;
+        cc->slider_drag_slot = i;
+        cc->slider_drag_value = frac;
+
         cc_render(cc);
         return;
     }
@@ -1025,6 +1192,62 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
             return;
         }
     }
+}
+
+/* Pointer motion over the panel (docs/13-POPOUTS-SPEC.md sec.1): while a
+ * slider drag is armed (see dc_control_center_handle_click()), every motion
+ * updates the value live; otherwise this is plain hover tracking, re-
+ * rendering only when the hovered id changes — same guard pattern as
+ * bar.c's dc_bar_pointer_motion(). */
+void dc_control_center_handle_motion(dc_control_center *cc, double x, double y)
+{
+    if (!cc->visible || cc->closing)
+        return;
+
+    cc_layout l = cc_get_layout((float)cc->logical_width);
+
+    if (cc->slider_dragging) {
+        float frac = cc_slider_frac_at(&l, cc->slider_drag_slot, x);
+        cc->slider_drag_value = frac;
+        if (cc->slider_drag_slot == 0)
+            cc_apply_volume_frac(frac);
+        else
+            cc_apply_brightness_frac(frac);
+        cc_render(cc);
+        return;
+    }
+
+    cc_hover_id id = cc_hittest(&l, x, y);
+    if (id == cc->hover_id)
+        return; /* still the same element — nothing to repaint */
+
+    cc->hover_id = id;
+    dc_wayland_set_cursor(cc->wl, id != CC_HOVER_NONE ? DC_CURSOR_POINTER : DC_CURSOR_DEFAULT);
+    cc_render(cc);
+}
+
+/* Left button released anywhere: ends a slider drag, if one was in progress
+ * (docs/13-POPOUTS-SPEC.md sec.1). No-op otherwise — plain hover has nothing
+ * to finalize. */
+void dc_control_center_handle_release(dc_control_center *cc)
+{
+    if (!cc->slider_dragging)
+        return;
+    cc->slider_dragging = false;
+    cc_render(cc);
+}
+
+/* Pointer left the panel entirely: clear hover (and, defensively, any
+ * in-progress drag — the compositor delivers leave before a surface can be
+ * destroyed out from under an active grab, but there's no harm being safe). */
+void dc_control_center_handle_leave(dc_control_center *cc)
+{
+    cc->slider_dragging = false;
+    if (cc->hover_id == CC_HOVER_NONE)
+        return;
+    cc->hover_id = CC_HOVER_NONE;
+    dc_wayland_set_cursor(cc->wl, DC_CURSOR_DEFAULT);
+    cc_render(cc);
 }
 
 void dc_control_center_destroy(dc_control_center *cc)

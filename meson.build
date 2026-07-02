@@ -74,7 +74,7 @@ src = files(
   'src/wayland/wl.c', 'src/wayland/egl.c',
   'src/render/nvg.c',
   'src/ui/bar/bar.c',
-  'src/ui/popout.c',
+  'src/ui/popout.c', 'src/ui/hover.c',
   'src/ui/controlcenter.c', 'src/ui/osd.c', 'src/ui/toasts.c',
   'src/ui/launcher.c', 'src/ui/notifcenter.c', 'src/ui/clip_picker.c', 'src/ui/settings.c',
   'src/ui/lock.c',

@@ -48,6 +48,13 @@ typedef void (*dc_motion_cb)(struct wl_surface *surface, double x, double y, voi
  * surface" for them to refer to). */
 typedef void (*dc_leave_cb)(struct wl_surface *surface, void *user_data);
 
+/* Left button released over `surface` (surface-local logical coordinates,
+ * same convention as dc_click_cb). Fired alongside dc_click_cb's press —
+ * together they bracket a button-held-motion drag gesture (e.g. a popout
+ * slider): press starts it, motion_cb keeps firing while held, this ends
+ * it. */
+typedef void (*dc_release_cb)(struct wl_surface *surface, double x, double y, void *user_data);
+
 /* One "step" of scroll on `surface`: `steps_v`/`steps_h` are signed step
  * counts (positive = scroll down / right), already debounced from raw axis
  * deltas — see dc_wayland_set_axis_cb(). Usually +-1, but may be larger for a
@@ -81,12 +88,15 @@ typedef struct dc_wayland {
     struct wl_surface *pointer_surface;
     double pointer_x;
     double pointer_y;
+    bool button_down; /* left button currently held (button-held-motion drags) */
     dc_click_cb click_cb;
     void *click_data;
     dc_motion_cb motion_cb;
     void *motion_data;
     dc_leave_cb leave_cb;
     void *leave_data;
+    dc_release_cb release_cb;
+    void *release_data;
 
     /* Scroll-axis debouncing state (docs/12-BAR-SPEC.md sec.5): continuous
      * (touchpad) sources accumulate in wl_fixed units across frames until a
@@ -123,6 +133,10 @@ void dc_wayland_set_motion_cb(dc_wayland *wl, dc_motion_cb cb, void *user_data);
 
 /* Set the handler for pointer leaving a surface (clears hover state). */
 void dc_wayland_set_leave_cb(dc_wayland *wl, dc_leave_cb cb, void *user_data);
+
+/* Set the handler for a left-button release (ends a button-held-motion
+ * drag started by dc_click_cb's press; see dc_release_cb). */
+void dc_wayland_set_release_cb(dc_wayland *wl, dc_release_cb cb, void *user_data);
 
 /* Set the handler for debounced scroll-wheel steps (docs/12-BAR-SPEC.md
  * sec.5: scrollYBehavior/scrollXBehavior). */

@@ -29,7 +29,19 @@ bool dc_control_center_visible(dc_control_center *cc);
 /* The popup's wl_surface (for matching pointer events). */
 struct wl_surface *dc_control_center_surface(dc_control_center *cc);
 
-/* Handle a left click at surface-local logical coordinates (tiles/sliders). */
+/* Handle a left click at surface-local logical coordinates (tiles/sliders).
+ * A press inside a slider's track also arms a live drag — see
+ * dc_control_center_handle_motion(). */
 void dc_control_center_handle_click(dc_control_center *cc, double x, double y);
+
+/* Pointer motion at surface-local logical (x, y): hover tracking, or (while a
+ * slider drag is armed) a live value update. */
+void dc_control_center_handle_motion(dc_control_center *cc, double x, double y);
+
+/* Left button released: ends any in-progress slider drag. */
+void dc_control_center_handle_release(dc_control_center *cc);
+
+/* Pointer left the panel: clears hover + any in-progress drag. */
+void dc_control_center_handle_leave(dc_control_center *cc);
 
 #endif /* DC_UI_CONTROLCENTER_H */

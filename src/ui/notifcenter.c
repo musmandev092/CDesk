@@ -8,6 +8,7 @@
 #include "render/nvg.h"
 #include "services/notifications.h"
 #include "theme/theme.h"
+#include "ui/hover.h"
 #include "ui/popout.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
@@ -62,11 +63,24 @@ typedef enum {
 typedef struct {
     uint32_t id;
     dc_notif_status status;
+    float card_x0, card_y0, card_x1, card_y1;
     float close_x0, close_y0, close_x1, close_y1;
     float dismiss_x0, dismiss_y0, dismiss_x1, dismiss_y1;
     bool has_action;
     float action_x0, action_y0, action_x1, action_y1;
 } nc_card_hit;
+
+/* Hover ids (docs/13-POPOUTS-SPEC.md sec.3: hover bg on cards, X, Dismiss/
+ * action buttons, tabs, Clear). The fixed header elements get small named
+ * ids; each card's sub-regions are packed as NC_HOVER_CARD_BASE + hit-index*4
+ * + {0:body,1:close,2:dismiss,3:action} since the card list is dynamic
+ * (count/order changes every render). */
+#define NC_HOVER_NONE 0
+#define NC_HOVER_TAB0 1
+#define NC_HOVER_TAB1 2
+#define NC_HOVER_CLEAR 3
+#define NC_HOVER_SETTINGS 4
+#define NC_HOVER_CARD_BASE 10
 
 struct dc_notif_center {
     dc_wayland *wl;
@@ -106,6 +120,11 @@ struct dc_notif_center {
     /* Entrance/exit scale-and-fade pivot, bar-position-aware — see
      * controlcenter.c's identical field for the full rationale. */
     float anim_ox, anim_oy;
+
+    /* Hover tracking (docs/13-POPOUTS-SPEC.md sec.3), same guard pattern as
+     * bar.c's dc_bar_pointer_motion() / controlcenter.c's hover_id: only
+     * re-render when the hovered id actually changes. */
+    int hover_id;
 
     bool visible;
     bool configured;
@@ -224,6 +243,10 @@ static void draw_card(dc_notif_center *nc, const dc_notification *n, float x, fl
     memset(hit, 0, sizeof(*hit));
     hit->id = n->id;
     hit->status = n->status;
+    hit->card_x0 = x;
+    hit->card_y0 = y;
+    hit->card_x1 = x + w;
+    hit->card_y1 = y + DC_NC_CARD_H;
 
     nvgBeginPath(vg);
     nvgRoundedRect(vg, x, y, w, DC_NC_CARD_H, 12.0f);
@@ -366,6 +389,100 @@ static void draw_tab(dc_notif_center *nc, int index, float x, float y, float h,
     nc->tab_x1[index] = x + w;
     nc->tab_y1[index] = y + h;
     *out_x1 = x + w;
+}
+
+/* Hover bg (docs/13-POPOUTS-SPEC.md sec.3; formula from bar.c's
+ * draw_hover_overlay(), shared via hover.h): painted last, on top of
+ * whatever's already drawn at that hit rect. Stadium shape (radius = half
+ * the rect's own height) for the pill-like tab/Clear/settings/dismiss/action
+ * hits, a circle for the small square close-button hit, the card's own 12px
+ * corner radius for its body. */
+static void draw_nc_hover(dc_notif_center *nc)
+{
+    if (nc->hover_id == NC_HOVER_NONE)
+        return;
+
+    float x0 = 0, y0 = 0, x1 = 0, y1 = 0, radius = 6.0f;
+
+    if (nc->hover_id == NC_HOVER_TAB0) {
+        x0 = nc->tab_x0[0];
+        y0 = nc->tab_y0[0];
+        x1 = nc->tab_x1[0];
+        y1 = nc->tab_y1[0];
+        radius = (y1 - y0) / 2.0f;
+    } else if (nc->hover_id == NC_HOVER_TAB1) {
+        x0 = nc->tab_x0[1];
+        y0 = nc->tab_y0[1];
+        x1 = nc->tab_x1[1];
+        y1 = nc->tab_y1[1];
+        radius = (y1 - y0) / 2.0f;
+    } else if (nc->hover_id == NC_HOVER_CLEAR) {
+        x0 = nc->clear_x0;
+        y0 = nc->clear_y0;
+        x1 = nc->clear_x1;
+        y1 = nc->clear_y1;
+        radius = (y1 - y0) / 2.0f;
+    } else if (nc->hover_id == NC_HOVER_SETTINGS) {
+        x0 = nc->settings_x0;
+        y0 = nc->settings_y0;
+        x1 = nc->settings_x1;
+        y1 = nc->settings_y1;
+        radius = (y1 - y0) / 2.0f;
+    } else if (nc->hover_id >= NC_HOVER_CARD_BASE) {
+        int rel = nc->hover_id - NC_HOVER_CARD_BASE;
+        int i = rel / 4, kind = rel % 4;
+        if (i < 0 || i >= nc->hit_count)
+            return;
+        const nc_card_hit *hit = &nc->hits[i];
+        switch (kind) {
+        case 0:
+            x0 = hit->card_x0;
+            y0 = hit->card_y0;
+            x1 = hit->card_x1;
+            y1 = hit->card_y1;
+            radius = 12.0f;
+            break;
+        case 1:
+            x0 = hit->close_x0;
+            y0 = hit->close_y0;
+            x1 = hit->close_x1;
+            y1 = hit->close_y1;
+            radius = (x1 - x0) / 2.0f;
+            break;
+        case 2:
+            x0 = hit->dismiss_x0;
+            y0 = hit->dismiss_y0;
+            x1 = hit->dismiss_x1;
+            y1 = hit->dismiss_y1;
+            radius = (y1 - y0) / 2.0f;
+            break;
+        case 3:
+            if (!hit->has_action)
+                return;
+            x0 = hit->action_x0;
+            y0 = hit->action_y0;
+            x1 = hit->action_x1;
+            y1 = hit->action_y1;
+            radius = (y1 - y0) / 2.0f;
+            break;
+        default:
+            return;
+        }
+    } else {
+        return;
+    }
+    if (x1 <= x0 || y1 <= y0)
+        return;
+
+    NVGcontext *vg = nc->render->vg;
+    const dc_theme *t = dc_theme_current;
+    const dc_config *cfg = dc_config_current;
+    dc_color hc =
+        dc_hover_bg_color(t->surface_container_high, t->primary, cfg->bar_widget_transparency);
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, x0, y0, x1 - x0, y1 - y0, radius);
+    nvgFillColor(vg, nvgRGBA(hc.r, hc.g, hc.b, hc.a));
+    nvgFill(vg);
 }
 
 static void nc_render(dc_notif_center *nc)
@@ -572,6 +689,8 @@ static void nc_render(dc_notif_center *nc)
         }
     }
 
+    draw_nc_hover(nc);
+
     nvgEndFrame(vg);
 
     if ((dc_anim_active(&nc->anim) || nc->closing) && !nc->frame_cb) {
@@ -696,6 +815,7 @@ static void nc_teardown(dc_notif_center *nc)
     nc->surface = NULL;
     nc->visible = false;
     nc->closing = false;
+    nc->hover_id = NC_HOVER_NONE;
     dc_debug("notification center hidden");
 }
 
@@ -744,6 +864,37 @@ void dc_notif_center_refresh(dc_notif_center *nc)
 static inline bool in_rect(double x, double y, float x0, float y0, float x1, float y1)
 {
     return x1 > x0 && x >= x0 && x <= x1 && y >= y0 && y <= y1;
+}
+
+/* Which interactive element (if any) sits under (x, y) -- shares the exact
+ * hit boundaries dc_notif_center_handle_click() dispatches against, so
+ * hover and click can never disagree (same discipline as controlcenter.c's
+ * cc_hittest()). Priority mirrors the click handler: header buttons/tabs,
+ * then each card's close/dismiss/action before its own body. */
+static int nc_hittest(dc_notif_center *nc, double x, double y)
+{
+    if (in_rect(x, y, nc->tab_x0[0], nc->tab_y0[0], nc->tab_x1[0], nc->tab_y1[0]))
+        return NC_HOVER_TAB0;
+    if (in_rect(x, y, nc->tab_x0[1], nc->tab_y0[1], nc->tab_x1[1], nc->tab_y1[1]))
+        return NC_HOVER_TAB1;
+    if (in_rect(x, y, nc->clear_x0, nc->clear_y0, nc->clear_x1, nc->clear_y1))
+        return NC_HOVER_CLEAR;
+    if (in_rect(x, y, nc->settings_x0, nc->settings_y0, nc->settings_x1, nc->settings_y1))
+        return NC_HOVER_SETTINGS;
+
+    for (int i = 0; i < nc->hit_count; i++) {
+        nc_card_hit *hit = &nc->hits[i];
+        if (in_rect(x, y, hit->close_x0, hit->close_y0, hit->close_x1, hit->close_y1))
+            return NC_HOVER_CARD_BASE + i * 4 + 1;
+        if (in_rect(x, y, hit->dismiss_x0, hit->dismiss_y0, hit->dismiss_x1, hit->dismiss_y1))
+            return NC_HOVER_CARD_BASE + i * 4 + 2;
+        if (hit->has_action &&
+            in_rect(x, y, hit->action_x0, hit->action_y0, hit->action_x1, hit->action_y1))
+            return NC_HOVER_CARD_BASE + i * 4 + 3;
+        if (in_rect(x, y, hit->card_x0, hit->card_y0, hit->card_x1, hit->card_y1))
+            return NC_HOVER_CARD_BASE + i * 4 + 0;
+    }
+    return NC_HOVER_NONE;
 }
 
 void dc_notif_center_handle_click(dc_notif_center *nc, double x, double y)
@@ -797,6 +948,33 @@ void dc_notif_center_handle_click(dc_notif_center *nc, double x, double y)
             return;
         }
     }
+}
+
+/* Pointer motion over the panel (docs/13-POPOUTS-SPEC.md sec.3): hover
+ * tracking only (no drag surface here) -- re-render only when the hovered id
+ * changes, same guard pattern as bar.c/controlcenter.c. */
+void dc_notif_center_handle_motion(dc_notif_center *nc, double x, double y)
+{
+    if (!nc->visible || nc->closing)
+        return;
+
+    int id = nc_hittest(nc, x, y);
+    if (id == nc->hover_id)
+        return;
+
+    nc->hover_id = id;
+    dc_wayland_set_cursor(nc->wl, id != NC_HOVER_NONE ? DC_CURSOR_POINTER : DC_CURSOR_DEFAULT);
+    nc_render(nc);
+}
+
+/* Pointer left the panel entirely: clear hover. */
+void dc_notif_center_handle_leave(dc_notif_center *nc)
+{
+    if (nc->hover_id == NC_HOVER_NONE)
+        return;
+    nc->hover_id = NC_HOVER_NONE;
+    dc_wayland_set_cursor(nc->wl, DC_CURSOR_DEFAULT);
+    nc_render(nc);
 }
 
 void dc_notif_center_handle_scroll(dc_notif_center *nc, int steps_v)

@@ -164,9 +164,17 @@ static void pointer_handle_button(void *data, struct wl_pointer *pointer, uint32
     DC_UNUSED(pointer);
     DC_UNUSED(serial);
     DC_UNUSED(time);
-    if (button == BTN_LEFT && state == WL_POINTER_BUTTON_STATE_PRESSED && wl->pointer_surface &&
-        wl->click_cb)
-        wl->click_cb(wl->pointer_surface, wl->pointer_x, wl->pointer_y, wl->click_data);
+    if (button != BTN_LEFT)
+        return;
+    if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        wl->button_down = true;
+        if (wl->pointer_surface && wl->click_cb)
+            wl->click_cb(wl->pointer_surface, wl->pointer_x, wl->pointer_y, wl->click_data);
+    } else {
+        wl->button_down = false;
+        if (wl->pointer_surface && wl->release_cb)
+            wl->release_cb(wl->pointer_surface, wl->pointer_x, wl->pointer_y, wl->release_data);
+    }
 }
 
 /* Continuous-source axis delta: accumulate in wl_fixed units (docs/12-BAR-SPEC.md
@@ -611,6 +619,12 @@ void dc_wayland_set_leave_cb(dc_wayland *wl, dc_leave_cb cb, void *user_data)
 {
     wl->leave_cb = cb;
     wl->leave_data = user_data;
+}
+
+void dc_wayland_set_release_cb(dc_wayland *wl, dc_release_cb cb, void *user_data)
+{
+    wl->release_cb = cb;
+    wl->release_data = user_data;
 }
 
 void dc_wayland_set_axis_cb(dc_wayland *wl, dc_axis_cb cb, void *user_data)
