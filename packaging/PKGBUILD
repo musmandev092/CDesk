@@ -12,6 +12,10 @@ optdepends=(
   'wireplumber: volume control (wpctl)'
   'brightnessctl: brightness control'
   'bluez: bluetooth status'
+  'wl-clipboard: clipboard history + copy-back'
+  'grim: screenshots'
+  'slurp: region screenshot + color picker'
+  'gammastep: night mode / warm filter'
 )
 # For a release, point source at a tagged tarball/commit and set sha256sums.
 # Local build: run `makepkg` from a checkout, or just use the Makefile / meson
