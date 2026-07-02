@@ -1,0 +1,29 @@
+# Maintainer: DankC
+pkgname=dankc
+pkgver=0.0.1
+pkgrel=1
+pkgdesc="Lightweight C Wayland shell for niri (DankMaterialShell rewrite)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/AvengeMedia/DankMaterialShell"
+license=('MIT')
+depends=('wayland' 'libxkbcommon' 'systemd-libs' 'mesa')
+makedepends=('meson' 'ninja' 'wayland-protocols' 'pkgconf')
+optdepends=(
+  'wireplumber: volume control (wpctl)'
+  'brightnessctl: brightness control'
+  'bluez: bluetooth status'
+)
+# For a release, point source at a tagged tarball/commit and set sha256sums.
+# Local build: run `makepkg` from a checkout, or just use the Makefile / meson
+# directly (see packaging/README.md).
+source=()
+sha256sums=()
+
+build() {
+  arch-meson "$srcdir/.." build
+  meson compile -C build
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+}
