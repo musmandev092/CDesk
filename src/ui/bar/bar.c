@@ -1733,7 +1733,14 @@ void dc_bar_render(dc_bar *bar)
 
     if (!dc_egl_make_current(bar->egl, &bar->egl_window))
         return;
-    if (!dc_render_ensure(bar->render))
+    /* dc_render_ensure() guarantees a live vg on success, but assert it at the
+     * call site too: dc_bar_render() is reached from Wayland listener
+     * callbacks (layer-surface configure, fractional-scale, and the S6
+     * workspace-anim frame callback ws_frame_done, all tail-calling here), any
+     * of which can fire during startup before the shared render context is
+     * up. Entering nanovg with a NULL context is the crash we are guarding
+     * against (nvgBeginFrame -> nvgSave, NULL NVGcontext). */
+    if (!dc_render_ensure(bar->render) || !bar->render->vg)
         return;
 
     /* Map the large (physical) buffer down to the logical surface size. */
@@ -1823,6 +1830,16 @@ static void layer_surface_handle_closed(void *data, struct zwlr_layer_surface_v1
     dc_debug("bar surface closed by compositor");
     bar->configured = false;
     bar->egl_ready = false;
+    /* Cancel the self-arming S6 workspace-anim frame callback: it must not
+     * outlive the surface it was requested on. Without this, a pending
+     * ws_frame_done would fire against a closed surface (and dc_bar_render
+     * would re-arm a new frame callback on the next configure while the stale
+     * one is still in flight). dc_anim's own state is left as-is — the next
+     * configure's render re-arms cleanly if the morph is still running. */
+    if (bar->ws_frame_cb) {
+        wl_callback_destroy(bar->ws_frame_cb);
+        bar->ws_frame_cb = NULL;
+    }
 }
 
 static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {

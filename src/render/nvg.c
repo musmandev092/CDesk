@@ -427,8 +427,17 @@ static int utf8_encode(int cp, char *out)
 
 bool dc_render_ensure(dc_render *render)
 {
-    if (render->ready)
+    /* Contract: a `true` return guarantees `render->vg != NULL`. Every caller
+     * (bar.c and every popout) proceeds straight into nanovg on the strength
+     * of this, so the `ready` flag and `vg` must never diverge. Verify both,
+     * not just `ready`: a NULL vg with `ready` still set (e.g. a future
+     * partial-teardown path) would otherwise slip a NULL context into
+     * nvgBeginFrame() — the exact fault behind the dc_bar_render->nvgSave
+     * startup SIGSEGV (NULL NVGcontext, fault at &ctx->nstates). Treat any
+     * such state as not-ready and rebuild. */
+    if (render->ready && render->vg)
         return true;
+    render->ready = false;
 
     render->vg = nvgCreateGLES3(NVG_ANTIALIAS | NVG_STENCIL_STROKES);
     if (!render->vg) {
