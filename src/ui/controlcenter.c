@@ -47,6 +47,7 @@ struct dc_control_center {
 
     dc_anim anim;
     struct wl_callback *frame_cb;
+    bool closing;
 
     bool visible;
     bool configured;
@@ -54,6 +55,7 @@ struct dc_control_center {
 };
 
 static void cc_render(dc_control_center *cc);
+static void cc_teardown(dc_control_center *cc);
 
 static void cc_frame_done(void *data, struct wl_callback *cb, uint32_t time);
 static const struct wl_callback_listener cc_frame_listener = {.done = cc_frame_done};
@@ -64,8 +66,12 @@ static void cc_frame_done(void *data, struct wl_callback *cb, uint32_t time)
     DC_UNUSED(time);
     wl_callback_destroy(cb);
     cc->frame_cb = NULL;
-    if (cc->visible && dc_anim_active(&cc->anim))
+    if (!cc->visible)
+        return;
+    if (dc_anim_active(&cc->anim))
         cc_render(cc);
+    else if (cc->closing)
+        cc_teardown(cc);
 }
 
 static inline NVGcolor tc(dc_color c)
@@ -246,8 +252,11 @@ static void cc_render(dc_control_center *cc)
 
     nvgBeginFrame(vg, w, h, (float)cc->scale120 / DC_SCALE_BASE);
 
-    /* Entrance: fade in + scale up from the top-right corner (DMS). */
+    /* Entrance/exit: fade + scale from the top-right corner (DMS). Closing runs
+     * the progress in reverse. */
     float p = dc_anim_progress(&cc->anim);
+    if (cc->closing)
+        p = 1.0f - (p > 1.0f ? 1.0f : p);
     float alpha = p > 1.0f ? 1.0f : p;
     float scale = 0.94f + 0.06f * p;
     nvgGlobalAlpha(vg, alpha);
@@ -307,7 +316,7 @@ static void cc_render(dc_control_center *cc)
 
     nvgEndFrame(vg);
 
-    if (dc_anim_active(&cc->anim) && !cc->frame_cb) {
+    if ((dc_anim_active(&cc->anim) || cc->closing) && !cc->frame_cb) {
         cc->frame_cb = wl_surface_frame(cc->surface);
         wl_callback_add_listener(cc->frame_cb, &cc_frame_listener, cc);
     }
@@ -393,10 +402,11 @@ static void cc_show(dc_control_center *cc, dc_output *output)
 
     wl_surface_commit(cc->surface);
     cc->visible = true;
+    cc->closing = false;
     dc_debug("control center shown");
 }
 
-static void cc_hide(dc_control_center *cc)
+static void cc_teardown(dc_control_center *cc)
 {
     if (cc->frame_cb) {
         wl_callback_destroy(cc->frame_cb);
@@ -419,13 +429,27 @@ static void cc_hide(dc_control_center *cc)
     cc->layer_surface = NULL;
     cc->surface = NULL;
     cc->visible = false;
+    cc->closing = false;
     dc_debug("control center hidden");
+}
+
+static void cc_begin_close(dc_control_center *cc)
+{
+    if (!cc->visible || cc->closing)
+        return;
+    dc_anim_start(&cc->anim, DC_DUR_SHORT, DC_EASE_EMPHASIZED_ACCEL);
+    cc->closing = true;
+    if (!dc_anim_active(&cc->anim)) {
+        cc_teardown(cc);
+        return;
+    }
+    cc_render(cc);
 }
 
 void dc_control_center_toggle(dc_control_center *cc, dc_output *output)
 {
     if (cc->visible)
-        cc_hide(cc);
+        cc_begin_close(cc);
     else
         cc_show(cc, output);
 }
@@ -437,8 +461,7 @@ bool dc_control_center_visible(dc_control_center *cc)
 
 void dc_control_center_hide(dc_control_center *cc)
 {
-    if (cc->visible)
-        cc_hide(cc);
+    cc_begin_close(cc);
 }
 
 struct wl_surface *dc_control_center_surface(dc_control_center *cc)
@@ -448,7 +471,7 @@ struct wl_surface *dc_control_center_surface(dc_control_center *cc)
 
 void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
 {
-    if (!cc->visible)
+    if (!cc->visible || cc->closing)
         return;
 
     cc_layout l = cc_get_layout((float)cc->logical_width);
@@ -496,6 +519,6 @@ void dc_control_center_destroy(dc_control_center *cc)
     if (!cc)
         return;
     if (cc->visible)
-        cc_hide(cc);
+        cc_teardown(cc);
     free(cc);
 }

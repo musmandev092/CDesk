@@ -60,8 +60,9 @@ struct dc_launcher {
     int selected;
     int scroll; /* first visible row */
 
-    dc_anim anim;                 /* entrance (fade + scale) */
+    dc_anim anim;                 /* entrance / exit (fade + scale) */
     struct wl_callback *frame_cb; /* pending frame callback while animating */
+    bool closing;                 /* playing the exit animation, then teardown */
 
     bool visible;
     bool configured;
@@ -69,8 +70,9 @@ struct dc_launcher {
 };
 
 static void launcher_render(dc_launcher *l);
+static void launcher_teardown(dc_launcher *l);
 
-/* Frame callback: advance the entrance animation one frame. */
+/* Frame callback: advance the entrance/exit animation one frame. */
 static void frame_done(void *data, struct wl_callback *cb, uint32_t time);
 static const struct wl_callback_listener frame_listener = {.done = frame_done};
 
@@ -80,8 +82,13 @@ static void frame_done(void *data, struct wl_callback *cb, uint32_t time)
     DC_UNUSED(time);
     wl_callback_destroy(cb);
     l->frame_cb = NULL;
-    if (l->visible && dc_anim_active(&l->anim))
+    if (!l->visible)
+        return;
+    if (dc_anim_active(&l->anim)) {
         launcher_render(l);
+    } else if (l->closing) {
+        launcher_teardown(l); /* exit animation finished */
+    }
 }
 
 static inline NVGcolor tc(dc_color c)
@@ -156,8 +163,11 @@ static void launcher_render(dc_launcher *l)
 
     nvgBeginFrame(vg, w, h, (float)l->scale120 / DC_SCALE_BASE);
 
-    /* Entrance animation: fade in + scale up from center (DMS spotlight). */
+    /* Entrance/exit animation: fade + scale from center (DMS spotlight). While
+     * closing, the progress runs in reverse (1 -> 0). */
     float p = dc_anim_progress(&l->anim);
+    if (l->closing)
+        p = 1.0f - (p > 1.0f ? 1.0f : p);
     float alpha = p > 1.0f ? 1.0f : p;
     float scale = 0.92f + 0.08f * p;
     nvgGlobalAlpha(vg, alpha);
@@ -272,9 +282,10 @@ static void launcher_render(dc_launcher *l)
 
     nvgEndFrame(vg);
 
-    /* While animating, ask for a frame callback (committed by the swap) so the
-     * next frame is drawn; the loop drives it via frame_done. */
-    if (dc_anim_active(&l->anim) && !l->frame_cb) {
+    /* While animating (or finishing a close), ask for a frame callback so the
+     * next frame is drawn; the loop drives it via frame_done. The extra frame
+     * when closing lets frame_done run the teardown after the last frame. */
+    if ((dc_anim_active(&l->anim) || l->closing) && !l->frame_cb) {
         l->frame_cb = wl_surface_frame(l->surface);
         wl_callback_add_listener(l->frame_cb, &frame_listener, l);
     }
@@ -362,10 +373,11 @@ static void launcher_show(dc_launcher *l, dc_output *output)
 
     wl_surface_commit(l->surface);
     l->visible = true;
+    l->closing = false;
     dc_debug("launcher shown");
 }
 
-static void launcher_hide(dc_launcher *l)
+static void launcher_teardown(dc_launcher *l)
 {
     if (l->frame_cb) {
         wl_callback_destroy(l->frame_cb);
@@ -388,21 +400,36 @@ static void launcher_hide(dc_launcher *l)
     l->layer_surface = NULL;
     l->surface = NULL;
     l->visible = false;
+    l->closing = false;
     dc_debug("launcher hidden");
+}
+
+/* Begin the exit animation; teardown happens once it completes (or immediately
+ * when animations are disabled). */
+static void launcher_begin_close(dc_launcher *l)
+{
+    if (!l->visible || l->closing)
+        return;
+    dc_anim_start(&l->anim, DC_DUR_SHORT, DC_EASE_EMPHASIZED_ACCEL);
+    l->closing = true;
+    if (!dc_anim_active(&l->anim)) {
+        launcher_teardown(l);
+        return;
+    }
+    launcher_render(l);
 }
 
 void dc_launcher_toggle(dc_launcher *l, dc_output *output)
 {
     if (l->visible)
-        launcher_hide(l);
+        launcher_begin_close(l);
     else
         launcher_show(l, output);
 }
 
 void dc_launcher_hide(dc_launcher *l)
 {
-    if (l->visible)
-        launcher_hide(l);
+    launcher_begin_close(l);
 }
 
 bool dc_launcher_visible(dc_launcher *l)
@@ -417,18 +444,18 @@ struct wl_surface *dc_launcher_surface(dc_launcher *l)
 
 void dc_launcher_handle_key(dc_launcher *l, uint32_t keysym, const char *utf8)
 {
-    if (!l->visible)
+    if (!l->visible || l->closing)
         return;
 
     switch (keysym) {
     case XKB_KEY_Escape:
-        launcher_hide(l);
+        launcher_begin_close(l);
         return;
     case XKB_KEY_Return:
     case XKB_KEY_KP_Enter:
         if (l->selected >= 0 && l->selected < l->result_count) {
             dc_app_launch(l->results[l->selected]);
-            launcher_hide(l);
+            launcher_begin_close(l);
         }
         return;
     case XKB_KEY_BackSpace: {
@@ -465,7 +492,7 @@ void dc_launcher_handle_key(dc_launcher *l, uint32_t keysym, const char *utf8)
 
 void dc_launcher_handle_click(dc_launcher *l, double x, double y)
 {
-    if (!l->visible)
+    if (!l->visible || l->closing)
         return;
     DC_UNUSED(x);
     if (y < DC_LAUNCHER_RESULTS_Y)
@@ -474,7 +501,7 @@ void dc_launcher_handle_click(dc_launcher *l, double x, double y)
     int idx = l->scroll + r;
     if (r >= 0 && r < DC_LAUNCHER_MAX_ROWS && idx >= 0 && idx < l->result_count) {
         dc_app_launch(l->results[idx]);
-        launcher_hide(l);
+        launcher_begin_close(l);
     }
 }
 
@@ -483,7 +510,7 @@ void dc_launcher_destroy(dc_launcher *l)
     if (!l)
         return;
     if (l->visible)
-        launcher_hide(l);
+        launcher_teardown(l);
     dc_apps_destroy(l->apps);
     free(l);
 }

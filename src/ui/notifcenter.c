@@ -55,6 +55,7 @@ struct dc_notif_center {
 
     dc_anim anim;
     struct wl_callback *frame_cb;
+    bool closing;
 
     bool visible;
     bool configured;
@@ -71,6 +72,7 @@ static inline NVGcolor tc_alpha(dc_color c, int a)
 }
 
 static void nc_render(dc_notif_center *nc);
+static void nc_teardown(dc_notif_center *nc);
 
 static void nc_frame_done(void *data, struct wl_callback *cb, uint32_t time);
 static const struct wl_callback_listener nc_frame_listener = {.done = nc_frame_done};
@@ -81,8 +83,12 @@ static void nc_frame_done(void *data, struct wl_callback *cb, uint32_t time)
     DC_UNUSED(time);
     wl_callback_destroy(cb);
     nc->frame_cb = NULL;
-    if (nc->visible && dc_anim_active(&nc->anim))
+    if (!nc->visible)
+        return;
+    if (dc_anim_active(&nc->anim))
         nc_render(nc);
+    else if (nc->closing)
+        nc_teardown(nc);
 }
 
 static void recompute_physical(dc_notif_center *nc)
@@ -177,6 +183,8 @@ static void nc_render(dc_notif_center *nc)
     nvgBeginFrame(vg, w, h, (float)nc->scale120 / DC_SCALE_BASE);
 
     float p = dc_anim_progress(&nc->anim);
+    if (nc->closing)
+        p = 1.0f - (p > 1.0f ? 1.0f : p);
     float alpha = p > 1.0f ? 1.0f : p;
     float scale = 0.94f + 0.06f * p;
     nvgGlobalAlpha(vg, alpha);
@@ -265,7 +273,7 @@ static void nc_render(dc_notif_center *nc)
 
     nvgEndFrame(vg);
 
-    if (dc_anim_active(&nc->anim) && !nc->frame_cb) {
+    if ((dc_anim_active(&nc->anim) || nc->closing) && !nc->frame_cb) {
         nc->frame_cb = wl_surface_frame(nc->surface);
         wl_callback_add_listener(nc->frame_cb, &nc_frame_listener, nc);
     }
@@ -352,10 +360,11 @@ static void nc_show(dc_notif_center *nc, dc_output *output)
 
     wl_surface_commit(nc->surface);
     nc->visible = true;
+    nc->closing = false;
     dc_debug("notification center shown");
 }
 
-static void nc_hide(dc_notif_center *nc)
+static void nc_teardown(dc_notif_center *nc)
 {
     if (nc->frame_cb) {
         wl_callback_destroy(nc->frame_cb);
@@ -378,21 +387,34 @@ static void nc_hide(dc_notif_center *nc)
     nc->layer_surface = NULL;
     nc->surface = NULL;
     nc->visible = false;
+    nc->closing = false;
     dc_debug("notification center hidden");
+}
+
+static void nc_begin_close(dc_notif_center *nc)
+{
+    if (!nc->visible || nc->closing)
+        return;
+    dc_anim_start(&nc->anim, DC_DUR_SHORT, DC_EASE_EMPHASIZED_ACCEL);
+    nc->closing = true;
+    if (!dc_anim_active(&nc->anim)) {
+        nc_teardown(nc);
+        return;
+    }
+    nc_render(nc);
 }
 
 void dc_notif_center_toggle(dc_notif_center *nc, dc_output *output)
 {
     if (nc->visible)
-        nc_hide(nc);
+        nc_begin_close(nc);
     else
         nc_show(nc, output);
 }
 
 void dc_notif_center_hide(dc_notif_center *nc)
 {
-    if (nc->visible)
-        nc_hide(nc);
+    nc_begin_close(nc);
 }
 
 bool dc_notif_center_visible(dc_notif_center *nc)
@@ -413,7 +435,7 @@ void dc_notif_center_refresh(dc_notif_center *nc)
 
 void dc_notif_center_handle_click(dc_notif_center *nc, double x, double y)
 {
-    if (!nc->visible)
+    if (!nc->visible || nc->closing)
         return;
     if (nc->clear_x1 > nc->clear_x0 && x >= nc->clear_x0 && x <= nc->clear_x1 &&
         y >= nc->clear_y0 && y <= nc->clear_y1) {
@@ -427,6 +449,6 @@ void dc_notif_center_destroy(dc_notif_center *nc)
     if (!nc)
         return;
     if (nc->visible)
-        nc_hide(nc);
+        nc_teardown(nc);
     free(nc);
 }
