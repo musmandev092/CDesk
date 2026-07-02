@@ -38,6 +38,14 @@ typedef struct dc_config {
     float bar_transparency;               /* 0..1 alpha multiplier for the bar background */
     float bar_widget_transparency;        /* 0..1 alpha multiplier for widget pill backgrounds */
 
+    /* weather widget (docs/12-BAR-SPEC.md sec.4/7 S4b): fixed lat/lon, no
+     * geolocation yet. dc_weather_init() is only called at startup when
+     * weather_enabled is true. */
+    bool weather_enabled;
+    double weather_lat;
+    double weather_lon;
+    bool weather_fahrenheit;
+
     /* Left/center/right widget ids, in display order (left-to-right within
      * each section; see dc_bar's layout pass for how each section anchors). */
     char bar_left_widgets[DC_CONFIG_WIDGETS_MAX][DC_CONFIG_WIDGET_ID_MAX];

@@ -11,6 +11,7 @@ struct dc_egl;
 struct dc_render;
 struct dc_niri;
 struct dc_tray;
+struct dc_notifications;
 
 typedef struct dc_bar dc_bar;
 
@@ -22,6 +23,10 @@ void dc_bar_destroy(dc_bar *bar);
 
 /* Attach the tray host so the bar renders StatusNotifier items. Optional. */
 void dc_bar_set_tray(dc_bar *bar, struct dc_tray *tray);
+
+/* Attach the notification server so notificationButton can show the unread
+ * dot (docs/12-BAR-SPEC.md sec.4/6). Optional. */
+void dc_bar_set_notifications(dc_bar *bar, struct dc_notifications *notifications);
 
 /* Re-render the bar (e.g. on a clock tick or a compositor event). No-op until
  * the surface has been configured. */
@@ -42,6 +47,9 @@ typedef enum {
     DC_BAR_REGION_CLOCK,
     DC_BAR_REGION_WORKSPACE,
     DC_BAR_REGION_TRAY,
+    DC_BAR_REGION_MEDIA_PREV,
+    DC_BAR_REGION_MEDIA_PLAY,
+    DC_BAR_REGION_MEDIA_NEXT,
 } dc_bar_region;
 
 /* Which region a surface-local logical coordinate falls in, from the last

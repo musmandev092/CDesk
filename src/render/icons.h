@@ -41,4 +41,34 @@
 #define DC_ICON_CHEVRON_RIGHT 0xe5cc
 #define DC_ICON_EXPAND_MORE 0xe5cf
 
+/* music (media) transport (docs/12-BAR-SPEC.md sec.4/6). */
+#define DC_ICON_SKIP_PREVIOUS 0xe045
+#define DC_ICON_SKIP_NEXT 0xe044
+#define DC_ICON_PLAY_ARROW 0xe037
+#define DC_ICON_PAUSE 0xe034
+
+/* weather set (docs/12-BAR-SPEC.md sec.4/6), matching
+ * dc_weather_icon_name()'s returned names 1:1. NOTE: these codepoints are
+ * absent from the build-time font subset (assets/fonts/MaterialSymbolsRounded.ttf
+ * was previously a ~2200-glyph subset that happened to skip the whole weather
+ * block) — the font was swapped for DMS's full variable font (still loaded
+ * from the same path/filename) so these render instead of tofu. */
+#define DC_ICON_CLEAR_DAY 0xf157
+#define DC_ICON_CLEAR_NIGHT 0xf159
+#define DC_ICON_PARTLY_CLOUDY_DAY 0xf172
+#define DC_ICON_PARTLY_CLOUDY_NIGHT 0xf174
+#define DC_ICON_CLOUD 0xf15c
+#define DC_ICON_RAINY 0xf176
+#define DC_ICON_WEATHER_SNOWY 0xe2cd
+#define DC_ICON_THUNDERSTORM 0xebdb
+#define DC_ICON_FOGGY 0xe818
+
+/* cpuUsage / memUsage (docs/12-BAR-SPEC.md sec.4/6), matching DMS's
+ * CpuMonitor.qml / RamMonitor.qml icon names exactly. */
+#define DC_ICON_MEMORY 0xe322        /* cpuUsage */
+#define DC_ICON_DEVELOPER_BOARD 0xe30d /* memUsage */
+
+/* controlCenterButton bluetooth sub-icon, connected state. */
+#define DC_ICON_BLUETOOTH_CONNECTED 0xe1a8
+
 #endif /* DC_RENDER_ICONS_H */

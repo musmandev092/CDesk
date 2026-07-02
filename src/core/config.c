@@ -26,6 +26,13 @@ static dc_config config = {
     .bar_transparency = 1.0f,
     .bar_widget_transparency = 1.0f,
 
+    /* User's live DMS weather config (docs/12-BAR-SPEC.md sec.0): fixed
+     * "New York, NY" location, Celsius. */
+    .weather_enabled = true,
+    .weather_lat = 40.7128,
+    .weather_lon = -74.0060,
+    .weather_fahrenheit = false,
+
     /* User's live DMS layout (docs/12-BAR-SPEC.md sec.0). */
     .bar_left_widgets = {"launcherButton", "workspaceSwitcher", "focusedWindow"},
     .bar_left_widgets_n = 3,
@@ -89,6 +96,21 @@ static void get_int(const cJSON *root, const char *key, int *out, int lo, int hi
     const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
     if (cJSON_IsNumber(item)) {
         int v = item->valueint;
+        if (v < lo)
+            v = lo;
+        if (v > hi)
+            v = hi;
+        *out = v;
+    }
+}
+
+/* Like get_float() but double-precision, for the weather widget's lat/lon
+ * (docs/12-BAR-SPEC.md sec.4 weather). */
+static void get_double(const cJSON *root, const char *key, double *out, double lo, double hi)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (cJSON_IsNumber(item)) {
+        double v = item->valuedouble;
         if (v < lo)
             v = lo;
         if (v > hi)
@@ -210,6 +232,11 @@ void dc_config_load(void)
     get_float(root, "barTransparency", &config.bar_transparency, 0.0f, 1.0f);
     get_float(root, "barWidgetTransparency", &config.bar_widget_transparency, 0.0f, 1.0f);
 
+    get_bool(root, "weatherEnabled", &config.weather_enabled);
+    get_double(root, "weatherLat", &config.weather_lat, -90.0, 90.0);
+    get_double(root, "weatherLon", &config.weather_lon, -180.0, 180.0);
+    get_bool(root, "weatherFahrenheit", &config.weather_fahrenheit);
+
     get_string_array(root, "barLeftWidgets", config.bar_left_widgets, DC_CONFIG_WIDGETS_MAX,
                      &config.bar_left_widgets_n);
     get_string_array(root, "barCenterWidgets", config.bar_center_widgets, DC_CONFIG_WIDGETS_MAX,
@@ -278,6 +305,11 @@ void dc_config_save(void)
     cJSON_AddNumberToObject(root, "barWidgetPadding", config.bar_widget_padding);
     cJSON_AddNumberToObject(root, "barTransparency", (double)config.bar_transparency);
     cJSON_AddNumberToObject(root, "barWidgetTransparency", (double)config.bar_widget_transparency);
+
+    cJSON_AddBoolToObject(root, "weatherEnabled", config.weather_enabled);
+    cJSON_AddNumberToObject(root, "weatherLat", config.weather_lat);
+    cJSON_AddNumberToObject(root, "weatherLon", config.weather_lon);
+    cJSON_AddBoolToObject(root, "weatherFahrenheit", config.weather_fahrenheit);
 
     add_string_array(root, "barLeftWidgets", config.bar_left_widgets, config.bar_left_widgets_n);
     add_string_array(root, "barCenterWidgets", config.bar_center_widgets,

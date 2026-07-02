@@ -12,13 +12,17 @@
 #include "services/icons.h"
 #include "services/mpris.h"
 #include "services/net.h"
+#include "services/notifications.h"
+#include "services/sysmon.h"
 #include "services/tray.h"
+#include "services/weather.h"
 #include "theme/theme.h"
 #include "ui/bar/bar_tokens.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
 #include <ctype.h>
+#include <dirent.h>
 #include <GLES2/gl2.h>
 #include <math.h>
 #include <stdio.h>
@@ -125,6 +129,8 @@ struct dc_bar {
 
     /* System tray (StatusNotifier) + a per-name nanovg image cache. */
     struct dc_tray *tray;
+    /* Notification server, for notificationButton's unread dot. */
+    struct dc_notifications *notifications;
     struct {
         char name[DC_TRAY_STR];
         int image;
@@ -289,11 +295,10 @@ static void draw_notif_pill(dc_bar *bar, const dc_pill *p)
     const dc_theme *t = dc_theme_current;
     draw_icon_centered(bar, p, DC_ICON_NOTIFICATIONS, t->surface_text);
 
-    /* Unread dot (docs/12-BAR-SPEC.md sec.4/6): needs the dc_notifications
-     * service threaded through dc_bar_create()/main.c, which is out of scope
-     * for S3 (this stage only touches the ui/bar sources). The draw call is
-     * wired up and ready — `has_unread` just has no live data source yet. */
-    const bool has_unread = false;
+    /* Unread dot (docs/12-BAR-SPEC.md sec.4/6): set by the notification
+     * server on any new notification, cleared by main.c when the
+     * notification center is opened. */
+    const bool has_unread = dc_notifications_has_unread(bar->notifications);
     if (has_unread) {
         NVGcontext *vg = bar->render->vg;
         const dc_config *cfg = dc_config_current;
@@ -354,7 +359,11 @@ static float layout_workspaces(dc_bar *bar, float x0, bool draw)
     const dc_theme *t = dc_theme_current;
     const dc_config *cfg = dc_config_current;
     const float cy = bar_cy(bar);
-    const float h = dc_bar_widget_thickness(cfg);
+    /* Capsule height = widgetThickness x 0.5 (docs/12-BAR-SPEC.md sec.7 S4b —
+     * WorkspaceSwitcher.qml:1154, showWorkspaceApps=false), vertically
+     * centered in the chip; active/inactive *widths* stay thickness-derived
+     * (dc_bar_ws_active_width/dc_bar_ws_inactive_width; unchanged). */
+    const float h = dc_bar_widget_thickness(cfg) * 0.5f;
     const float y = cy - h / 2.0f;
     const float active_w = dc_bar_ws_active_width(cfg);
     const float inactive_w = dc_bar_ws_inactive_width(cfg);
@@ -402,6 +411,86 @@ static void draw_workspaces_pill(dc_bar *bar, const dc_pill *p)
 }
 
 /* --- focusedWindow --------------------------------------------------------- */
+
+/* Strip codepoints the UI font can't render before building any display
+ * string (docs/12-BAR-SPEC.md sec.8: focusedWindow + music titles) —
+ * supplementary-plane codepoints (emoji and friends, >= U+10000), variation
+ * selectors (U+FE00-U+FE0F), and private-use-area codepoints (U+E000-U+F8FF,
+ * which includes the Material Symbols block itself, in case a stray one ends
+ * up in a window/track title). `in`/`out` may alias the same buffer (the
+ * output is always <= the input length, and bytes are only ever written at
+ * an offset behind or equal to the read cursor, so memmove-through-self is
+ * safe even though the ranges can overlap). Malformed UTF-8 continuation
+ * bytes are dropped rather than crashing on garbage input. */
+static void bar_sanitize_utf8(const char *in, char *out, size_t out_sz)
+{
+    const unsigned char *s = (const unsigned char *)in;
+    size_t oi = 0;
+
+    while (*s && oi + 1 < out_sz) {
+        unsigned char c = *s;
+        int len;
+        unsigned cp;
+
+        if ((c & 0x80) == 0) {
+            len = 1;
+            cp = c;
+        } else if ((c & 0xE0) == 0xC0) {
+            len = 2;
+            cp = c & 0x1F;
+        } else if ((c & 0xF0) == 0xE0) {
+            len = 3;
+            cp = c & 0x0F;
+        } else if ((c & 0xF8) == 0xF0) {
+            len = 4;
+            cp = c & 0x07;
+        } else {
+            s++; /* stray continuation/invalid lead byte: drop */
+            continue;
+        }
+
+        bool ok = true;
+        for (int i = 1; i < len; i++) {
+            if ((s[i] & 0xC0) != 0x80) {
+                ok = false;
+                break;
+            }
+            cp = (cp << 6) | (s[i] & 0x3F);
+        }
+        if (!ok) {
+            s++;
+            continue;
+        }
+
+        bool banned = cp >= 0x10000 || (cp >= 0xFE00 && cp <= 0xFE0F) ||
+                     (cp >= 0xE000 && cp <= 0xF8FF);
+        if (!banned && oi + (size_t)len < out_sz) {
+            memmove(out + oi, s, (size_t)len);
+            oi += (size_t)len;
+        }
+        s += len;
+    }
+    out[oi] = '\0';
+}
+
+/* Truncate a NUL-terminated UTF-8 buffer in place to at most `max_bytes`
+ * bytes, backing up to the last full codepoint boundary. Used to bound
+ * layout_media()'s title/artist before they're concatenated into a
+ * fixed-size label (docs/12-BAR-SPEC.md sec.4/8) — both the truncation
+ * itself and the snprintf() precision below are needed: this makes it UTF-8
+ * safe, the literal `%.100s` precision is what lets the compiler prove the
+ * concatenation can't overflow (declared-array-size analysis alone can't see
+ * a runtime truncation), avoiding -Wformat-truncation. */
+static void bar_truncate_bytes(char *s, size_t max_bytes)
+{
+    size_t len = strlen(s);
+    if (len <= max_bytes)
+        return;
+    size_t cut = max_bytes;
+    while (cut > 0 && ((unsigned char)s[cut] & 0xC0) == 0x80)
+        cut--;
+    s[cut] = '\0';
+}
 
 /* Truncate `buf` (a DC_NIRI_TITLE_MAX-sized title buffer) in place on a
  * UTF-8 codepoint boundary and append a real ellipsis ("…", U+2026) until it
@@ -456,12 +545,14 @@ static float layout_focused_window(dc_bar *bar, float x0, bool draw)
         snprintf(app_name, sizeof(app_name), "%s", base);
         app_name[0] = (char)toupper((unsigned char)app_name[0]);
     }
+    bar_sanitize_utf8(app_name, app_name, sizeof(app_name));
 
     /* Strip a trailing " - AppName" / " \xe2\x80\x94 AppName" (em dash) window
      * title suffix so the app name isn't shown twice (docs/12-BAR-SPEC.md
      * sec.4, matching DMS FocusedApp.qml's title.endsWith(appName) trim). */
     char title[DC_NIRI_TITLE_MAX];
     snprintf(title, sizeof(title), "%s", win->title);
+    bar_sanitize_utf8(title, title, sizeof(title));
     if (app_name[0] && title[0]) {
         char suffix[96];
         size_t tl = strlen(title), sl;
@@ -640,7 +731,306 @@ static void draw_clock_pill(dc_bar *bar, const dc_pill *p)
     layout_clock(bar, p->content_x0, true);
 }
 
+/* --- music (media) --------------------------------------------------------- */
+
+/* 20x20 music_note (primary) + "Title • Artist" (elided to ~200px) + a
+ * prev/play-pause/next transport, matching DMS's Media.qml horizontal layout
+ * (docs/12-BAR-SPEC.md sec.4 music). Hidden entirely (returns 0) when no
+ * MPRIS player is present. Shared measure/draw, like the widgets above;
+ * pushes the three transport hit rects itself when drawing (custom_hit —
+ * the whole pill is not one click target here, docs/12-BAR-SPEC.md sec.5). */
+static float layout_media(dc_bar *bar, float x0, bool draw)
+{
+    dc_mpris_info info;
+    if (!dc_mpris_read(&info) || !info.active)
+        return 0.0f;
+
+    NVGcontext *vg = bar->render->vg;
+    const dc_theme *t = dc_theme_current;
+    const float cy = bar_cy(bar);
+    const float icon_sz = 20.0f;
+    const float btn_sm = 20.0f;
+    const float btn_play = 24.0f;
+    const float icon_sm = 12.0f;
+    const float icon_play = 14.0f;
+    const float gap = DC_BAR_WIDGET_SPACING;
+    const float text_max = 200.0f;
+    const bool playing = info.playing;
+
+    char title[DC_NIRI_TITLE_MAX];
+    char artist[DC_NIRI_TITLE_MAX];
+    bar_sanitize_utf8(info.title, title, sizeof(title));
+    bar_sanitize_utf8(info.artist, artist, sizeof(artist));
+    bar_truncate_bytes(title, 100);
+    bar_truncate_bytes(artist, 100);
+    if (!title[0])
+        snprintf(title, sizeof(title), "Unknown Track");
+
+    char label[DC_NIRI_TITLE_MAX];
+    if (artist[0])
+        snprintf(label, sizeof(label), "%.100s \xe2\x80\xa2 %.100s", title, artist);
+    else
+        snprintf(label, sizeof(label), "%.100s", title);
+
+    nvgFontFaceId(vg, bar->render->font_ui);
+    nvgFontSize(vg, DC_BAR_TEXT_SIZE);
+    bar_ellipsize(vg, label, text_max);
+    float bounds[4];
+    nvgTextBounds(vg, 0.0f, 0.0f, label, NULL, bounds);
+    float label_w = bounds[2] - bounds[0];
+
+    float x = x0;
+
+    if (draw)
+        dc_render_icon(bar->render, DC_ICON_MUSIC_NOTE, x + icon_sz / 2.0f, cy, icon_sz, t->primary,
+                       NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+    x += icon_sz + gap;
+
+    if (draw) {
+        /* dc_render_icon() just switched the shared vg context to the icons
+         * font/size — restore the UI font before drawing the label text. */
+        nvgFontFaceId(vg, bar->render->font_ui);
+        nvgFontSize(vg, DC_BAR_TEXT_SIZE);
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        nvgFillColor(vg, tc(t->surface_text));
+        nvgText(vg, x, cy, label, NULL);
+    }
+    x += label_w + gap;
+
+    /* prev/next: transparent circles for now — hover fill lands with the S6
+     * hover pass (docs/12-BAR-SPEC.md sec.4/5). */
+    float prev_x0 = x;
+    if (draw)
+        dc_render_icon(bar->render, DC_ICON_SKIP_PREVIOUS, x + btn_sm / 2.0f, cy, icon_sm,
+                       t->surface_text, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+    x += btn_sm + gap;
+
+    /* play/pause: filled circle — bg=primary/icon=background while playing,
+     * bg=primaryHover(primary @ 12%)/icon=primary while paused. */
+    float play_x0 = x;
+    if (draw) {
+        nvgBeginPath(vg);
+        nvgCircle(vg, x + btn_play / 2.0f, cy, btn_play / 2.0f);
+        nvgFillColor(vg, playing ? tc(t->primary) : tc_alpha(t->primary, 31));
+        nvgFill(vg);
+        dc_render_icon(bar->render, playing ? DC_ICON_PAUSE : DC_ICON_PLAY_ARROW,
+                       x + btn_play / 2.0f, cy, icon_play, playing ? t->background : t->primary,
+                       NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+    }
+    x += btn_play + gap;
+
+    float next_x0 = x;
+    if (draw)
+        dc_render_icon(bar->render, DC_ICON_SKIP_NEXT, x + btn_sm / 2.0f, cy, icon_sm,
+                       t->surface_text, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+    x += btn_sm;
+
+    if (draw) {
+        bar_push_hit(bar, prev_x0, prev_x0 + btn_sm, DC_BAR_REGION_MEDIA_PREV, 0);
+        bar_push_hit(bar, play_x0, play_x0 + btn_play, DC_BAR_REGION_MEDIA_PLAY, 0);
+        bar_push_hit(bar, next_x0, next_x0 + btn_sm, DC_BAR_REGION_MEDIA_NEXT, 0);
+    }
+
+    return x - x0;
+}
+
+static float measure_media(dc_bar *bar)
+{
+    return layout_media(bar, 0.0f, false);
+}
+
+static void draw_media_pill(dc_bar *bar, const dc_pill *p)
+{
+    layout_media(bar, p->content_x0, true);
+}
+
+/* --- weather --------------------------------------------------------------- */
+
+/* Map dc_weather_icon_name()'s returned name to a Material Symbols codepoint
+ * (docs/12-BAR-SPEC.md sec.4/6 weather). */
+static int weather_icon_codepoint(const char *name)
+{
+    if (strcmp(name, "clear_day") == 0)
+        return DC_ICON_CLEAR_DAY;
+    if (strcmp(name, "clear_night") == 0)
+        return DC_ICON_CLEAR_NIGHT;
+    if (strcmp(name, "partly_cloudy_day") == 0)
+        return DC_ICON_PARTLY_CLOUDY_DAY;
+    if (strcmp(name, "partly_cloudy_night") == 0)
+        return DC_ICON_PARTLY_CLOUDY_NIGHT;
+    if (strcmp(name, "foggy") == 0)
+        return DC_ICON_FOGGY;
+    if (strcmp(name, "rainy") == 0)
+        return DC_ICON_RAINY;
+    if (strcmp(name, "weather_snowy") == 0)
+        return DC_ICON_WEATHER_SNOWY;
+    if (strcmp(name, "thunderstorm") == 0)
+        return DC_ICON_THUNDERSTORM;
+    return DC_ICON_CLOUD; /* "cloud" and any unmapped code */
+}
+
+/* Weather glyph (barIconSize(-6), 15px) + "NN°C"/"NN°F" (docs/12-BAR-SPEC.md
+ * sec.4 weather). Hidden (returns 0) until dc_weather_init() has a
+ * last-known-good reading — including while disabled (weatherEnabled=false
+ * never calls dc_weather_init(), so dc_weather_get() just returns false). */
+static float layout_weather(dc_bar *bar, float x0, bool draw)
+{
+    dc_weather_state w;
+    if (!dc_weather_get(&w) || !w.valid)
+        return 0.0f;
+
+    NVGcontext *vg = bar->render->vg;
+    const dc_theme *t = dc_theme_current;
+    const dc_config *cfg = dc_config_current;
+    const float cy = bar_cy(bar);
+    const float isz = dc_bar_icon_size(cfg, -6);
+    const float gap = DC_BAR_WIDGET_SPACING;
+    const int codepoint = weather_icon_codepoint(dc_weather_icon_name(w.weather_code, w.is_day));
+
+    float x = x0;
+    if (draw)
+        dc_render_icon(bar->render, codepoint, x + isz / 2.0f, cy, isz, t->surface_text,
+                       NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+    x += isz + gap;
+
+    char label[16];
+    snprintf(label, sizeof(label), "%d\xc2\xb0%s", w.temp_c, cfg->weather_fahrenheit ? "F" : "C");
+    nvgFontFaceId(vg, bar->render->font_ui);
+    nvgFontSize(vg, DC_BAR_TEXT_SIZE);
+    float bounds[4];
+    nvgTextBounds(vg, 0.0f, 0.0f, label, NULL, bounds);
+    float label_w = bounds[2] - bounds[0];
+
+    if (draw) {
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        nvgFillColor(vg, tc(t->surface_text));
+        nvgText(vg, x, cy, label, NULL);
+    }
+    x += label_w;
+    return x - x0;
+}
+
+static float measure_weather(dc_bar *bar)
+{
+    return layout_weather(bar, 0.0f, false);
+}
+
+static void draw_weather_pill(dc_bar *bar, const dc_pill *p)
+{
+    layout_weather(bar, p->content_x0, true);
+}
+
+/* --- cpuUsage / memUsage ---------------------------------------------------- */
+
+/* Icon (barIconSize(-6), 15px) + "NN%" (docs/12-BAR-SPEC.md sec.4), matching
+ * DMS's CpuMonitor.qml / RamMonitor.qml: icon glyph + color thresholds, then
+ * the percentage text. Always visible (no MPRIS/weather-style hide
+ * condition) — dc_sysmon_poll() self-limits to a 3s cadence, driven from
+ * main.c's 1 Hz tick. Shared by both widgets via `icon`/`percent`/
+ * `warn_at`/`danger_at`, mirroring layout_battery()'s icon+label shape. */
+static float layout_sysmon(dc_bar *bar, float x0, bool draw, int icon, int percent, int warn_at,
+                           int danger_at)
+{
+    NVGcontext *vg = bar->render->vg;
+    const dc_theme *t = dc_theme_current;
+    const dc_config *cfg = dc_config_current;
+    const float cy = bar_cy(bar);
+    const float isz = dc_bar_icon_size(cfg, -6);
+    const float icon_text_gap = 2.0f;
+
+    dc_color icon_color =
+        percent > danger_at ? t->error : (percent > warn_at ? t->warning : t->surface_text);
+
+    float x = x0;
+    if (draw)
+        dc_render_icon(bar->render, icon, x, cy, isz, icon_color, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+    x += isz + icon_text_gap;
+
+    char label[8];
+    snprintf(label, sizeof(label), "%d%%", percent);
+    nvgFontFaceId(vg, bar->render->font_ui);
+    nvgFontSize(vg, DC_BAR_TEXT_SIZE);
+    float bounds[4];
+    nvgTextBounds(vg, 0.0f, 0.0f, label, NULL, bounds);
+    float text_w = bounds[2] - bounds[0];
+
+    if (draw) {
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        nvgFillColor(vg, tc(t->surface_text));
+        nvgText(vg, x, cy, label, NULL);
+    }
+    x += text_w;
+    return x - x0;
+}
+
+static float measure_cpu(dc_bar *bar)
+{
+    return layout_sysmon(bar, 0.0f, false, DC_ICON_MEMORY, dc_sysmon_cpu_percent(), 60, 80);
+}
+
+static void draw_cpu_pill(dc_bar *bar, const dc_pill *p)
+{
+    layout_sysmon(bar, p->content_x0, true, DC_ICON_MEMORY, dc_sysmon_cpu_percent(), 60, 80);
+}
+
+static float measure_mem(dc_bar *bar)
+{
+    return layout_sysmon(bar, 0.0f, false, DC_ICON_DEVELOPER_BOARD, dc_sysmon_mem_percent(), 75, 90);
+}
+
+static void draw_mem_pill(dc_bar *bar, const dc_pill *p)
+{
+    layout_sysmon(bar, p->content_x0, true, DC_ICON_DEVELOPER_BOARD, dc_sysmon_mem_percent(), 75, 90);
+}
+
 /* --- battery ------------------------------------------------------------ */
+
+/* Any Mains/USB power-supply reporting online=1 (docs/12-BAR-SPEC.md sec.4/6
+ * battery item 5). battery.h's `charging` is a strict sysfs status=="Charging"
+ * check, but plenty of laptops report "Not charging" once a charge threshold
+ * is hit while AC stays connected — DMS's BatteryService shows the green
+ * charging glyph for as long as AC is plugged in, not just mid-charge.
+ * battery.{c,h} is out of scope for this stage (see AGENTS.md constraints),
+ * so this reads the sibling "online" sysfs attribute directly, mirroring
+ * battery.c's own read_line() pattern. Best-effort: false if no supply is
+ * found (never treated as fatal — the bar just falls back to bat.charging). */
+static bool bar_ac_online(void)
+{
+    DIR *dir = opendir("/sys/class/power_supply");
+    if (!dir)
+        return false;
+
+    bool online = false;
+    struct dirent *entry;
+    char path[512], value[32];
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.')
+            continue;
+
+        snprintf(path, sizeof(path), "/sys/class/power_supply/%s/type", entry->d_name);
+        FILE *f = fopen(path, "r");
+        if (!f)
+            continue;
+        bool got_type = fgets(value, sizeof(value), f) != NULL;
+        fclose(f);
+        if (!got_type)
+            continue;
+        value[strcspn(value, "\n")] = '\0';
+        if (strcmp(value, "Mains") != 0 && strcmp(value, "USB") != 0)
+            continue;
+
+        snprintf(path, sizeof(path), "/sys/class/power_supply/%s/online", entry->d_name);
+        f = fopen(path, "r");
+        if (!f)
+            continue;
+        bool got_online = fgets(value, sizeof(value), f) != NULL;
+        fclose(f);
+        if (got_online && value[0] == '1')
+            online = true;
+    }
+    closedir(dir);
+    return online;
+}
 
 /* Pick the Material Symbols battery glyph for this level/charging state
  * (docs/12-BAR-SPEC.md sec.4 + sec.6). DMS's BatteryService.getBatteryIcon()
@@ -649,13 +1039,13 @@ static void draw_clock_pill(dc_bar *bar, const dc_pill *p)
  * subset) doesn't include those codepoints — verified by parsing its cmap,
  * they render as blank space, not tofu. Collapsed to the three tiers that
  * are actually present in the font: full, low (0_bar), and alert. */
-static int battery_icon_codepoint(const dc_battery_info *bat)
+static int battery_icon_codepoint(bool charging, int percent)
 {
-    if (bat->charging)
+    if (charging)
         return DC_ICON_BATTERY_CHARGING_FULL;
-    if (bat->percent <= 10)
+    if (percent <= 10)
         return DC_ICON_BATTERY_ALERT;
-    if (bat->percent <= 25)
+    if (percent <= 25)
         return DC_ICON_BATTERY_0_BAR;
     return DC_ICON_BATTERY_FULL;
 }
@@ -673,10 +1063,11 @@ static float layout_battery(dc_bar *bar, float x0, bool draw)
     const dc_theme *t = dc_theme_current;
     const dc_config *cfg = dc_config_current;
     const float cy = bar_cy(bar);
-    const bool low = bat.percent < 20 && !bat.charging;
+    const bool charging = bat.charging || bar_ac_online();
+    const bool low = bat.percent < 20 && !charging;
 
-    dc_color icon_color = bat.charging ? t->primary : (low ? t->error : t->surface_text);
-    const int codepoint = battery_icon_codepoint(&bat);
+    dc_color icon_color = charging ? t->primary : (low ? t->error : t->surface_text);
+    const int codepoint = battery_icon_codepoint(charging, bat.percent);
     const float isz = dc_bar_icon_size(cfg, -4);
     const float icon_text_gap = 2.0f;
     float x = x0;
@@ -791,21 +1182,23 @@ static void draw_tray_pill(dc_bar *bar, const dc_pill *p)
     }
 }
 
-/* --- controlCenterButton (temporary stand-in) ----------------------------- */
+/* --- controlCenterButton --------------------------------------------------- */
 
-/* DMS's compound pill (network/vpn/bluetooth/audio/screenSharing) is S4 work.
- * For now this slot renders dankc's existing volume/bluetooth/wifi trio as a
- * single pill so the right cluster isn't empty — docs/12-BAR-SPEC.md sec.4
- * says this REPLACES the standalone icons entirely, which is why they no
- * longer have their own top-level draw calls. */
-static float measure_cc_stub(dc_bar *bar)
+/* DMS's compound pill: network/bluetooth/audio sub-icons (the user's config
+ * doesn't enable vpn/screenSharing/etc — docs/12-BAR-SPEC.md sec.0/4), each
+ * `primary` when active/connected else `surfaceText`, 17px, DC_BAR_WIDGET_SPACING
+ * (4px) apart. REPLACES dankc's old standalone wifi/bluetooth/volume icons and
+ * the dead cellular icon — this is the only place those services are read for
+ * bar display now. One hit region for the whole pill (already routed to
+ * DC_BAR_REGION_CONTROL_CENTER by the table below). */
+static float measure_cc(dc_bar *bar)
 {
     DC_UNUSED(bar);
     float isz = dc_bar_icon_size(dc_config_current, -4);
     return isz * 3.0f + DC_BAR_WIDGET_SPACING * 2.0f;
 }
 
-static void draw_cc_stub_pill(dc_bar *bar, const dc_pill *p)
+static void draw_cc_pill(dc_bar *bar, const dc_pill *p)
 {
     const dc_config *cfg = dc_config_current;
     const dc_theme *t = dc_theme_current;
@@ -813,7 +1206,23 @@ static void draw_cc_stub_pill(dc_bar *bar, const dc_pill *p)
     const int align = NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE;
     float x = p->content_x0;
 
-    /* Volume — live level + mute state from wpctl. */
+    /* network — wifi glyph, primary when connected (dc_net_wifi). */
+    dc_net_info net;
+    dc_net_wifi(&net);
+    dc_render_icon(bar->render, DC_ICON_WIFI, x, p->cy, isz,
+                  net.connected ? t->primary : t->surface_text, align);
+    x += isz + DC_BAR_WIDGET_SPACING;
+
+    /* bluetooth — bluetooth_connected + primary when a device is connected,
+     * plain bluetooth + surfaceText otherwise (dc_bluez_read). */
+    dc_bluez_info bt;
+    bool have_bt = dc_bluez_read(&bt);
+    bool bt_connected = have_bt && bt.connected;
+    dc_render_icon(bar->render, bt_connected ? DC_ICON_BLUETOOTH_CONNECTED : DC_ICON_BLUETOOTH, x,
+                  p->cy, isz, bt_connected ? t->primary : t->surface_text, align);
+    x += isz + DC_BAR_WIDGET_SPACING;
+
+    /* audio — volume_up/down/off by level/mute (dc_audio_read), surfaceText. */
     dc_audio_info audio;
     bool have_audio = dc_audio_read(&audio);
     int volume_icon = DC_ICON_VOLUME_UP;
@@ -821,27 +1230,7 @@ static void draw_cc_stub_pill(dc_bar *bar, const dc_pill *p)
         volume_icon = DC_ICON_VOLUME_OFF;
     else if (have_audio && audio.volume < 34)
         volume_icon = DC_ICON_VOLUME_DOWN;
-    dc_color volume_color = (have_audio && audio.muted) ? t->outline : t->surface_text;
-    dc_render_icon(bar->render, volume_icon, x, p->cy, isz, volume_color, align);
-    x += isz + DC_BAR_WIDGET_SPACING;
-
-    /* Bluetooth — info-blue when a device is connected, mid when powered, dim off. */
-    dc_bluez_info bt;
-    bool have_bt = dc_bluez_read(&bt);
-    dc_color bt_color = t->outline;
-    if (have_bt && bt.connected)
-        bt_color = t->info;
-    else if (have_bt && bt.powered)
-        bt_color = t->surface_variant_text;
-    dc_render_icon(bar->render, DC_ICON_BLUETOOTH, x, p->cy, isz, bt_color, align);
-    x += isz + DC_BAR_WIDGET_SPACING;
-
-    /* Wi-Fi — green when connected (sysfs), dim otherwise. */
-    dc_net_info net;
-    dc_net_wifi(&net);
-    int wifi_icon = net.connected ? DC_ICON_WIFI : DC_ICON_NETWORK_WIFI;
-    dc_color wifi_color = net.connected ? t->primary : t->outline;
-    dc_render_icon(bar->render, wifi_icon, x, p->cy, isz, wifi_color, align);
+    dc_render_icon(bar->render, volume_icon, x, p->cy, isz, t->surface_text, align);
 }
 
 /* --- widget host: config-driven left/center/right sections --------------- */
@@ -855,9 +1244,10 @@ typedef struct {
     dc_bar_region region; /* used when !custom_hit */
 } dc_bar_widget_def;
 
-/* Table of widget ids this stage implements. Unknown/unimplemented ids
- * (music, weather, cpuUsage, memUsage — arriving in S4) are skipped silently
- * by find_widget() returning NULL; see docs/12-BAR-SPEC.md sec.7 S2/S4. */
+/* Table of widget ids this stage implements (docs/12-BAR-SPEC.md sec.7
+ * S4b adds music/weather/cpuUsage/memUsage + the real controlCenterButton;
+ * any remaining unknown id is skipped silently by find_widget() returning
+ * NULL). */
 static const dc_bar_widget_def *find_widget(const char *id)
 {
     static const dc_bar_widget_def table[] = {
@@ -867,17 +1257,20 @@ static const dc_bar_widget_def *find_widget(const char *id)
          DC_BAR_REGION_NONE},
         {"focusedWindow", measure_focused_window, draw_focused_window_pill, true, false,
          DC_BAR_REGION_NONE},
+        {"music", measure_media, draw_media_pill, true, true, DC_BAR_REGION_NONE},
         {"clock", measure_clock, draw_clock_pill, true, false, DC_BAR_REGION_CLOCK},
+        {"weather", measure_weather, draw_weather_pill, true, false, DC_BAR_REGION_NONE},
         {"systemTray", measure_tray, draw_tray_pill, false, true, DC_BAR_REGION_NONE},
         {"clipboard", measure_clipboard, draw_clipboard_pill, true, false,
          DC_BAR_REGION_CLIPBOARD},
+        {"cpuUsage", measure_cpu, draw_cpu_pill, true, false, DC_BAR_REGION_NONE},
+        {"memUsage", measure_mem, draw_mem_pill, true, false, DC_BAR_REGION_NONE},
         {"notificationButton", measure_notif, draw_notif_pill, true, false,
          DC_BAR_REGION_NOTIFICATIONS},
         /* battery -> control center for now (docs/12-BAR-SPEC.md sec.5: "battery→battery
          * popout (phase 2: CC)"). */
         {"battery", measure_battery, draw_battery_pill, true, false, DC_BAR_REGION_CONTROL_CENTER},
-        {"controlCenterButton", measure_cc_stub, draw_cc_stub_pill, true, false,
-         DC_BAR_REGION_CONTROL_CENTER},
+        {"controlCenterButton", measure_cc, draw_cc_pill, true, false, DC_BAR_REGION_CONTROL_CENTER},
     };
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++)
         if (strcmp(table[i].id, id) == 0)
@@ -1197,6 +1590,11 @@ dc_output *dc_bar_output(dc_bar *bar)
 void dc_bar_set_tray(dc_bar *bar, struct dc_tray *tray)
 {
     bar->tray = tray;
+}
+
+void dc_bar_set_notifications(dc_bar *bar, struct dc_notifications *notifications)
+{
+    bar->notifications = notifications;
 }
 
 dc_bar_region dc_bar_hittest(dc_bar *bar, double x, double y, int *out_payload)

@@ -18,7 +18,9 @@
 #include "services/logind.h"
 #include "services/mpris.h"
 #include "services/notifications.h"
+#include "services/sysmon.h"
 #include "services/tray.h"
+#include "services/weather.h"
 #include "theme/theme.h"
 #include "ui/bar/bar.h"
 #include "ui/clip_picker.h"
@@ -80,6 +82,7 @@ static void clock_tick(void *data)
     struct tick_ctx *ctx = data;
     dc_notifications_tick(ctx->notifications);
     dc_lock_tick(ctx->lock);
+    dc_sysmon_poll(); /* self-limits to 3s (docs/12-BAR-SPEC.md sec.4 cpuUsage/memUsage) */
     render_all(ctx->set);
 
     dc_audio_info audio;
@@ -126,6 +129,7 @@ struct click_ctx {
     dc_notif_center *notif_center;
     dc_clip_picker *clip_picker;
     dc_settings *settings;
+    dc_notifications *notifications;
 };
 
 /* logind asked us to lock (pre-sleep / lock-session). */
@@ -161,6 +165,7 @@ struct control_ctx {
     dc_clip_picker *clip_picker;
     dc_settings *settings;
     dc_lock *lock;
+    dc_notifications *notifications;
 };
 
 static struct dc_output *first_output(struct dc_wayland *wl)
@@ -192,8 +197,11 @@ static void control_dispatch(const char *cmd, void *data)
         dc_launcher_toggle(c->launcher, out);
     else if (strcmp(cmd, "control-center") == 0 || strcmp(cmd, "control-center toggle") == 0)
         dc_control_center_toggle(c->control_center, out);
-    else if (strcmp(cmd, "notifications") == 0 || strcmp(cmd, "notifications toggle") == 0)
+    else if (strcmp(cmd, "notifications") == 0 || strcmp(cmd, "notifications toggle") == 0) {
         dc_notif_center_toggle(c->notif_center, out);
+        if (dc_notif_center_visible(c->notif_center))
+            dc_notifications_mark_read(c->notifications);
+    }
     else if (strcmp(cmd, "clipboard") == 0 || strcmp(cmd, "clipboard toggle") == 0)
         dc_clip_picker_toggle(c->clip_picker, out);
     else if (strcmp(cmd, "settings") == 0 || strcmp(cmd, "settings toggle") == 0)
@@ -300,12 +308,20 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
             dc_launcher_toggle(ctx->launcher, dc_bar_output(bar));
         } else if (region == DC_BAR_REGION_NOTIFICATIONS) {
             dc_notif_center_toggle(ctx->notif_center, dc_bar_output(bar));
+            if (dc_notif_center_visible(ctx->notif_center))
+                dc_notifications_mark_read(ctx->notifications);
         } else if (region == DC_BAR_REGION_CLIPBOARD) {
             dc_clip_picker_toggle(ctx->clip_picker, dc_bar_output(bar));
         } else if (region == DC_BAR_REGION_CONTROL_CENTER) {
             dc_control_center_toggle(cc, dc_bar_output(bar));
         } else if (region == DC_BAR_REGION_WORKSPACE) {
             dc_niri_focus_workspace(payload);
+        } else if (region == DC_BAR_REGION_MEDIA_PREV) {
+            dc_mpris_previous();
+        } else if (region == DC_BAR_REGION_MEDIA_PLAY) {
+            dc_mpris_play_pause();
+        } else if (region == DC_BAR_REGION_MEDIA_NEXT) {
+            dc_mpris_next();
         } else {
             if (dc_control_center_visible(cc))
                 dc_control_center_hide(cc);
@@ -348,6 +364,13 @@ int main(int argc, char **argv)
     dc_notifications *notifications = dc_notifications_create(dbus);
     dc_tray *tray = dc_tray_create(dbus);
 
+    /* Bar weather widget (docs/12-BAR-SPEC.md sec.4): only arm the fetch loop
+     * when enabled — dc_weather_get() just reports "no reading yet" (widget
+     * hidden) if dc_weather_init() is never called. */
+    if (dc_config_current->weather_enabled)
+        dc_weather_init(dc_config_current->weather_lat, dc_config_current->weather_lon,
+                        dc_config_current->weather_fahrenheit);
+
     dc_render render = {0};
     struct bar_set set = {0};
     dc_output *output;
@@ -361,8 +384,10 @@ int main(int argc, char **argv)
     if (set.count == 0)
         dc_warn("no outputs found; nothing to display");
 
-    for (int i = 0; i < set.count; i++)
+    for (int i = 0; i < set.count; i++) {
         dc_bar_set_tray(set.bars[i], tray);
+        dc_bar_set_notifications(set.bars[i], notifications);
+    }
     dc_tray_set_changed_cb(tray, niri_changed, &set); /* re-render bars on tray change */
 
     dc_control_center *control_center = dc_control_center_create(wl, &egl, &render);
@@ -403,7 +428,8 @@ int main(int argc, char **argv)
                              .launcher = launcher,
                              .notif_center = notif_center,
                              .clip_picker = clip_picker,
-                             .settings = settings};
+                             .settings = settings,
+                             .notifications = notifications};
     dc_wayland_set_click_cb(wl, handle_bar_click, &cctx);
 
     struct control_ctx control_ctx = {.wl = wl,
@@ -412,7 +438,8 @@ int main(int argc, char **argv)
                                       .notif_center = notif_center,
                                       .clip_picker = clip_picker,
                                       .settings = settings,
-                                      .lock = lock};
+                                      .lock = lock,
+                                      .notifications = notifications};
     dc_control *control = dc_control_create(g_loop, control_dispatch, &control_ctx);
     dc_logind *logind = dc_logind_create(dbus, logind_lock, lock);
 

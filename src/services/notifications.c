@@ -35,6 +35,8 @@ struct dc_notifications {
     dc_notification history[DC_NOTIF_HISTORY]; /* ring buffer, oldest at head */
     int history_count;
     int history_head;
+
+    bool has_unread; /* bar bell dot (docs/12-BAR-SPEC.md sec.4/6) */
 };
 
 /* Copy a notification into the history ring, evicting the oldest when full. */
@@ -168,6 +170,7 @@ static int method_notify(sd_bus_message *msg, void *userdata, sd_bus_error *err)
              (app_icon && *app_icon) ? app_icon : (hint_icon ? hint_icon : ""));
 
     dc_info("notify #%u [%s] %s", id, slot->app_name, slot->summary);
+    n->has_unread = true;
     notify_changed(n);
 
     return sd_bus_reply_method_return(msg, "u", id);
@@ -370,4 +373,16 @@ void dc_notifications_clear_history(dc_notifications *n)
     n->history_count = 0;
     n->history_head = 0;
     notify_changed(n);
+}
+
+bool dc_notifications_has_unread(dc_notifications *n)
+{
+    return n && n->has_unread;
+}
+
+void dc_notifications_mark_read(dc_notifications *n)
+{
+    if (!n)
+        return;
+    n->has_unread = false;
 }

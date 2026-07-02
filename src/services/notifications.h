@@ -70,4 +70,13 @@ void dc_notifications_clear_history(dc_notifications *n);
 /* Programmatically dismiss a toast (e.g. user click). Emits NotificationClosed. */
 void dc_notifications_dismiss(dc_notifications *n, uint32_t id);
 
+/* True if a notification has arrived since the notification center was last
+ * opened (docs/12-BAR-SPEC.md sec.4 notificationButton: the bell's unread
+ * dot). Survives toast expiry/dismissal — only dc_notifications_mark_read()
+ * clears it. */
+bool dc_notifications_has_unread(dc_notifications *n);
+
+/* Clear the unread flag (call when the notification center becomes visible). */
+void dc_notifications_mark_read(dc_notifications *n);
+
 #endif /* DC_SERVICES_NOTIFICATIONS_H */

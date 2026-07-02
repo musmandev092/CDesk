@@ -120,3 +120,43 @@ bool dc_mpris_read(dc_mpris_info *out)
     *out = g_cache;
     return g_cache.active;
 }
+
+/* Fire-and-forget call of a no-arg/no-reply-value MPRIS Player method on the
+ * first player found (docs/12-BAR-SPEC.md sec.4/5: music prev/play/next). */
+static void call_player_method(const char *method)
+{
+    if (!g_user)
+        return;
+    char *player = find_player();
+    if (!player)
+        return;
+
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = NULL;
+    int r = sd_bus_call_method(g_user, player, DC_MPRIS_PATH, DC_MPRIS_PLAYER_IFACE, method, &err,
+                               &reply, "");
+    if (r < 0)
+        sd_bus_error_free(&err);
+    if (reply)
+        sd_bus_message_unref(reply);
+    free(player);
+
+    /* Force a fresh read on the next dc_mpris_read() instead of serving the
+     * pre-click cache for up to a second. */
+    g_last = 0;
+}
+
+void dc_mpris_play_pause(void)
+{
+    call_player_method("PlayPause");
+}
+
+void dc_mpris_next(void)
+{
+    call_player_method("Next");
+}
+
+void dc_mpris_previous(void)
+{
+    call_player_method("Previous");
+}
