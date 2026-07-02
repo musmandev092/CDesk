@@ -104,4 +104,13 @@
 #define DC_ICON_SUBJECT 0xe8d2      /* long-text-entry fallback glyph */
 #define DC_ICON_IMAGE 0xe3f4        /* image-entry fallback glyph (thumbnail decode failure) */
 
+/* Launcher (docs/13-POPOUTS-SPEC.md sec.6): section-header view-mode toggles
+ * and footer source-filter pills. Values taken from DMS's own MaterialSymbols
+ * .codepoints file, same convention as the clipboard block above. */
+#define DC_ICON_VIEW_LIST 0xe8ef   /* list view (default, fully implemented) */
+#define DC_ICON_GRID_VIEW 0xe9b0   /* grid view */
+#define DC_ICON_VIEW_MODULE 0xe8f0 /* compact view (TODO, dim/disabled) */
+#define DC_ICON_FOLDER 0xe2c7      /* footer "Files" pill (TODO, dim/disabled) */
+#define DC_ICON_EXTENSION 0xe87b   /* footer "Plugins" pill (TODO, dim/disabled) */
+
 #endif /* DC_RENDER_ICONS_H */

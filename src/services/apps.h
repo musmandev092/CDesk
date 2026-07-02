@@ -1,8 +1,8 @@
 /* apps.h — desktop-entry index for the app launcher.
  *
  * Scans XDG applications directories once, parses the [Desktop Entry] Name/
- * Exec/Icon (skipping NoDisplay/Hidden and non-Application types), and offers a
- * ranked fuzzy search. See docs/04-FEATURES (launcher).
+ * Exec/Icon/Comment/GenericName (skipping NoDisplay/Hidden and non-Application
+ * types), and offers a ranked fuzzy search. See docs/04-FEATURES (launcher).
  */
 #ifndef DC_SERVICES_APPS_H
 #define DC_SERVICES_APPS_H
@@ -10,12 +10,16 @@
 #define DC_APP_NAME 128
 #define DC_APP_EXEC 320
 #define DC_APP_ID 128
+#define DC_APP_DESC 192
 
 typedef struct {
     char name[DC_APP_NAME];
     char exec[DC_APP_EXEC]; /* field codes (%f/%u/...) stripped */
     char id[DC_APP_ID];     /* desktop-file basename, for icon resolution */
-    int score;              /* scratch, set during search */
+    /* Comment=, falling back to GenericName=; empty if the entry has neither
+     * (launcher rows then show the name only). */
+    char desc[DC_APP_DESC];
+    int score; /* scratch, set during search */
 } dc_app;
 
 typedef struct dc_apps dc_apps;

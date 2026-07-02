@@ -332,13 +332,25 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
     }
 }
 
-/* Pointer motion over a bar surface: forward to hover tracking, which
- * internally re-renders only on a hover-region change (docs/12-BAR-SPEC.md
- * sec.5). Other DankC surfaces (popups, launcher) don't have per-pixel hover
+/* Pointer motion routing: bars get hover-region tracking (docs/12-BAR-SPEC.md
+ * sec.5); the launcher moves its selection to the row under the cursor
+ * (docs/13-POPOUTS-SPEC.md sec.6). Other popups don't track per-pixel hover
  * yet, so a miss here is a silent no-op. */
+struct motion_ctx {
+    struct bar_set *set;
+    dc_launcher *launcher;
+};
+
 static void handle_bar_motion(struct wl_surface *surface, double x, double y, void *data)
 {
-    struct bar_set *set = data;
+    struct motion_ctx *mctx = data;
+
+    if (dc_launcher_visible(mctx->launcher) && surface == dc_launcher_surface(mctx->launcher)) {
+        dc_launcher_handle_motion(mctx->launcher, x, y);
+        return;
+    }
+
+    struct bar_set *set = mctx->set;
     for (int i = 0; i < set->count; i++) {
         if (dc_bar_surface(set->bars[i]) == surface) {
             dc_bar_pointer_motion(set->bars[i], x, y);
@@ -368,6 +380,7 @@ struct axis_ctx {
     struct bar_set *set;
     dc_notif_center *notif_center;
     dc_clip_picker *clip_picker;
+    dc_launcher *launcher;
 };
 
 /* Scroll on a bar surface: vertical wheel -> workspace focus, horizontal ->
@@ -382,7 +395,8 @@ struct axis_ctx {
  * offsets the active tab's card list instead — the axis routing itself is
  * already generic (see above), so this only needed a surface check + a call
  * into dc_notif_center_handle_scroll(). Same pattern for the clipboard
- * picker's row list (docs/13-POPOUTS-SPEC.md sec.4). */
+ * picker's row list (docs/13-POPOUTS-SPEC.md sec.4) and the launcher's result
+ * list/grid (docs/13-POPOUTS-SPEC.md sec.6). */
 static void handle_bar_axis(struct wl_surface *surface, int steps_v, int steps_h, void *data)
 {
     struct axis_ctx *actx = data;
@@ -395,6 +409,10 @@ static void handle_bar_axis(struct wl_surface *surface, int steps_v, int steps_h
     if (dc_clip_picker_visible(actx->clip_picker) &&
         surface == dc_clip_picker_surface(actx->clip_picker)) {
         dc_clip_picker_handle_scroll(actx->clip_picker, steps_v);
+        return;
+    }
+    if (dc_launcher_visible(actx->launcher) && surface == dc_launcher_surface(actx->launcher)) {
+        dc_launcher_handle_scroll(actx->launcher, steps_v);
         return;
     }
 
@@ -519,9 +537,11 @@ int main(int argc, char **argv)
                              .settings = settings,
                              .notifications = notifications};
     dc_wayland_set_click_cb(wl, handle_bar_click, &cctx);
-    dc_wayland_set_motion_cb(wl, handle_bar_motion, &set);
+    struct motion_ctx mctx = {.set = &set, .launcher = launcher};
+    dc_wayland_set_motion_cb(wl, handle_bar_motion, &mctx);
     dc_wayland_set_leave_cb(wl, handle_bar_leave, &set);
-    struct axis_ctx actx = {.set = &set, .notif_center = notif_center, .clip_picker = clip_picker};
+    struct axis_ctx actx = {
+        .set = &set, .notif_center = notif_center, .clip_picker = clip_picker, .launcher = launcher};
     dc_wayland_set_axis_cb(wl, handle_bar_axis, &actx);
 
     struct control_ctx control_ctx = {.wl = wl,
