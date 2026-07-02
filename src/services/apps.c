@@ -48,6 +48,84 @@ static void clean_exec(char *dst, size_t n, const char *src)
     dst[o] = '\0';
 }
 
+/* Second pass over a .desktop file: fill app->actions[] from `[Desktop
+ * Action <id>]` groups whose <id> appears in `actions_raw` (the raw
+ * semicolon-separated Actions= value read during the first pass). Actions
+ * are kept in Actions='s own order regardless of the groups' order in the
+ * file (both are typical, but Actions= is the authoritative order per the
+ * desktop-entry spec). */
+static void parse_desktop_actions(const char *path, const char *actions_raw, dc_app *app)
+{
+    char ids[DC_APP_ACTION_MAX][DC_APP_ACTION_NAME];
+    int nids = 0;
+
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", actions_raw);
+    for (char *tok = strtok(buf, ";"); tok && nids < DC_APP_ACTION_MAX; tok = strtok(NULL, ";")) {
+        if (!*tok)
+            continue;
+        snprintf(ids[nids], sizeof(ids[nids]), "%s", tok);
+        nids++;
+    }
+    if (nids == 0)
+        return;
+
+    char tmp_name[DC_APP_ACTION_MAX][DC_APP_ACTION_NAME] = {{0}};
+    char tmp_exec[DC_APP_ACTION_MAX][DC_APP_EXEC] = {{0}};
+
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return;
+
+    int cur_idx = -1; /* which ids[]/tmp_*[] slot the current group targets, or -1 */
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strpbrk(line, "\r\n");
+        if (nl)
+            *nl = '\0';
+
+        if (line[0] == '[') {
+            cur_idx = -1;
+            size_t plen = strlen("[Desktop Action ");
+            size_t len = strlen(line);
+            if (len > plen && line[len - 1] == ']' && strncmp(line, "[Desktop Action ", plen) == 0) {
+                size_t idlen = len - plen - 1;
+                if (idlen < DC_APP_ACTION_NAME) {
+                    char aid[DC_APP_ACTION_NAME];
+                    memcpy(aid, line + plen, idlen);
+                    aid[idlen] = '\0';
+                    for (int i = 0; i < nids; i++)
+                        if (strcmp(ids[i], aid) == 0) {
+                            cur_idx = i;
+                            break;
+                        }
+                }
+            }
+            continue;
+        }
+        if (cur_idx < 0)
+            continue;
+
+        if (strncmp(line, "Name=", 5) == 0 && !tmp_name[cur_idx][0]) {
+            snprintf(tmp_name[cur_idx], sizeof(tmp_name[cur_idx]), "%.*s", DC_APP_ACTION_NAME - 1,
+                     line + 5);
+        } else if (strncmp(line, "Exec=", 5) == 0 && !tmp_exec[cur_idx][0]) {
+            clean_exec(tmp_exec[cur_idx], sizeof(tmp_exec[cur_idx]), line + 5);
+        }
+    }
+    fclose(f);
+
+    for (int i = 0; i < nids && app->action_count < DC_APP_ACTION_MAX; i++) {
+        if (!tmp_name[i][0] || !tmp_exec[i][0])
+            continue; /* incomplete action group; skip rather than show a dead row */
+        snprintf(app->actions[app->action_count].name, sizeof(app->actions[app->action_count].name),
+                 "%.*s", (int)sizeof(app->actions[app->action_count].name) - 1, tmp_name[i]);
+        snprintf(app->actions[app->action_count].exec, sizeof(app->actions[app->action_count].exec),
+                 "%.*s", (int)sizeof(app->actions[app->action_count].exec) - 1, tmp_exec[i]);
+        app->action_count++;
+    }
+}
+
 /* Parse one .desktop file into `app`. Returns 1 if it's a launchable, visible
  * Application, else 0. `id` is the basename without ".desktop". */
 static int parse_desktop(const char *path, const char *id, dc_app *app)
@@ -63,7 +141,8 @@ static int parse_desktop(const char *path, const char *id, dc_app *app)
      * (docs/13-POPOUTS-SPEC.md sec.6). Both are optional. */
     char comment[DC_APP_DESC] = {0};
     char generic[DC_APP_DESC] = {0};
-    int is_application = 1; /* assume Application unless Type says otherwise */
+    char actions_raw[256] = {0}; /* raw Actions= value, e.g. "new-window;new-private-window;" */
+    int is_application = 1;      /* assume Application unless Type says otherwise */
     int hidden = 0;
     int in_entry = 0;
 
@@ -74,7 +153,10 @@ static int parse_desktop(const char *path, const char *id, dc_app *app)
             *nl = '\0';
 
         if (line[0] == '[') {
-            /* Only read the main [Desktop Entry] group; stop at actions. */
+            /* Only read the main [Desktop Entry] group; Actions= groups are
+             * picked up by a dedicated second pass (parse_desktop_actions),
+             * since we don't yet know which action ids matter until we've
+             * seen Actions= itself. */
             in_entry = strcmp(line, "[Desktop Entry]") == 0;
             continue;
         }
@@ -89,6 +171,9 @@ static int parse_desktop(const char *path, const char *id, dc_app *app)
             snprintf(comment, sizeof(comment), "%.*s", DC_APP_DESC - 1, line + 8);
         } else if (strncmp(line, "GenericName=", 12) == 0 && !generic[0]) {
             snprintf(generic, sizeof(generic), "%.*s", DC_APP_DESC - 1, line + 12);
+        } else if (strncmp(line, "Actions=", 8) == 0 && !actions_raw[0]) {
+            snprintf(actions_raw, sizeof(actions_raw), "%.*s", (int)sizeof(actions_raw) - 1,
+                     line + 8);
         } else if (strncmp(line, "Type=", 5) == 0) {
             is_application = strcmp(line + 5, "Application") == 0;
         } else if (strncmp(line, "NoDisplay=", 10) == 0) {
@@ -107,6 +192,9 @@ static int parse_desktop(const char *path, const char *id, dc_app *app)
     snprintf(app->id, sizeof(app->id), "%s", id);
     snprintf(app->desc, sizeof(app->desc), "%s", comment[0] ? comment : generic);
     app->score = 0;
+    app->action_count = 0;
+    if (actions_raw[0])
+        parse_desktop_actions(path, actions_raw, app);
     return 1;
 }
 
@@ -270,22 +358,38 @@ int dc_apps_search(dc_apps *apps, const char *query, const dc_app **out, int max
     return n;
 }
 
-void dc_app_launch(const dc_app *app)
+void dc_app_launch_exec(const char *exec)
 {
-    if (!app || !app->exec[0])
+    if (!exec || !exec[0])
         return;
-    dc_info("launching %s: %s", app->name, app->exec);
 
     pid_t pid = fork();
     if (pid == 0) {
         /* Double-fork so the app reparents to init and never zombies us. */
         setsid();
         if (fork() == 0) {
-            execl("/bin/sh", "sh", "-c", app->exec, (char *)NULL);
+            execl("/bin/sh", "sh", "-c", exec, (char *)NULL);
             _exit(127);
         }
         _exit(0);
     } else if (pid > 0) {
         waitpid(pid, NULL, 0);
     }
+}
+
+void dc_app_launch(const dc_app *app)
+{
+    if (!app || !app->exec[0])
+        return;
+    dc_info("launching %s: %s", app->name, app->exec);
+    dc_app_launch_exec(app->exec);
+}
+
+void dc_app_launch_action(const dc_app *app, int idx)
+{
+    if (!app || idx < 0 || idx >= app->action_count)
+        return;
+    const dc_app_action *a = &app->actions[idx];
+    dc_info("launching %s action '%s': %s", app->name, a->name, a->exec);
+    dc_app_launch_exec(a->exec);
 }
