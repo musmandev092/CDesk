@@ -14,7 +14,21 @@ A lightweight desktop shell for the **niri** Wayland compositor, written in C �
 DankMaterialShell's core (QML/Quickshell + Go) as one native binary. Full spec in `docs/` (00–11).
 niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
 
-## Current status — bar parity DONE ✅ (S1–S6, 2026-07-02); panels parity next
+## Current status — bar + ALL panels at DMS parity ✅ (2026-07-02 late)
+Second wave (7 parallel worktree agents, merged to main through 0a6cc3d): startup-SIGSEGV
+fix, battery popout (health/capacity/power profiles), Processes popout (tabs/search/rings/
+sortable /proc table, cpu+mem chips open it), launcher parity (descriptions, view modes,
+footer pills, hover selection, icon cache), popout hover + slider DRAG everywhere,
+tabbed Settings (10 tabs, live-apply incl. bar position), DankDash dashboard (Overview/
+Weather w/ 7-day forecast/Media w/ album art/Wallpapers; clock/music/weather chips open it).
+Plus: full-Unicode fallback fonts + monochrome emoji; **Makefile now does header dep
+tracking (-MMD)** — stale-.o struct mismatches previously caused phantom "corruption";
+dc_render_icon now saves/restores nvg state (recurring garbled-text class killed).
+Remaining polish: power menu modal, tuned power-profile backend, marquee, Hourly forecast,
+wallpaper browser, notif action-images, HarfBuzz shaping, P7 perf (damage tracking, poll
+reduction, font subsetting). Plugins (T29) still deferred.
+
+## Previous status — bar parity DONE ✅ (S1–S6, 2026-07-02); panels parity next
 Bar now pixel-matches the user's live DMS bottom bar (docs/12-BAR-SPEC.md, commits
 07831c7..c412bb6): floating rounded 40px container + elevation shadow + bottom position,
 config-driven widget host (BasePill chips, user's exact L/C/R widget arrays), workspace
