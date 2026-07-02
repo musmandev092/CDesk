@@ -63,8 +63,11 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
   icon: info-blue connected / mid powered / dim off. Stable, no busy-loop.
 - [x] **T15 MPRIS** — media service (session bus): player detect + PlaybackStatus + title/artist, cached;
   bar shows music-note + title left of clock while Playing (hidden otherwise), like DMS.
-- [ ] **T11 UPower battery** (D-Bus; sysfs already works), **T16 StatusNotifier tray**, **T17 logind**
-  (brightness/power/idle).
+- [x] **T11 battery** — DONE via sysfs: battery.c reads capacity + status; bar shows %, green fill when
+  charging, red when low. UPower D-Bus (time-to-empty/full estimates) skipped — not shown on the bar.
+- [ ] **T16 StatusNotifier tray** — BLOCKED to verify: needs a tray-producing app (StatusNotifierItem) to
+  test the host/watcher end-to-end; deferred rather than ship unverifiable code.
+- [ ] **T17 logind** (idle/lid/sleep signals) — plumbing, not user-visible yet; deferred.
 
 ## Then — panels (M4+)
 - [x] **Pointer input** (prerequisite) — wl_seat + wl_pointer + bar click hit-testing (launcher/
@@ -91,13 +94,24 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
   click-to-launch. Backed by apps.c (XDG scan + fuzzy search) and xkb keyboard input in wl.c. Opens from
   the bar launcher button. Also fixed a latent libwayland abort: wl_pointer needs frame/axis_* listener
   stubs (see memory dankc-wl-listener-stubs). TODO later: math/calc/actions, recent apps, mouse hover.
-- [ ] **T22 Lock screen**, **T23 clipboard/screenshot/color-picker/night**.
+- [ ] **T22 Lock screen** — DEFERRED (safety): needs PAM auth; testing means locking the live session with
+  unverified code (lockout risk). Do when the user is awake.
+- [ ] **T23 clipboard / screenshot / color-picker / night** — BLOCKED to verify on this host: no
+  `wl-clipboard` (clipboard), no `grim`/screencopy tooling (screenshot/color-picker), and no wlr-gamma
+  protocol available (night mode); night mode is also intrusive to toggle on a live session. Deferred.
 
 ## Later
 - [x] **T26 config engine (cJSON)** — DONE: ~/.config/dankc/config.json (theme/clock24h/showDate/
   animationsEnabled/animationSpeed) with defaults; bar clock honours clock24h + showDate. Plus all 10 DMS
   DARK stock themes selectable via dc_theme_set (generated from StockThemes.js). TODO: hot-reload on
   file change; light variants; more keys (bar position/height, widget toggles).
-- [ ] **T24 Material color engine** (C++ MCU, colors from wallpaper — matches DMS when matugen active).
-- [ ] **T25 dankctl IPC + niri keybind generation.**
-  **T27 Settings UI.**  **T28 meson build.**  **T29 plugins (.so ABI).**  **T30 packaging.**
+- [x] **T24 Material color engine** — DONE: theme/dynamic.cpp (the one C++ module) — wallpaper -> vibrant
+  seed (chroma-weighted histogram) -> coherent dark Material palette; config keys dynamicColor + wallpaper.
+  HSL-tone approximation of MCU (true HCT is a future refinement in the same file).
+- [x] **T25 dankctl IPC** — DONE: control socket ($XDG_RUNTIME_DIR/dankc.sock) + `dankc ctl <cmd>` client
+  (launcher/control-center/notifications/quit) + `dankc keybinds` niri snippet generator.
+- [x] **T28 meson build** — DONE (written, mirrors the Makefile; not executed — meson not installed here).
+- [x] **T30 packaging** — DONE: packaging/PKGBUILD + README (meson-based, cross-distro notes).
+- [ ] **T27 Settings UI** — not started (large GUI; config is file-driven for now via config.json).
+- [ ] **T29 plugins (.so ABI)** — intentionally DEFERRED per locked project decision (native .so plugins
+  are a post-v1 phase, not in the core shell).

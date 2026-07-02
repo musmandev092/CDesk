@@ -38,9 +38,13 @@ niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
   gallium threads for the display fd. Now uses thread-safe prepare_read/read_events + a wall-clock loop
   tick. See memory `dankc-wayland-dispatch-deadlock`.
 - **Footprint:** RSS ≈ **145 MB** for two GPU bars incl. Mesa (Pss lower), vs DMS `qs` ≈ 477 MB.
-- **Next:** workspace-focus pill animation (needs bar frame-callback driving); OSD/toast exit fade; then
-  T23 clipboard (needs `wl-clipboard` installed to verify) and T22 lock screen (DEFERRED — needs the user
-  awake to test PAM auth; locking the live session with unverified code risks a lockout).
+- **dankctl** (T25): control socket + `dankc ctl <cmd>` (launcher/control-center/notifications/quit) +
+  `dankc keybinds` niri snippet. **Dynamic color** (T24): theme/dynamic.cpp derives a palette from the
+  wallpaper (config dynamicColor + wallpaper). **Build/packaging**: meson.build (T28) + packaging/ (T30).
+- **Remaining:** T27 settings GUI (not started); T16 tray, T23 clipboard/screenshot/night, T17 logind
+  (BLOCKED to verify here — no tray app / wl-clipboard / grim / gamma proto); T22 lock (DEFERRED — PAM
+  lockout risk on live session); T29 plugins (deferred by design). Polish: workspace-pill + toast per-card
+  animation (need bar/per-card frame driving).
 - Vendored: nanovg (GLES3, `third_party/nanovg`), cJSON (`third_party/cjson`); Inter bundled
   (`assets/fonts/InterVariable.ttf`).
 
