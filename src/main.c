@@ -360,16 +360,38 @@ static void handle_bar_leave(struct wl_surface *surface, void *data)
     }
 }
 
+/* dc_wayland's axis_cb fires for whatever surface the pointer is currently
+ * over -- bars and popouts alike (wl.c's pointer_handle_enter/axis track
+ * wl->pointer_surface generically; see pointer_handle_axis). This context
+ * lets one callback route to either. */
+struct axis_ctx {
+    struct bar_set *set;
+    dc_notif_center *notif_center;
+};
+
 /* Scroll on a bar surface: vertical wheel -> workspace focus, horizontal ->
  * column focus (docs/12-BAR-SPEC.md sec.5 — the user's live config,
  * scrollYBehavior=workspace/scrollXBehavior=column; other behavior modes
  * aren't wired up, since dankc's config doesn't expose them yet). `steps_v`/
  * `steps_h` are already debounced into whole steps by dc_wayland (wl.c); one
  * niri action fires per callback regardless of step magnitude, so a single
- * fast flick can't spawn a pile of `niri msg` processes. */
+ * fast flick can't spawn a pile of `niri msg` processes.
+ *
+ * Scroll over the notification center (docs/13-POPOUTS-SPEC.md sec.3):
+ * offsets the active tab's card list instead — the axis routing itself is
+ * already generic (see above), so this only needed a surface check + a call
+ * into dc_notif_center_handle_scroll(). */
 static void handle_bar_axis(struct wl_surface *surface, int steps_v, int steps_h, void *data)
 {
-    struct bar_set *set = data;
+    struct axis_ctx *actx = data;
+
+    if (dc_notif_center_visible(actx->notif_center) &&
+        surface == dc_notif_center_surface(actx->notif_center)) {
+        dc_notif_center_handle_scroll(actx->notif_center, steps_v);
+        return;
+    }
+
+    struct bar_set *set = actx->set;
     bool on_bar = false;
     for (int i = 0; i < set->count; i++) {
         if (dc_bar_surface(set->bars[i]) == surface) {
@@ -492,7 +514,8 @@ int main(int argc, char **argv)
     dc_wayland_set_click_cb(wl, handle_bar_click, &cctx);
     dc_wayland_set_motion_cb(wl, handle_bar_motion, &set);
     dc_wayland_set_leave_cb(wl, handle_bar_leave, &set);
-    dc_wayland_set_axis_cb(wl, handle_bar_axis, &set);
+    struct axis_ctx actx = {.set = &set, .notif_center = notif_center};
+    dc_wayland_set_axis_cb(wl, handle_bar_axis, &actx);
 
     struct control_ctx control_ctx = {.wl = wl,
                                       .launcher = launcher,
@@ -533,6 +556,11 @@ int main(int argc, char **argv)
         wl_list_for_each(first, &wl->outputs, link) {
             break;
         }
+        /* A user's already-running DMS instance normally owns
+         * org.freedesktop.Notifications, so real notify-send traffic never
+         * reaches dankc's server -- seed fixed demo entries directly instead
+         * (docs/13-POPOUTS-SPEC.md sec.3 verification). */
+        dc_notifications_seed_demo(notifications);
         dc_notif_center_toggle(notif_center, first);
     }
 

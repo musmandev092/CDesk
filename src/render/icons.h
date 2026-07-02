@@ -86,4 +86,9 @@
 /* controlCenterButton bluetooth sub-icon, connected state. */
 #define DC_ICON_BLUETOOTH_CONNECTED 0xe1a8
 
+/* Notification Center header's "Clear" button (docs/13-POPOUTS-SPEC.md
+ * sec.3, NotificationHeader.qml's "delete_sweep"). Confirmed present in the
+ * bundled font via fontTools (unlike the numbered battery glyphs above). */
+#define DC_ICON_DELETE_SWEEP 0xea79
+
 #endif /* DC_RENDER_ICONS_H */

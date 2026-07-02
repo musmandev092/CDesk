@@ -12,11 +12,17 @@
 
 struct dc_dbus;
 
-#define DC_NOTIF_MAX 32
+/* Single store for both the Notification Center's "Current" and "History"
+ * tabs (docs/13-POPOUTS-SPEC.md sec.3) -- see dc_notif_status below. Was two
+ * separate arrays (32 live + 64 history-ring) before the tabs split; bumped to
+ * one flat 64-entry store sized like the old history ring since every
+ * notification now lives here for its whole life. */
+#define DC_NOTIF_MAX 64
 #define DC_NOTIF_APP 64
 #define DC_NOTIF_SUMMARY 160
 #define DC_NOTIF_BODY 400
 #define DC_NOTIF_ICON 160
+#define DC_NOTIF_ACTION 48
 
 typedef enum {
     DC_URGENCY_LOW = 0,
@@ -24,17 +30,38 @@ typedef enum {
     DC_URGENCY_CRITICAL = 2,
 } dc_urgency;
 
+/* Notification Center tab membership. DMS keeps every notification in a
+ * persistent `historyList` from the moment it arrives while *also* tracking
+ * still-open ones in a separate `notifications` array (so "current" is a
+ * near-subset of "history" that shrinks as toasts get retained/dropped).
+ * DankC uses a simpler, mutually-exclusive split that's easier to reason
+ * about from a single flat store: a notification starts CURRENT on arrival
+ * and moves to HISTORY only when the user acts on it -- a card's X/Dismiss
+ * (or the "Open" action button, which also resolves the card), or "Clear" on
+ * the Current tab (moves everything at once). "Clear" on the History tab (or
+ * dismissing/opening an already-HISTORY card) deletes instead of moving,
+ * since there's nowhere further for it to go. See notifications.c's
+ * resolve_dismiss(). */
+typedef enum {
+    DC_NOTIF_CURRENT = 0,
+    DC_NOTIF_HISTORY = 1,
+} dc_notif_status;
+
 typedef struct {
     uint32_t id;
     char app_name[DC_NOTIF_APP];
     char summary[DC_NOTIF_SUMMARY];
     char body[DC_NOTIF_BODY];
     char app_icon[DC_NOTIF_ICON];
+    char action_key[DC_NOTIF_ACTION];   /* first non-"default" action id, "" if none */
+    char action_label[DC_NOTIF_ACTION]; /* that action's button label, e.g. "Open" */
     dc_urgency urgency;
     int expire_timeout_ms; /* -1 = server default, 0 = never expire */
-    int64_t created_ms;    /* CLOCK_MONOTONIC ms when posted */
+    int64_t created_ms;    /* CLOCK_MONOTONIC ms when posted -- lifetime/ordering math */
+    int64_t created_wall_ms; /* CLOCK_REALTIME ms when posted -- wall-clock display only */
     bool popup;            /* still shown as a transient toast */
-    bool active;           /* occupies this slot */
+    bool active;           /* occupies this slot (either tab; false = free/deleted) */
+    dc_notif_status status;
 } dc_notification;
 
 typedef struct dc_notifications dc_notifications;
@@ -49,26 +76,44 @@ void dc_notifications_destroy(dc_notifications *n);
 
 void dc_notifications_set_changed_cb(dc_notifications *n, dc_notif_changed_cb cb, void *user_data);
 
-/* Expire any toasts whose timeout has elapsed (call from the 1 Hz tick). Returns
- * true if anything changed. */
+/* Expire any toasts whose timeout has elapsed (call from the 1 Hz tick). Only
+ * hides the transient toast (popup=false); the entry stays on the Current tab
+ * until the user acts on it, matching DMS (a toast auto-hiding doesn't drop it
+ * from NotificationService.notifications). Returns true if anything changed. */
 bool dc_notifications_tick(dc_notifications *n);
 
 /* Enumerate the currently-visible toast popups, newest first, up to `max`.
  * Writes pointers into `out` and returns the count. */
 int dc_notifications_popups(dc_notifications *n, const dc_notification **out, int max);
 
-/* Enumerate stored history (dismissed/expired notifications), newest first, up
- * to `max`. Writes pointers into `out` and returns the count. */
-int dc_notifications_history(dc_notifications *n, const dc_notification **out, int max);
+/* Enumerate the Current tab (arrived, not yet dismissed), newest first, up to
+ * `max`. Writes pointers into `out` and returns the count. */
+int dc_notifications_current(dc_notifications *n, const dc_notification **out, int max);
+int dc_notifications_current_count(dc_notifications *n);
 
-/* Number of stored history entries. */
+/* Enumerate the History tab (dismissed/cleared), newest first, up to `max`.
+ * Writes pointers into `out` and returns the count. */
+int dc_notifications_history(dc_notifications *n, const dc_notification **out, int max);
 int dc_notifications_history_count(dc_notifications *n);
 
-/* Clear all history entries. */
+/* "Clear" on the Current tab: move every Current entry to History (does not
+ * delete). */
+void dc_notifications_clear_current(dc_notifications *n);
+
+/* "Clear" on the History tab: delete every History entry. */
 void dc_notifications_clear_history(dc_notifications *n);
 
-/* Programmatically dismiss a toast (e.g. user click). Emits NotificationClosed. */
+/* Per-card X/Dismiss: resolves `id` one step further (Current -> History,
+ * History -> deleted). Also used for a D-Bus/programmatic dismiss (e.g. a
+ * toast's own close button). Emits NotificationClosed only on the
+ * Current->History step, matching the spec (a History entry was already
+ * closed once). */
 void dc_notifications_dismiss(dc_notifications *n, uint32_t id);
+
+/* Per-card action button (e.g. "Open"): emits ActionInvoked for `id`'s first
+ * action, then resolves it exactly like dc_notifications_dismiss(). No-op if
+ * `id` has no action. */
+void dc_notifications_invoke_action(dc_notifications *n, uint32_t id);
 
 /* True if a notification has arrived since the notification center was last
  * opened (docs/12-BAR-SPEC.md sec.4 notificationButton: the bell's unread
@@ -78,5 +123,11 @@ bool dc_notifications_has_unread(dc_notifications *n);
 
 /* Clear the unread flag (call when the notification center becomes visible). */
 void dc_notifications_mark_read(dc_notifications *n);
+
+/* Seed a handful of fixed demo entries (some Current, some History; varied
+ * bodies/actions/ages) bypassing D-Bus entirely, for screenshotting/manual
+ * verification when nothing owns org.freedesktop.Notifications for real (e.g.
+ * a user's live DMS already does). Gated by the caller on $DANKC_NC_DEMO. */
+void dc_notifications_seed_demo(dc_notifications *n);
 
 #endif /* DC_SERVICES_NOTIFICATIONS_H */

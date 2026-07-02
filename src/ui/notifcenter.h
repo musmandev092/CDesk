@@ -1,8 +1,8 @@
-/* notifcenter.h — notification history panel (top-right popout).
+/* notifcenter.h — notification center popout (docs/13-POPOUTS-SPEC.md sec.3).
  *
- * A wlr-layer overlay listing dismissed/expired notifications with a header and
- * a "Clear all" action, matching DMS's NotificationCenterPopout. Opened from the
- * bar's notification bell. Fed by the notification server's history.
+ * A wlr-layer overlay with Current/History tabs, matching DMS's
+ * NotificationCenterPopout. Opened from the bar's notification bell. Fed by
+ * the notification server's dc_notifications_current()/_history().
  */
 #ifndef DC_UI_NOTIFCENTER_H
 #define DC_UI_NOTIFCENTER_H
@@ -31,7 +31,12 @@ struct wl_surface *dc_notif_center_surface(dc_notif_center *nc);
 /* Re-render if visible (call on the notification changed-callback). */
 void dc_notif_center_refresh(dc_notif_center *nc);
 
-/* Click at logical (x, y): hit the Clear-all button or a card. */
+/* Click at logical (x, y): hits a tab, the header buttons, or a card's
+ * close/dismiss/action region. */
 void dc_notif_center_handle_click(dc_notif_center *nc, double x, double y);
+
+/* Mouse wheel over the panel: scroll the active tab's card list by
+ * `steps_v` debounced wheel steps (positive = down), clamped to content. */
+void dc_notif_center_handle_scroll(dc_notif_center *nc, int steps_v);
 
 #endif /* DC_UI_NOTIFCENTER_H */
