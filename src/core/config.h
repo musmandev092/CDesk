@@ -29,4 +29,10 @@ extern const dc_config *dc_config_current;
  * the theme selection. Call once at startup after dc_theme_init(). */
 void dc_config_load(void);
 
+/* Mutable access for the settings UI. After editing, call dc_config_reapply()
+ * (re-selects theme + dynamic color) and dc_config_save() (persist to disk). */
+dc_config *dc_config_mut(void);
+void dc_config_reapply(void);
+void dc_config_save(void);
+
 #endif /* DC_CORE_CONFIG_H */

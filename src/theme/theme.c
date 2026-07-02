@@ -62,6 +62,15 @@ const char *dc_theme_name_at(int index)
     return dc_stock_themes[index].name;
 }
 
+dc_color dc_theme_primary_at(int index)
+{
+    if (index < 0 || index >= DC_STOCK_COUNT) {
+        dc_color none = {0, 0, 0, 255};
+        return none;
+    }
+    return dc_stock_themes[index].theme.primary;
+}
+
 void dc_theme_set_custom(const dc_theme *theme)
 {
     if (theme)

@@ -53,6 +53,7 @@ bool dc_theme_set(const char *id);
 int dc_theme_count(void);
 const char *dc_theme_id_at(int index);
 const char *dc_theme_name_at(int index);
+dc_color dc_theme_primary_at(int index); /* swatch colour for a settings picker */
 
 /* Install a fully-specified palette (e.g. one generated from the wallpaper by
  * the dynamic color engine). Copied into the active theme. */

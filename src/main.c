@@ -24,6 +24,7 @@
 #include "ui/launcher.h"
 #include "ui/notifcenter.h"
 #include "ui/osd.h"
+#include "ui/settings.h"
 #include "ui/toasts.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
@@ -119,6 +120,7 @@ struct click_ctx {
     dc_launcher *launcher;
     dc_notif_center *notif_center;
     dc_clip_picker *clip_picker;
+    dc_settings *settings;
 };
 
 /* Keyboard input routed to whichever keyboard-grabbing overlay is open. */
@@ -143,6 +145,7 @@ struct control_ctx {
     dc_control_center *control_center;
     dc_notif_center *notif_center;
     dc_clip_picker *clip_picker;
+    dc_settings *settings;
 };
 
 static struct dc_output *first_output(struct dc_wayland *wl)
@@ -178,6 +181,8 @@ static void control_dispatch(const char *cmd, void *data)
         dc_notif_center_toggle(c->notif_center, out);
     else if (strcmp(cmd, "clipboard") == 0 || strcmp(cmd, "clipboard toggle") == 0)
         dc_clip_picker_toggle(c->clip_picker, out);
+    else if (strcmp(cmd, "settings") == 0 || strcmp(cmd, "settings toggle") == 0)
+        dc_settings_toggle(c->settings, out);
     else if (strcmp(cmd, "screenshot") == 0)
         /* Full screen -> ~/Pictures + clipboard (needs grim + wl-copy). */
         run_sh("f=\"${XDG_PICTURES_DIR:-$HOME/Pictures}/screenshot-$(date +%Y%m%d-%H%M%S).png\"; "
@@ -225,7 +230,8 @@ static void print_keybinds(void)
            "    Print            { spawn \"dankc\" \"ctl\" \"screenshot\"; }\n"
            "    Mod+Print        { spawn \"dankc\" \"ctl\" \"screenshot-region\"; }\n"
            "    Mod+Shift+P      { spawn \"dankc\" \"ctl\" \"color-picker\"; }\n"
-           "    Mod+Shift+N      { spawn \"dankc\" \"ctl\" \"night\"; }\n");
+           "    Mod+Shift+N      { spawn \"dankc\" \"ctl\" \"night\"; }\n"
+           "    Mod+Comma        { spawn \"dankc\" \"ctl\" \"settings\"; }\n");
 }
 
 /* Route a left click: into the control-center popup if it's the target, else to
@@ -257,6 +263,11 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
     if (dc_clip_picker_visible(ctx->clip_picker) &&
         surface == dc_clip_picker_surface(ctx->clip_picker)) {
         dc_clip_picker_handle_click(ctx->clip_picker, x, y);
+        return;
+    }
+
+    if (dc_settings_visible(ctx->settings) && surface == dc_settings_surface(ctx->settings)) {
+        dc_settings_handle_click(ctx->settings, x, y);
         return;
     }
 
@@ -352,6 +363,7 @@ int main(int argc, char **argv)
 
     dc_clipboard *clipboard = dc_clipboard_create(wl, g_loop);
     dc_clip_picker *clip_picker = dc_clip_picker_create(wl, &egl, &render, clipboard);
+    dc_settings *settings = dc_settings_create(wl, &egl, &render);
 
     struct kbd_ctx kbd = {.launcher = launcher, .clip_picker = clip_picker};
     dc_wayland_set_key_cb(wl, handle_key, &kbd);
@@ -361,14 +373,16 @@ int main(int argc, char **argv)
                              .toasts = toasts,
                              .launcher = launcher,
                              .notif_center = notif_center,
-                             .clip_picker = clip_picker};
+                             .clip_picker = clip_picker,
+                             .settings = settings};
     dc_wayland_set_click_cb(wl, handle_bar_click, &cctx);
 
     struct control_ctx control_ctx = {.wl = wl,
                                       .launcher = launcher,
                                       .control_center = control_center,
                                       .notif_center = notif_center,
-                                      .clip_picker = clip_picker};
+                                      .clip_picker = clip_picker,
+                                      .settings = settings};
     dc_control *control = dc_control_create(g_loop, control_dispatch, &control_ctx);
 
     struct sigaction sa = {.sa_handler = handle_signal};
@@ -406,6 +420,7 @@ int main(int argc, char **argv)
     dc_loop_run(g_loop);
 
     dc_info("shutting down");
+    dc_settings_destroy(settings);
     dc_clip_picker_destroy(clip_picker);
     dc_clipboard_destroy(clipboard);
     dc_control_destroy(control);
