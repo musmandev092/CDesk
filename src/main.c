@@ -31,6 +31,7 @@
 #include "ui/lock.h"
 #include "ui/notifcenter.h"
 #include "ui/osd.h"
+#include "ui/powermenu.h"
 #include "ui/processes.h"
 #include "ui/settings.h"
 #include "ui/toasts.h"
@@ -153,6 +154,7 @@ struct click_ctx {
     dc_settings *settings;
     dc_dashboard *dashboard;
     dc_notifications *notifications;
+    dc_powermenu *powermenu;
 };
 
 /* logind asked us to lock (pre-sleep / lock-session). */
@@ -168,6 +170,7 @@ struct kbd_ctx {
     dc_processes *processes;
     dc_lock *lock;
     dc_settings *settings;
+    dc_powermenu *powermenu;
 };
 
 static void handle_key(uint32_t keysym, const char *utf8, void *data)
@@ -181,6 +184,8 @@ static void handle_key(uint32_t keysym, const char *utf8, void *data)
         dc_clip_picker_handle_key(k->clip_picker, keysym, utf8);
     else if (dc_processes_visible(k->processes))
         dc_processes_handle_key(k->processes, keysym, utf8);
+    else if (dc_powermenu_visible(k->powermenu))
+        dc_powermenu_handle_key(k->powermenu, keysym, utf8);
     else
         dc_launcher_handle_key(k->launcher, keysym, utf8);
 }
@@ -198,6 +203,7 @@ struct control_ctx {
     dc_dashboard *dashboard;
     dc_lock *lock;
     dc_notifications *notifications;
+    dc_powermenu *powermenu;
 };
 
 static struct dc_output *first_output(struct dc_wayland *wl)
@@ -268,6 +274,8 @@ static void control_dispatch(const char *cmd, void *data)
         dc_dashboard_toggle(c->dashboard, out, DC_DASH_WALLPAPERS);
     else if (strcmp(cmd, "lock") == 0)
         dc_lock_engage(c->lock);
+    else if (strcmp(cmd, "power-menu") == 0 || strcmp(cmd, "power-menu toggle") == 0)
+        dc_powermenu_toggle(c->powermenu, out);
     else if (strcmp(cmd, "unlock") == 0 && getenv("DANKC_LOCK_ESCAPE"))
         dc_lock_force_unlock(c->lock); /* testing-only, env-gated */
     else if (strcmp(cmd, "screenshot") == 0)
@@ -320,7 +328,8 @@ static void print_keybinds(void)
            "    Mod+Print        { spawn \"dankc\" \"ctl\" \"screenshot-region\"; }\n"
            "    Mod+Shift+P      { spawn \"dankc\" \"ctl\" \"color-picker\"; }\n"
            "    Mod+Shift+N      { spawn \"dankc\" \"ctl\" \"night\"; }\n"
-           "    Mod+Comma        { spawn \"dankc\" \"ctl\" \"settings\"; }\n");
+           "    Mod+Comma        { spawn \"dankc\" \"ctl\" \"settings\"; }\n"
+           "    Mod+Escape       { spawn \"dankc\" \"ctl\" \"power-menu\"; }\n");
 }
 
 /* Route a left click: into the control-center popup if it's the target, else to
@@ -332,6 +341,11 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
 
     if (dc_toasts_handle_click(ctx->toasts, surface, x, y))
         return;
+
+    if (dc_powermenu_visible(ctx->powermenu) && surface == dc_powermenu_surface(ctx->powermenu)) {
+        dc_powermenu_handle_click(ctx->powermenu, x, y);
+        return;
+    }
 
     if (dc_launcher_visible(ctx->launcher) && surface == dc_launcher_surface(ctx->launcher)) {
         dc_launcher_handle_click(ctx->launcher, x, y);
@@ -438,6 +452,11 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
 static void handle_bar_motion(struct wl_surface *surface, double x, double y, void *data)
 {
     struct click_ctx *ctx = data;
+
+    if (dc_powermenu_visible(ctx->powermenu) && surface == dc_powermenu_surface(ctx->powermenu)) {
+        dc_powermenu_handle_motion(ctx->powermenu, x, y);
+        return;
+    }
 
     if (dc_launcher_visible(ctx->launcher) && surface == dc_launcher_surface(ctx->launcher)) {
         dc_launcher_handle_motion(ctx->launcher, x, y);
@@ -663,6 +682,7 @@ int main(int argc, char **argv)
     dc_launcher *launcher = dc_launcher_create(wl, &egl, &render);
     dc_lock *lock = dc_lock_create(wl, &egl, &render);
     dc_processes *processes = dc_processes_create(wl, &egl, &render);
+    dc_powermenu *powermenu = dc_powermenu_create(wl, &egl, &render, dbus, lock);
     struct tick_ctx tick = {.set = &set,
                             .osd = osd,
                             .wl = wl,
@@ -691,7 +711,8 @@ int main(int argc, char **argv)
         .clip_picker = clip_picker,
         .processes = processes,
         .lock = lock,
-        .settings = settings};
+        .settings = settings,
+        .powermenu = powermenu};
     dc_wayland_set_key_cb(wl, handle_key, &kbd);
     dc_config_set_change_cb(bars_config_changed, &set);
 
@@ -705,7 +726,8 @@ int main(int argc, char **argv)
                              .processes = processes,
                              .settings = settings,
                              .dashboard = dashboard,
-                             .notifications = notifications};
+                             .notifications = notifications,
+                             .powermenu = powermenu};
     dc_wayland_set_click_cb(wl, handle_bar_click, &cctx);
     dc_wayland_set_motion_cb(wl, handle_bar_motion, &cctx);
     dc_wayland_set_leave_cb(wl, handle_bar_leave, &cctx);
@@ -728,7 +750,8 @@ int main(int argc, char **argv)
                                       .settings = settings,
                                       .dashboard = dashboard,
                                       .lock = lock,
-                                      .notifications = notifications};
+                                      .notifications = notifications,
+                                      .powermenu = powermenu};
     dc_control *control = dc_control_create(g_loop, control_dispatch, &control_ctx);
     dc_logind *logind = dc_logind_create(dbus, logind_lock, lock);
 
@@ -754,6 +777,41 @@ int main(int argc, char **argv)
             break;
         }
         dc_launcher_toggle(launcher, first);
+    }
+    if (getenv("DANKC_POWERMENU_DEMO")) {
+        dc_output *first = NULL;
+        wl_list_for_each(first, &wl->outputs, link) {
+            break;
+        }
+        dc_powermenu_toggle(powermenu, first);
+    }
+    /* DANKC_POWERMENU_FIRE=lock|logout|suspend|reboot|shutdown: open the menu
+     * and arm+confirm that action via dc_powermenu_debug_fire() -- the same
+     * internal path two real Enter presses/clicks take -- without any
+     * Wayland input synthesis. See powermenu.h's doc comment: verification-
+     * only, so DANKC_POWER_DRYRUN's log line can be checked deterministically
+     * even when this process doesn't hold pointer/keyboard focus in a shared
+     * multi-instance session. */
+    if (getenv("DANKC_POWERMENU_FIRE")) {
+        dc_output *first = NULL;
+        wl_list_for_each(first, &wl->outputs, link) {
+            break;
+        }
+        static const char *names[] = {"lock", "logout", "suspend", "reboot", "shutdown"};
+        const char *which = getenv("DANKC_POWERMENU_FIRE");
+        int idx = -1;
+        for (int i = 0; i < (int)DC_ARRAY_LEN(names); i++) {
+            if (strcmp(which, names[i]) == 0) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx >= 0) {
+            dc_powermenu_toggle(powermenu, first);
+            dc_powermenu_debug_fire(powermenu, idx);
+        } else {
+            dc_warn("DANKC_POWERMENU_FIRE: unknown action %s", which);
+        }
     }
     if (getenv("DANKC_DASH_DEMO")) {
         dc_output *first = NULL;
@@ -790,6 +848,7 @@ int main(int argc, char **argv)
     dc_info("shutting down");
     dc_logind_destroy(logind);
     dc_tray_destroy(tray);
+    dc_powermenu_destroy(powermenu);
     dc_lock_destroy(lock);
     dc_dashboard_destroy(dashboard);
     dc_settings_destroy(settings);
