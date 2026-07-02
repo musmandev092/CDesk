@@ -12,6 +12,7 @@ struct dc_render;
 struct dc_niri;
 struct dc_tray;
 struct dc_notifications;
+struct dc_config;
 
 typedef struct dc_bar dc_bar;
 
@@ -20,6 +21,15 @@ typedef struct dc_bar dc_bar;
 dc_bar *dc_bar_create(struct dc_wayland *wl, struct dc_output *output, struct dc_egl *egl,
                       struct dc_render *render, struct dc_niri *niri);
 void dc_bar_destroy(dc_bar *bar);
+
+/* Total logical height of the bar's own layer-surface/exclusive zone (the
+ * floating rect's thickness plus the transparent spacing gap toward the
+ * outer screen edge — see bar.c's bar_compute_geometry()). This also equals
+ * the distance from the true screen edge to the bar rect's desktop-facing
+ * edge, since the bar surface is anchored flush to that screen edge
+ * (docs/12-BAR-SPEC.md sec.1). Popouts (docs/13-POPOUTS-SPEC.md sec.0) use
+ * it to sit directly adjacent to the bar regardless of bar_position. */
+int dc_bar_window_height(const struct dc_config *cfg);
 
 /* Attach the tray host so the bar renders StatusNotifier items. Optional. */
 void dc_bar_set_tray(dc_bar *bar, struct dc_tray *tray);

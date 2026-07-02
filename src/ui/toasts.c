@@ -314,6 +314,12 @@ static void toasts_show(dc_toasts *t)
     if (t->wl->viewporter)
         t->viewport = wp_viewporter_get_viewport(t->wl->viewporter, t->surface);
 
+    /* Toasts are always top-right (DMS notificationPopupPosition=0) — this is
+     * intentionally NOT bar-position-aware (docs/13-POPOUTS-SPEC.md sec.0:
+     * "toasts stay top-right, unaffected"), since a bottom bar never intrudes
+     * on the top-right corner and a top bar's right cluster sits to the left
+     * of this margin, not underneath it. Don't wire dc_bar_window_height()
+     * in here. */
     t->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
         t->wl->layer_shell, t->surface, output ? output->wl_output : NULL,
         ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "dankc:toasts");

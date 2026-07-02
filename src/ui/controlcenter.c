@@ -1,6 +1,7 @@
 #include "ui/controlcenter.h"
 
 #include "core/anim.h"
+#include "core/config.h"
 #include "core/log.h"
 #include "dc.h"
 #include "render/icons.h"
@@ -9,6 +10,7 @@
 #include "services/bluez.h"
 #include "services/net.h"
 #include "theme/theme.h"
+#include "ui/popout.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
@@ -26,6 +28,9 @@
 #define DC_CC_WIDTH 380
 #define DC_CC_HEIGHT 420
 #define DC_SCALE_BASE 120
+/* Inset from the screen's right edge when bar-adjacent (docs/13-POPOUTS-SPEC.md
+ * sec.0/1: opens near the bar's right cluster, a few px in from the edge). */
+#define DC_CC_SIDE_MARGIN 12
 
 struct dc_control_center {
     dc_wayland *wl;
@@ -48,6 +53,11 @@ struct dc_control_center {
     dc_anim anim;
     struct wl_callback *frame_cb;
     bool closing;
+
+    /* Entrance/exit scale-and-fade pivot, bar-position-aware (docs/13-POPOUTS-
+     * SPEC.md sec.0): fraction of (w,h) nearest the bar-facing edge, set from
+     * dc_popout_bar_adjacent() at show-time. */
+    float anim_ox, anim_oy;
 
     bool visible;
     bool configured;
@@ -252,17 +262,20 @@ static void cc_render(dc_control_center *cc)
 
     nvgBeginFrame(vg, w, h, (float)cc->scale120 / DC_SCALE_BASE);
 
-    /* Entrance/exit: fade + scale from the top-right corner (DMS). Closing runs
-     * the progress in reverse. */
+    /* Entrance/exit: fade + scale from the bar-facing edge (docs/13-POPOUTS-
+     * SPEC.md sec.0) — pivot set by dc_popout_bar_adjacent() in cc_show().
+     * Closing runs the progress in reverse. */
     float p = dc_anim_progress(&cc->anim);
     if (cc->closing)
         p = 1.0f - (p > 1.0f ? 1.0f : p);
     float alpha = p > 1.0f ? 1.0f : p;
     float scale = 0.94f + 0.06f * p;
+    float ox = pad + (w - 2.0f * pad) * cc->anim_ox;
+    float oy = pad + (h - 2.0f * pad) * cc->anim_oy;
     nvgGlobalAlpha(vg, alpha);
-    nvgTranslate(vg, w - pad, pad);
+    nvgTranslate(vg, ox, oy);
     nvgScale(vg, scale, scale);
-    nvgTranslate(vg, -(w - pad), -pad);
+    nvgTranslate(vg, -ox, -oy);
 
     /* Soft drop shadow. */
     NVGpaint shadow = nvgBoxGradient(vg, pad, pad + 2.0f, w - 2 * pad, h - 2 * pad, 12.0f, 18.0f,
@@ -393,10 +406,17 @@ static void cc_show(dc_control_center *cc, dc_output *output)
     cc->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
         cc->wl->layer_shell, cc->surface, output ? output->wl_output : NULL,
         ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "dankc:control-center");
-    zwlr_layer_surface_v1_set_anchor(cc->layer_surface, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-                                                            ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+
+    /* Bar-adjacent, right-aligned (docs/13-POPOUTS-SPEC.md sec.0/1: CC opens
+     * near the bar's right cluster, on whichever screen edge the bar is on). */
+    dc_popout_anchor pa =
+        dc_popout_bar_adjacent(dc_config_current, DC_POPOUT_ALIGN_END, DC_CC_SIDE_MARGIN);
+    cc->anim_ox = pa.origin_x;
+    cc->anim_oy = pa.origin_y;
+    zwlr_layer_surface_v1_set_anchor(cc->layer_surface, pa.anchor);
     zwlr_layer_surface_v1_set_size(cc->layer_surface, DC_CC_WIDTH, DC_CC_HEIGHT);
-    zwlr_layer_surface_v1_set_margin(cc->layer_surface, 54, 8, 0, 0);
+    zwlr_layer_surface_v1_set_margin(cc->layer_surface, pa.margin_top, pa.margin_right,
+                                     pa.margin_bottom, pa.margin_left);
     zwlr_layer_surface_v1_set_exclusive_zone(cc->layer_surface, -1);
     zwlr_layer_surface_v1_add_listener(cc->layer_surface, &layer_surface_listener, cc);
 

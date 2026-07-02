@@ -70,6 +70,13 @@ static dc_bar_geometry bar_compute_geometry(const dc_config *cfg)
     return g;
 }
 
+/* Public accessor (bar.h) for popout.c and any panel that needs to sit
+ * adjacent to the bar without duplicating bar_compute_geometry()'s formula. */
+int dc_bar_window_height(const dc_config *cfg)
+{
+    return bar_compute_geometry(cfg).window_height;
+}
+
 /* dc_color -> nanovg color. */
 static inline NVGcolor tc(dc_color c)
 {

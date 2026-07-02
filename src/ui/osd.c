@@ -1,12 +1,14 @@
 #include "ui/osd.h"
 
 #include "core/anim.h"
+#include "core/config.h"
 #include "core/log.h"
 #include "core/loop.h"
 #include "dc.h"
 #include "render/icons.h"
 #include "render/nvg.h"
 #include "theme/theme.h"
+#include "ui/bar/bar.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
@@ -26,6 +28,13 @@
 #define DC_OSD_HEIGHT 60
 #define DC_OSD_TIMEOUT_MS 2000
 #define DC_SCALE_BASE 120
+/* Fixed bottom margin when the bar is at the TOP (no bar to clear down
+ * there — just DMS's usual OSD lift off the screen edge). When the bar is
+ * at the BOTTOM, the margin is computed from dc_bar_window_height() instead
+ * so the OSD always clears it (docs/13-POPOUTS-SPEC.md sec.0). */
+#define DC_OSD_MARGIN_NO_BAR 80
+/* Extra visual gap above the bar, matching popout.c's DC_POPOUT_BAR_GAP. */
+#define DC_OSD_BAR_GAP 8
 
 struct dc_osd {
     dc_wayland *wl;
@@ -328,7 +337,15 @@ void dc_osd_show_volume(dc_osd *osd, dc_output *output, int volume, bool muted)
         ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "dankc:osd");
     zwlr_layer_surface_v1_set_anchor(osd->layer_surface, ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM);
     zwlr_layer_surface_v1_set_size(osd->layer_surface, DC_OSD_WIDTH, DC_OSD_HEIGHT);
-    zwlr_layer_surface_v1_set_margin(osd->layer_surface, 0, 0, 80, 0);
+    /* OSD is always bottom-center (DMS osdPosition=5), independent of
+     * bar_position — but it must clear a bottom bar (docs/13-POPOUTS-SPEC.md
+     * sec.0). A top bar doesn't intrude on the bottom edge, so keep the
+     * original fixed lift there. */
+    const dc_config *cfg = dc_config_current;
+    int32_t margin_bottom = (cfg->bar_position == DC_BAR_POSITION_BOTTOM)
+                                ? dc_bar_window_height(cfg) + DC_OSD_BAR_GAP
+                                : DC_OSD_MARGIN_NO_BAR;
+    zwlr_layer_surface_v1_set_margin(osd->layer_surface, 0, 0, margin_bottom, 0);
     zwlr_layer_surface_v1_set_exclusive_zone(osd->layer_surface, -1);
     zwlr_layer_surface_v1_add_listener(osd->layer_surface, &layer_surface_listener, osd);
 

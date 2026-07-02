@@ -6,6 +6,7 @@
 #include "dc.h"
 #include "render/nvg.h"
 #include "theme/theme.h"
+#include "ui/popout.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
@@ -42,6 +43,10 @@ struct dc_settings {
     dc_anim anim;
     struct wl_callback *frame_cb;
     bool closing, visible, configured, egl_ready;
+
+    /* Entrance/exit scale-and-fade pivot, bar-position-aware — see
+     * controlcenter.c's identical field for the full rationale. */
+    float anim_ox, anim_oy;
 };
 
 static inline NVGcolor tc(dc_color c)
@@ -170,10 +175,12 @@ static void s_render(dc_settings *s)
         p = 1.0f - (p > 1.0f ? 1.0f : p);
     float alpha = p > 1.0f ? 1.0f : p;
     float scale = 0.94f + 0.06f * p;
+    float ox = pad + (w - 2.0f * pad) * s->anim_ox;
+    float oy = pad + (h - 2.0f * pad) * s->anim_oy;
     nvgGlobalAlpha(vg, alpha);
-    nvgTranslate(vg, w / 2.0f, h / 2.0f);
+    nvgTranslate(vg, ox, oy);
     nvgScale(vg, scale, scale);
-    nvgTranslate(vg, -w / 2.0f, -h / 2.0f);
+    nvgTranslate(vg, -ox, -oy);
 
     NVGpaint shadow = nvgBoxGradient(vg, pad, pad + 2.0f, w - 2 * pad, h - 2 * pad, 16.0f, 20.0f,
                                      nvgRGBA(0, 0, 0, 110), nvgRGBA(0, 0, 0, 0));
@@ -329,7 +336,15 @@ static void s_show(dc_settings *s, dc_output *output)
     s->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
         s->wl->layer_shell, s->surface, output ? output->wl_output : NULL,
         ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "dankc:settings");
+
+    /* Bar-adjacent, horizontally centered (docs/13-POPOUTS-SPEC.md sec.0). */
+    dc_popout_anchor pa = dc_popout_bar_adjacent(dc_config_current, DC_POPOUT_ALIGN_CENTER, 0);
+    s->anim_ox = pa.origin_x;
+    s->anim_oy = pa.origin_y;
+    zwlr_layer_surface_v1_set_anchor(s->layer_surface, pa.anchor);
     zwlr_layer_surface_v1_set_size(s->layer_surface, DC_SET_WIDTH, DC_SET_HEIGHT);
+    zwlr_layer_surface_v1_set_margin(s->layer_surface, pa.margin_top, pa.margin_right,
+                                     pa.margin_bottom, pa.margin_left);
     zwlr_layer_surface_v1_add_listener(s->layer_surface, &layer_surface_listener, s);
     wl_surface_commit(s->surface);
     s->visible = true;

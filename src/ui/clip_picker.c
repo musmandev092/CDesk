@@ -1,12 +1,14 @@
 #include "ui/clip_picker.h"
 
 #include "core/anim.h"
+#include "core/config.h"
 #include "core/log.h"
 #include "dc.h"
 #include "render/icons.h"
 #include "render/nvg.h"
 #include "services/clipboard.h"
 #include "theme/theme.h"
+#include "ui/popout.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
@@ -34,6 +36,9 @@
 #define DC_CP_MAX_ROWS 8
 #define DC_CP_QUERY_MAX 128
 #define DC_CP_MAX_ENTRIES 32
+/* Inset from the screen's right edge when bar-adjacent (docs/13-POPOUTS-SPEC.md
+ * sec.0/4: opens near the clipboard icon, effectively the bar's right cluster). */
+#define DC_CP_SIDE_MARGIN 12
 
 struct dc_clip_picker {
     dc_wayland *wl;
@@ -60,6 +65,10 @@ struct dc_clip_picker {
     struct wl_callback *frame_cb;
     bool closing;
     bool visible, configured, egl_ready;
+
+    /* Entrance/exit scale-and-fade pivot, bar-position-aware — see
+     * controlcenter.c's identical field for the full rationale. */
+    float anim_ox, anim_oy;
 };
 
 static inline NVGcolor tc(dc_color c)
@@ -195,10 +204,12 @@ static void cp_render(dc_clip_picker *p)
         pr = 1.0f - (pr > 1.0f ? 1.0f : pr);
     float alpha = pr > 1.0f ? 1.0f : pr;
     float scale = 0.92f + 0.08f * pr;
+    float ox = pad + (w - 2.0f * pad) * p->anim_ox;
+    float oy = pad + (h - 2.0f * pad) * p->anim_oy;
     nvgGlobalAlpha(vg, alpha);
-    nvgTranslate(vg, w / 2.0f, h / 2.0f);
+    nvgTranslate(vg, ox, oy);
     nvgScale(vg, scale, scale);
-    nvgTranslate(vg, -w / 2.0f, -h / 2.0f);
+    nvgTranslate(vg, -ox, -oy);
 
     NVGpaint shadow = nvgBoxGradient(vg, pad, pad + 2.0f, w - 2 * pad, h - 2 * pad, 16.0f, 20.0f,
                                      nvgRGBA(0, 0, 0, 110), nvgRGBA(0, 0, 0, 0));
@@ -344,7 +355,16 @@ static void cp_show(dc_clip_picker *p, dc_output *output)
     p->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
         p->wl->layer_shell, p->surface, output ? output->wl_output : NULL,
         ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "dankc:clipboard");
+
+    /* Bar-adjacent, right-aligned (docs/13-POPOUTS-SPEC.md sec.0/4). */
+    dc_popout_anchor pa =
+        dc_popout_bar_adjacent(dc_config_current, DC_POPOUT_ALIGN_END, DC_CP_SIDE_MARGIN);
+    p->anim_ox = pa.origin_x;
+    p->anim_oy = pa.origin_y;
+    zwlr_layer_surface_v1_set_anchor(p->layer_surface, pa.anchor);
     zwlr_layer_surface_v1_set_size(p->layer_surface, DC_CP_WIDTH, DC_CP_HEIGHT);
+    zwlr_layer_surface_v1_set_margin(p->layer_surface, pa.margin_top, pa.margin_right,
+                                     pa.margin_bottom, pa.margin_left);
     zwlr_layer_surface_v1_set_keyboard_interactivity(
         p->layer_surface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE);
     zwlr_layer_surface_v1_add_listener(p->layer_surface, &layer_surface_listener, p);

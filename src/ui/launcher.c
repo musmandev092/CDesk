@@ -1,6 +1,7 @@
 #include "ui/launcher.h"
 
 #include "core/anim.h"
+#include "core/config.h"
 #include "core/log.h"
 #include "dc.h"
 #include "render/icons.h"
@@ -8,6 +9,7 @@
 #include "services/apps.h"
 #include "services/icons.h"
 #include "theme/theme.h"
+#include "ui/popout.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
@@ -34,6 +36,9 @@
 #define DC_LAUNCHER_RESULTS_Y 84.0f
 #define DC_LAUNCHER_MAX_ROWS 7
 #define DC_LAUNCHER_QUERY_MAX 128
+/* Inset from the screen's left edge when bar-adjacent (docs/13-POPOUTS-SPEC.md
+ * sec.0/6: DMS anchors the launcher bottom-left above the bar, not centered). */
+#define DC_LAUNCHER_SIDE_MARGIN 12
 
 struct dc_launcher {
     dc_wayland *wl;
@@ -63,6 +68,10 @@ struct dc_launcher {
     dc_anim anim;                 /* entrance / exit (fade + scale) */
     struct wl_callback *frame_cb; /* pending frame callback while animating */
     bool closing;                 /* playing the exit animation, then teardown */
+
+    /* Entrance/exit scale-and-fade pivot, bar-position-aware — see
+     * controlcenter.c's identical field for the full rationale. */
+    float anim_ox, anim_oy;
 
     bool visible;
     bool configured;
@@ -163,17 +172,21 @@ static void launcher_render(dc_launcher *l)
 
     nvgBeginFrame(vg, w, h, (float)l->scale120 / DC_SCALE_BASE);
 
-    /* Entrance/exit animation: fade + scale from center (DMS spotlight). While
-     * closing, the progress runs in reverse (1 -> 0). */
+    /* Entrance/exit animation: fade + scale from the bar-facing edge
+     * (docs/13-POPOUTS-SPEC.md sec.0/6 — bar-adjacent bottom-left, not a
+     * centered spotlight). While closing, the progress runs in reverse
+     * (1 -> 0). */
     float p = dc_anim_progress(&l->anim);
     if (l->closing)
         p = 1.0f - (p > 1.0f ? 1.0f : p);
     float alpha = p > 1.0f ? 1.0f : p;
     float scale = 0.92f + 0.08f * p;
+    float ox = pad + (w - 2.0f * pad) * l->anim_ox;
+    float oy = pad + (h - 2.0f * pad) * l->anim_oy;
     nvgGlobalAlpha(vg, alpha);
-    nvgTranslate(vg, w / 2.0f, h / 2.0f);
+    nvgTranslate(vg, ox, oy);
     nvgScale(vg, scale, scale);
-    nvgTranslate(vg, -w / 2.0f, -h / 2.0f);
+    nvgTranslate(vg, -ox, -oy);
 
     /* Drop shadow + card. */
     NVGpaint shadow = nvgBoxGradient(vg, pad, pad + 2.0f, w - 2 * pad, h - 2 * pad, 16.0f, 20.0f,
@@ -365,8 +378,18 @@ static void launcher_show(dc_launcher *l, dc_output *output)
     l->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
         l->wl->layer_shell, l->surface, output ? output->wl_output : NULL,
         ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "dankc:launcher");
-    /* No anchors -> compositor centers the surface. */
+
+    /* Bar-adjacent, left-aligned (docs/13-POPOUTS-SPEC.md sec.0/6): DMS opens
+     * the launcher bottom-left above the bar, not centered, for both bar
+     * positions. */
+    dc_popout_anchor pa =
+        dc_popout_bar_adjacent(dc_config_current, DC_POPOUT_ALIGN_START, DC_LAUNCHER_SIDE_MARGIN);
+    l->anim_ox = pa.origin_x;
+    l->anim_oy = pa.origin_y;
+    zwlr_layer_surface_v1_set_anchor(l->layer_surface, pa.anchor);
     zwlr_layer_surface_v1_set_size(l->layer_surface, DC_LAUNCHER_WIDTH, DC_LAUNCHER_HEIGHT);
+    zwlr_layer_surface_v1_set_margin(l->layer_surface, pa.margin_top, pa.margin_right,
+                                     pa.margin_bottom, pa.margin_left);
     zwlr_layer_surface_v1_set_keyboard_interactivity(
         l->layer_surface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE);
     zwlr_layer_surface_v1_add_listener(l->layer_surface, &layer_surface_listener, l);
