@@ -837,7 +837,9 @@ static float layout_clock(dc_bar *bar, float x0, bool draw)
 
     char time_str[16];
     char date_str[32];
-    strftime(time_str, sizeof(time_str), cfg->clock_24h ? "%H:%M" : "%-I:%M %p", &tm);
+    const char *time_fmt = cfg->clock_24h ? (cfg->show_seconds ? "%H:%M:%S" : "%H:%M")
+                                           : (cfg->show_seconds ? "%-I:%M:%S %p" : "%-I:%M %p");
+    strftime(time_str, sizeof(time_str), time_fmt, &tm);
     strftime(date_str, sizeof(date_str), "%a %-d", &tm); /* e.g. "Wed 1" */
 
     nvgFontFaceId(vg, bar->render->font_ui);
@@ -1875,6 +1877,32 @@ dc_bar *dc_bar_create(dc_wayland *wl, dc_output *output, dc_egl *egl, dc_render 
 
     dc_info("bar created on output %s", output->model ? output->model : "?");
     return bar;
+}
+
+void dc_bar_reconfigure(dc_bar *bar)
+{
+    if (!bar->layer_surface)
+        return;
+    const dc_config *cfg = dc_config_current;
+    dc_bar_geometry geo = bar_compute_geometry(cfg);
+    bar->logical_height = geo.window_height > 0 ? geo.window_height : DC_BAR_HEIGHT_FALLBACK;
+
+    uint32_t edge_anchor = (cfg->bar_position == DC_BAR_POSITION_TOP)
+                               ? ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP
+                               : ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM;
+    zwlr_layer_surface_v1_set_anchor(bar->layer_surface,
+                                     edge_anchor | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+                                         ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+    zwlr_layer_surface_v1_set_size(bar->layer_surface, 0, (uint32_t)bar->logical_height);
+    zwlr_layer_surface_v1_set_exclusive_zone(bar->layer_surface, bar->logical_height);
+    wl_surface_commit(bar->surface);
+
+    /* If the height is unchanged the compositor won't send a new configure, so
+     * refresh the content rect + repaint directly; if it did change, the
+     * configure ack will do it again harmlessly. */
+    recompute_physical(bar);
+    recompute_content_rect(bar);
+    dc_bar_render(bar);
 }
 
 struct wl_surface *dc_bar_surface(dc_bar *bar)

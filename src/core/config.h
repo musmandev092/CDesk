@@ -26,6 +26,7 @@ typedef struct dc_config {
     char theme_id[DC_CONFIG_THEME_MAX];   /* built-in palette id, e.g. "green" */
     bool clock_24h;                       /* 24-hour vs 12-hour clock */
     bool show_date;                       /* show the date next to the clock */
+    bool show_seconds;                    /* show seconds in the clock */
     bool animations_enabled;              /* master switch for panel animations */
     float animation_speed;                /* duration multiplier (0.25..4.0; 1 = DMS) */
     bool dynamic_color;                   /* derive the palette from the wallpaper */
@@ -68,5 +69,12 @@ void dc_config_load(void);
 dc_config *dc_config_mut(void);
 void dc_config_reapply(void);
 void dc_config_save(void);
+
+/* Register a callback invoked by dc_config_notify_changed(). The settings UI
+ * calls dc_config_notify_changed() after mutating fields that affect other
+ * live surfaces (bar geometry, widget lists); main.c registers a callback that
+ * reconfigures + redraws the bars. */
+void dc_config_set_change_cb(void (*cb)(void *ud), void *ud);
+void dc_config_notify_changed(void);
 
 #endif /* DC_CORE_CONFIG_H */

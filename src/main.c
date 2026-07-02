@@ -64,6 +64,16 @@ static void render_all(struct bar_set *set)
         dc_bar_render(set->bars[i]);
 }
 
+/* dc_config change hook (registered below): the settings UI mutates bar
+ * geometry / widget lists, so re-apply each bar's layer-surface geometry and
+ * repaint. */
+static void bars_config_changed(void *ud)
+{
+    struct bar_set *set = ud;
+    for (int i = 0; i < set->count; i++)
+        dc_bar_reconfigure(set->bars[i]);
+}
+
 struct tick_ctx {
     struct bar_set *set;
     dc_osd *osd;
@@ -143,6 +153,7 @@ struct kbd_ctx {
     dc_launcher *launcher;
     dc_clip_picker *clip_picker;
     dc_lock *lock;
+    dc_settings *settings;
 };
 
 static void handle_key(uint32_t keysym, const char *utf8, void *data)
@@ -150,6 +161,8 @@ static void handle_key(uint32_t keysym, const char *utf8, void *data)
     struct kbd_ctx *k = data;
     if (dc_lock_active(k->lock)) /* lock takes all input while engaged */
         dc_lock_handle_key(k->lock, keysym, utf8);
+    else if (dc_settings_wants_keyboard(k->settings))
+        dc_settings_handle_key(k->settings, keysym, utf8);
     else if (dc_clip_picker_visible(k->clip_picker))
         dc_clip_picker_handle_key(k->clip_picker, keysym, utf8);
     else
@@ -368,6 +381,7 @@ struct axis_ctx {
     struct bar_set *set;
     dc_notif_center *notif_center;
     dc_clip_picker *clip_picker;
+    dc_settings *settings;
 };
 
 /* Scroll on a bar surface: vertical wheel -> workspace focus, horizontal ->
@@ -395,6 +409,10 @@ static void handle_bar_axis(struct wl_surface *surface, int steps_v, int steps_h
     if (dc_clip_picker_visible(actx->clip_picker) &&
         surface == dc_clip_picker_surface(actx->clip_picker)) {
         dc_clip_picker_handle_scroll(actx->clip_picker, steps_v);
+        return;
+    }
+    if (dc_settings_visible(actx->settings) && surface == dc_settings_surface(actx->settings)) {
+        dc_settings_handle_scroll(actx->settings, steps_v);
         return;
     }
 
@@ -507,8 +525,10 @@ int main(int argc, char **argv)
     dc_clip_picker *clip_picker = dc_clip_picker_create(wl, &egl, &render, clipboard);
     dc_settings *settings = dc_settings_create(wl, &egl, &render);
 
-    struct kbd_ctx kbd = {.launcher = launcher, .clip_picker = clip_picker, .lock = lock};
+    struct kbd_ctx kbd = {
+        .launcher = launcher, .clip_picker = clip_picker, .lock = lock, .settings = settings};
     dc_wayland_set_key_cb(wl, handle_key, &kbd);
+    dc_config_set_change_cb(bars_config_changed, &set);
 
     struct click_ctx cctx = {.set = &set,
                              .control_center = control_center,
@@ -521,7 +541,8 @@ int main(int argc, char **argv)
     dc_wayland_set_click_cb(wl, handle_bar_click, &cctx);
     dc_wayland_set_motion_cb(wl, handle_bar_motion, &set);
     dc_wayland_set_leave_cb(wl, handle_bar_leave, &set);
-    struct axis_ctx actx = {.set = &set, .notif_center = notif_center, .clip_picker = clip_picker};
+    struct axis_ctx actx = {
+        .set = &set, .notif_center = notif_center, .clip_picker = clip_picker, .settings = settings};
     dc_wayland_set_axis_cb(wl, handle_bar_axis, &actx);
 
     struct control_ctx control_ctx = {.wl = wl,

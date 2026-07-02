@@ -42,6 +42,11 @@ void dc_bar_set_notifications(dc_bar *bar, struct dc_notifications *notification
  * the surface has been configured. */
 void dc_bar_render(dc_bar *bar);
 
+/* Re-apply config-driven geometry (position / thickness / spacing) to the
+ * layer surface and request a redraw. Call after the config changes at runtime
+ * (e.g. from the settings UI). */
+void dc_bar_reconfigure(dc_bar *bar);
+
 /* The bar's wl_surface (for matching pointer events). */
 struct wl_surface *dc_bar_surface(dc_bar *bar);
 
