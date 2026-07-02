@@ -38,13 +38,17 @@ niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
   gallium threads for the display fd. Now uses thread-safe prepare_read/read_events + a wall-clock loop
   tick. See memory `dankc-wayland-dispatch-deadlock`.
 - **Footprint:** RSS ≈ **145 MB** for two GPU bars incl. Mesa (Pss lower), vs DMS `qs` ≈ 477 MB.
-- **dankctl** (T25): control socket + `dankc ctl <cmd>` (launcher/control-center/notifications/quit) +
-  `dankc keybinds` niri snippet. **Dynamic color** (T24): theme/dynamic.cpp derives a palette from the
-  wallpaper (config dynamicColor + wallpaper). **Build/packaging**: meson.build (T28) + packaging/ (T30).
-- **Remaining:** T27 settings GUI (not started); T16 tray, T23 clipboard/screenshot/night, T17 logind
-  (BLOCKED to verify here — no tray app / wl-clipboard / grim / gamma proto); T22 lock (DEFERRED — PAM
-  lockout risk on live session); T29 plugins (deferred by design). Polish: workspace-pill + toast per-card
-  animation (need bar/per-card frame driving).
+- **dankctl** (T25): control socket + `dankc ctl launcher|control-center|notifications|clipboard|
+  screenshot|quit` + `dankc keybinds` (Mod+D/N/Shift+C/V, Print). **Dynamic color** (T24):
+  theme/dynamic.cpp from wallpaper (config dynamicColor+wallpaper). **Clipboard** (T23): wlr-data-control
+  history + picker (bar icon / Mod+V). **Screenshot** (T23): grim via `ctl screenshot` / Print.
+  **Build**: meson.build (T28, verified) + packaging/ (T30).
+- **Remaining:** T27 settings GUI (not started, large; config is file-driven). BLOCKED on tooling: T23
+  region-shot/color-picker (need `slurp`), T23 night mode (need gamma proto/gammastep), T16 tray (need a
+  tray app to verify). DEFERRED: T22 lock (PAM lockout risk — do with user awake), T29 plugins (by design),
+  T17 logind (plumbing). Polish: workspace-pill + per-card toast animation (need bar/per-card frame drive).
+- **Whole UI visually verified via grim** (2026-07-02): bar, launcher, control center, clipboard picker all
+  match DMS. Screenshots in the session scratchpad.
 - Vendored: nanovg (GLES3, `third_party/nanovg`), cJSON (`third_party/cjson`); Inter bundled
   (`assets/fonts/InterVariable.ttf`).
 

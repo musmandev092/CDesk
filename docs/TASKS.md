@@ -96,9 +96,13 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
   stubs (see memory dankc-wl-listener-stubs). TODO later: math/calc/actions, recent apps, mouse hover.
 - [ ] **T22 Lock screen** — DEFERRED (safety): needs PAM auth; testing means locking the live session with
   unverified code (lockout risk). Do when the user is awake.
-- [ ] **T23 clipboard / screenshot / color-picker / night** — BLOCKED to verify on this host: no
-  `wl-clipboard` (clipboard), no `grim`/screencopy tooling (screenshot/color-picker), and no wlr-gamma
-  protocol available (night mode); night mode is also intrusive to toggle on a live session. Deferred.
+- [~] **T23 clipboard / screenshot / color-picker / night** — PARTIAL:
+  - **Clipboard** ✅ DONE — wlr-data-control capture + 32-entry history + picker overlay (type-filter,
+    Enter/click copies back via wl-copy), bar clipboard icon + `dankc ctl clipboard`. Verified w/ shots.
+  - **Screenshot** ✅ DONE — `dankc ctl screenshot` (grim -> ~/Pictures + clipboard), Print keybind.
+  - **Region shot + color-picker** ⛔ need `slurp` (not installed) for interactive region selection.
+  - **Night mode** ⛔ needs wlr-gamma-control (absent) or gammastep/wlsunset (not installed); also intrusive
+    to toggle on a live session. Deferred.
 
 ## Later
 - [x] **T26 config engine (cJSON)** — DONE: ~/.config/dankc/config.json (theme/clock24h/showDate/
