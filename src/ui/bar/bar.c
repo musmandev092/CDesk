@@ -62,6 +62,9 @@ struct dc_bar {
     char icon_app_id[64];
     int icon_image; /* nanovg image handle, 0 = none */
 
+    /* Center x of the notification-bell icon (dynamic; for hit-testing). */
+    float notif_cx;
+
     int logical_width;  /* from the layer-surface configure */
     int logical_height;
     int scale120; /* fractional scale numerator (120 == 1.0x) */
@@ -413,6 +416,7 @@ static void draw_right_cluster(dc_bar *bar)
     x = draw_battery(bar, x - 4.0f) - 10.0f;
 
     dc_render_icon(bar->render, DC_ICON_NOTIFICATIONS, x, cy, isize, t->surface_text, align);
+    bar->notif_cx = x - isize / 2.0f; /* right-aligned icon spans [x-isize, x] */
     x -= step;
     dc_render_icon(bar->render, DC_ICON_CONTENT_PASTE, x, cy, isize, t->surface_text, align);
     x -= step;
@@ -571,6 +575,9 @@ dc_bar_region dc_bar_hittest(dc_bar *bar, double x, double y)
     DC_UNUSED(y);
     if (x < 44.0)
         return DC_BAR_REGION_LAUNCHER;
+    /* Notification bell (checked before the broader control-center cluster). */
+    if (bar->notif_cx > 0.0f && x >= bar->notif_cx - 14.0 && x <= bar->notif_cx + 14.0)
+        return DC_BAR_REGION_NOTIFICATIONS;
     if (x > bar->logical_width - 210.0)
         return DC_BAR_REGION_CONTROL_CENTER;
     if (x > bar->logical_width / 2.0 - 70.0 && x < bar->logical_width / 2.0 + 70.0)

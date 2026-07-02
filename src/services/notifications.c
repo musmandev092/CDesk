@@ -22,6 +22,8 @@
 #define DC_NOTIF_REASON_DISMISSED 2
 #define DC_NOTIF_REASON_CLOSED 3
 
+#define DC_NOTIF_HISTORY 64
+
 struct dc_notifications {
     sd_bus *bus;
     sd_bus_slot *slot;
@@ -29,7 +31,26 @@ struct dc_notifications {
     uint32_t next_id;
     dc_notif_changed_cb changed_cb;
     void *changed_data;
+
+    dc_notification history[DC_NOTIF_HISTORY]; /* ring buffer, oldest at head */
+    int history_count;
+    int history_head;
 };
+
+/* Copy a notification into the history ring, evicting the oldest when full. */
+static void push_history(dc_notifications *n, const dc_notification *item)
+{
+    int idx;
+    if (n->history_count < DC_NOTIF_HISTORY) {
+        idx = (n->history_head + n->history_count) % DC_NOTIF_HISTORY;
+        n->history_count++;
+    } else {
+        idx = n->history_head;
+        n->history_head = (n->history_head + 1) % DC_NOTIF_HISTORY;
+    }
+    n->history[idx] = *item;
+    n->history[idx].popup = false;
+}
 
 static int64_t now_ms(void)
 {
@@ -128,8 +149,10 @@ static int method_notify(sd_bus_message *msg, void *userdata, sd_bus_error *err)
 
     uint32_t id = replaces_id != 0 ? replaces_id : ++n->next_id;
     dc_notification *slot = acquire_slot(n, replaces_id);
-    if (slot->active && slot->id != id)
+    if (slot->active && slot->id != id) {
+        push_history(n, slot); /* evicted a different live notification */
         emit_closed(n, slot->id, DC_NOTIF_REASON_CLOSED);
+    }
 
     memset(slot, 0, sizeof(*slot));
     slot->id = id;
@@ -161,6 +184,7 @@ static int method_close(sd_bus_message *msg, void *userdata, sd_bus_error *err)
 
     dc_notification *slot = find_by_id(n, id);
     if (slot) {
+        push_history(n, slot);
         slot->active = false;
         emit_closed(n, id, DC_NOTIF_REASON_CLOSED);
         notify_changed(n);
@@ -270,8 +294,9 @@ bool dc_notifications_tick(dc_notifications *n)
             continue;
         int life = lifetime_ms(item);
         if (life > 0 && t - item->created_ms >= life) {
+            push_history(n, item);
             item->popup = false;
-            item->active = false; /* no history store yet — drop it */
+            item->active = false;
             emit_closed(n, item->id, DC_NOTIF_REASON_EXPIRED);
             changed = true;
         }
@@ -313,8 +338,36 @@ void dc_notifications_dismiss(dc_notifications *n, uint32_t id)
     dc_notification *slot = find_by_id(n, id);
     if (!slot)
         return;
+    push_history(n, slot);
     slot->popup = false;
     slot->active = false;
     emit_closed(n, id, DC_NOTIF_REASON_DISMISSED);
+    notify_changed(n);
+}
+
+int dc_notifications_history(dc_notifications *n, const dc_notification **out, int max)
+{
+    if (!n || max <= 0)
+        return 0;
+    int count = 0;
+    /* Newest first: walk the ring backwards from the most recent entry. */
+    for (int i = n->history_count - 1; i >= 0 && count < max; i--) {
+        int idx = (n->history_head + i) % DC_NOTIF_HISTORY;
+        out[count++] = &n->history[idx];
+    }
+    return count;
+}
+
+int dc_notifications_history_count(dc_notifications *n)
+{
+    return n ? n->history_count : 0;
+}
+
+void dc_notifications_clear_history(dc_notifications *n)
+{
+    if (!n)
+        return;
+    n->history_count = 0;
+    n->history_head = 0;
     notify_changed(n);
 }

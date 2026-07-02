@@ -57,6 +57,16 @@ bool dc_notifications_tick(dc_notifications *n);
  * Writes pointers into `out` and returns the count. */
 int dc_notifications_popups(dc_notifications *n, const dc_notification **out, int max);
 
+/* Enumerate stored history (dismissed/expired notifications), newest first, up
+ * to `max`. Writes pointers into `out` and returns the count. */
+int dc_notifications_history(dc_notifications *n, const dc_notification **out, int max);
+
+/* Number of stored history entries. */
+int dc_notifications_history_count(dc_notifications *n);
+
+/* Clear all history entries. */
+void dc_notifications_clear_history(dc_notifications *n);
+
 /* Programmatically dismiss a toast (e.g. user click). Emits NotificationClosed. */
 void dc_notifications_dismiss(dc_notifications *n, uint32_t id);
 

@@ -19,6 +19,7 @@
 #include "ui/bar/bar.h"
 #include "ui/controlcenter.h"
 #include "ui/launcher.h"
+#include "ui/notifcenter.h"
 #include "ui/osd.h"
 #include "ui/toasts.h"
 #include "wayland/egl.h"
@@ -92,10 +93,18 @@ static void niri_changed(void *data)
     render_all(data);
 }
 
-/* Notification server signalled a change: rebuild the toast stack. */
+/* The two notification views fed by the server's changed-callback. */
+struct notif_ui {
+    dc_toasts *toasts;
+    dc_notif_center *center;
+};
+
+/* Notification server signalled a change: rebuild the toasts + center. */
 static void notifications_changed(void *data)
 {
-    dc_toasts_refresh(data);
+    struct notif_ui *ui = data;
+    dc_toasts_refresh(ui->toasts);
+    dc_notif_center_refresh(ui->center);
 }
 
 struct click_ctx {
@@ -103,6 +112,7 @@ struct click_ctx {
     dc_control_center *control_center;
     dc_toasts *toasts;
     dc_launcher *launcher;
+    dc_notif_center *notif_center;
 };
 
 /* Keyboard input routed to the launcher (the only keyboard-grabbing surface). */
@@ -131,17 +141,29 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
         return;
     }
 
+    if (dc_notif_center_visible(ctx->notif_center) &&
+        surface == dc_notif_center_surface(ctx->notif_center)) {
+        dc_notif_center_handle_click(ctx->notif_center, x, y);
+        return;
+    }
+
     for (int i = 0; i < ctx->set->count; i++) {
         dc_bar *bar = ctx->set->bars[i];
         if (dc_bar_surface(bar) != surface)
             continue;
         dc_bar_region region = dc_bar_hittest(bar, x, y);
-        if (region == DC_BAR_REGION_LAUNCHER)
+        if (region == DC_BAR_REGION_LAUNCHER) {
             dc_launcher_toggle(ctx->launcher, dc_bar_output(bar));
-        else if (region == DC_BAR_REGION_CONTROL_CENTER)
+        } else if (region == DC_BAR_REGION_NOTIFICATIONS) {
+            dc_notif_center_toggle(ctx->notif_center, dc_bar_output(bar));
+        } else if (region == DC_BAR_REGION_CONTROL_CENTER) {
             dc_control_center_toggle(cc, dc_bar_output(bar));
-        else if (dc_control_center_visible(cc))
-            dc_control_center_hide(cc);
+        } else {
+            if (dc_control_center_visible(cc))
+                dc_control_center_hide(cc);
+            if (dc_notif_center_visible(ctx->notif_center))
+                dc_notif_center_hide(ctx->notif_center);
+        }
         return;
     }
 }
@@ -190,7 +212,9 @@ int main(void)
         break;
     }
     dc_toasts *toasts = dc_toasts_create(wl, &egl, &render, notifications, first_output);
-    dc_notifications_set_changed_cb(notifications, notifications_changed, toasts);
+    dc_notif_center *notif_center = dc_notif_center_create(wl, &egl, &render, notifications);
+    struct notif_ui notif_ui = {.toasts = toasts, .center = notif_center};
+    dc_notifications_set_changed_cb(notifications, notifications_changed, &notif_ui);
 
     dc_launcher *launcher = dc_launcher_create(wl, &egl, &render);
     dc_wayland_set_key_cb(wl, handle_key, launcher);
@@ -198,7 +222,8 @@ int main(void)
     struct click_ctx cctx = {.set = &set,
                              .control_center = control_center,
                              .toasts = toasts,
-                             .launcher = launcher};
+                             .launcher = launcher,
+                             .notif_center = notif_center};
     struct tick_ctx tick = {.set = &set, .osd = osd, .wl = wl, .notifications = notifications};
 
     g_loop = dc_loop_create();
@@ -234,12 +259,20 @@ dc_osd_integrate(osd, g_loop);
         }
         dc_launcher_toggle(launcher, first);
     }
+    if (getenv("DANKC_NC_DEMO")) {
+        dc_output *first = NULL;
+        wl_list_for_each(first, &wl->outputs, link) {
+            break;
+        }
+        dc_notif_center_toggle(notif_center, first);
+    }
 
     dc_info("entering event loop (%d bar%s)", set.count, set.count == 1 ? "" : "s");
     dc_loop_run(g_loop);
 
     dc_info("shutting down");
     dc_launcher_destroy(launcher);
+    dc_notif_center_destroy(notif_center);
     dc_toasts_destroy(toasts);
     dc_notifications_destroy(notifications);
     dc_osd_destroy(osd);
