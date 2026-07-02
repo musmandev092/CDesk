@@ -26,6 +26,7 @@
 #include "ui/battery_popout.h"
 #include "ui/clip_picker.h"
 #include "ui/controlcenter.h"
+#include "ui/dashboard.h"
 #include "ui/launcher.h"
 #include "ui/lock.h"
 #include "ui/notifcenter.h"
@@ -83,6 +84,7 @@ struct tick_ctx {
     dc_notifications *notifications;
     dc_lock *lock;
     dc_processes *processes;
+    dc_dashboard *dashboard;
     int last_volume;
     bool last_muted;
     bool have_last;
@@ -101,6 +103,7 @@ static void clock_tick(void *data)
     dc_sysmon_poll_processes();
     dc_processes_refresh(ctx->processes);
     render_all(ctx->set);
+    dc_dashboard_refresh(ctx->dashboard); /* keep clock/meters/media live while open */
 
     dc_audio_info audio;
     if (dc_audio_read(&audio) && audio.available) {
@@ -148,6 +151,7 @@ struct click_ctx {
     dc_clip_picker *clip_picker;
     dc_processes *processes;
     dc_settings *settings;
+    dc_dashboard *dashboard;
     dc_notifications *notifications;
 };
 
@@ -191,6 +195,7 @@ struct control_ctx {
     dc_clip_picker *clip_picker;
     dc_processes *processes;
     dc_settings *settings;
+    dc_dashboard *dashboard;
     dc_lock *lock;
     dc_notifications *notifications;
 };
@@ -202,6 +207,19 @@ static struct dc_output *first_output(struct dc_wayland *wl)
         return o;
     }
     return NULL;
+}
+
+/* Dashboard Settings-tab action: open the existing settings panel (the
+ * dashboard closes itself first). */
+struct dash_settings_ctx {
+    dc_settings *settings;
+    struct dc_wayland *wl;
+};
+
+static void dashboard_open_settings(void *user)
+{
+    struct dash_settings_ctx *c = user;
+    dc_settings_toggle(c->settings, first_output(c->wl));
 }
 
 /* Run a shell command detached (children auto-reaped via SIGCHLD SIG_IGN). */
@@ -240,6 +258,14 @@ static void control_dispatch(const char *cmd, void *data)
         dc_processes_toggle(c->processes, out, DC_PROCESSES_SORT_MEM);
     else if (strcmp(cmd, "settings") == 0 || strcmp(cmd, "settings toggle") == 0)
         dc_settings_toggle(c->settings, out);
+    else if (strcmp(cmd, "dashboard") == 0 || strcmp(cmd, "dashboard toggle") == 0)
+        dc_dashboard_toggle(c->dashboard, out, DC_DASH_OVERVIEW);
+    else if (strcmp(cmd, "dashboard media") == 0)
+        dc_dashboard_toggle(c->dashboard, out, DC_DASH_MEDIA);
+    else if (strcmp(cmd, "dashboard weather") == 0)
+        dc_dashboard_toggle(c->dashboard, out, DC_DASH_WEATHER);
+    else if (strcmp(cmd, "dashboard wallpapers") == 0)
+        dc_dashboard_toggle(c->dashboard, out, DC_DASH_WALLPAPERS);
     else if (strcmp(cmd, "lock") == 0)
         dc_lock_engage(c->lock);
     else if (strcmp(cmd, "unlock") == 0 && getenv("DANKC_LOCK_ESCAPE"))
@@ -345,6 +371,11 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
         return;
     }
 
+    if (dc_dashboard_visible(ctx->dashboard) && surface == dc_dashboard_surface(ctx->dashboard)) {
+        dc_dashboard_handle_click(ctx->dashboard, x, y);
+        return;
+    }
+
     for (int i = 0; i < ctx->set->count; i++) {
         dc_bar *bar = ctx->set->bars[i];
         if (dc_bar_surface(bar) != surface)
@@ -375,6 +406,12 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
             dc_processes_toggle(ctx->processes, dc_bar_output(bar), DC_PROCESSES_SORT_CPU);
         } else if (region == DC_BAR_REGION_MEM) {
             dc_processes_toggle(ctx->processes, dc_bar_output(bar), DC_PROCESSES_SORT_MEM);
+        } else if (region == DC_BAR_REGION_DASHBOARD) {
+            dc_dashboard_toggle(ctx->dashboard, dc_bar_output(bar), DC_DASH_OVERVIEW);
+        } else if (region == DC_BAR_REGION_MEDIA_BODY) {
+            dc_dashboard_toggle(ctx->dashboard, dc_bar_output(bar), DC_DASH_MEDIA);
+        } else if (region == DC_BAR_REGION_WEATHER) {
+            dc_dashboard_toggle(ctx->dashboard, dc_bar_output(bar), DC_DASH_WEATHER);
         } else {
             if (dc_control_center_visible(cc))
                 dc_control_center_hide(cc);
@@ -384,6 +421,8 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
                 dc_notif_center_hide(ctx->notif_center);
             if (dc_processes_visible(ctx->processes))
                 dc_processes_hide(ctx->processes);
+            if (dc_dashboard_visible(ctx->dashboard))
+                dc_dashboard_hide(ctx->dashboard);
         }
         return;
     }
@@ -642,6 +681,10 @@ int main(int argc, char **argv)
     dc_clipboard *clipboard = dc_clipboard_create(wl, g_loop);
     dc_clip_picker *clip_picker = dc_clip_picker_create(wl, &egl, &render, clipboard);
     dc_settings *settings = dc_settings_create(wl, &egl, &render);
+    dc_dashboard *dashboard = dc_dashboard_create(wl, &egl, &render);
+    struct dash_settings_ctx dash_settings = {.settings = settings, .wl = wl};
+    dc_dashboard_set_settings_cb(dashboard, dashboard_open_settings, &dash_settings);
+    tick.dashboard = dashboard;
 
     struct kbd_ctx kbd = {
         .launcher = launcher,
@@ -661,6 +704,7 @@ int main(int argc, char **argv)
                              .clip_picker = clip_picker,
                              .processes = processes,
                              .settings = settings,
+                             .dashboard = dashboard,
                              .notifications = notifications};
     dc_wayland_set_click_cb(wl, handle_bar_click, &cctx);
     dc_wayland_set_motion_cb(wl, handle_bar_motion, &cctx);
@@ -682,6 +726,7 @@ int main(int argc, char **argv)
                                       .clip_picker = clip_picker,
                                       .processes = processes,
                                       .settings = settings,
+                                      .dashboard = dashboard,
                                       .lock = lock,
                                       .notifications = notifications};
     dc_control *control = dc_control_create(g_loop, control_dispatch, &control_ctx);
@@ -710,6 +755,22 @@ int main(int argc, char **argv)
         }
         dc_launcher_toggle(launcher, first);
     }
+    if (getenv("DANKC_DASH_DEMO")) {
+        dc_output *first = NULL;
+        wl_list_for_each(first, &wl->outputs, link) {
+            break;
+        }
+        /* DANKC_DASH_DEMO=overview|media|weather|wallpapers picks the tab. */
+        const char *which = getenv("DANKC_DASH_DEMO");
+        dc_dash_tab tab = DC_DASH_OVERVIEW;
+        if (which && strcmp(which, "media") == 0)
+            tab = DC_DASH_MEDIA;
+        else if (which && strcmp(which, "weather") == 0)
+            tab = DC_DASH_WEATHER;
+        else if (which && strcmp(which, "wallpapers") == 0)
+            tab = DC_DASH_WALLPAPERS;
+        dc_dashboard_toggle(dashboard, first, tab);
+    }
     if (getenv("DANKC_NC_DEMO")) {
         dc_output *first = NULL;
         wl_list_for_each(first, &wl->outputs, link) {
@@ -730,6 +791,7 @@ int main(int argc, char **argv)
     dc_logind_destroy(logind);
     dc_tray_destroy(tray);
     dc_lock_destroy(lock);
+    dc_dashboard_destroy(dashboard);
     dc_settings_destroy(settings);
     dc_clip_picker_destroy(clip_picker);
     dc_processes_destroy(processes);

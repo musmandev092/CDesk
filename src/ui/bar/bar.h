@@ -70,6 +70,11 @@ typedef enum {
      * Processes popout), pre-sorted by the metric that was clicked. */
     DC_BAR_REGION_CPU,
     DC_BAR_REGION_MEM,
+    /* Dashboard popout (docs/13-POPOUTS-SPEC.md sec.5): clock chip -> Overview,
+     * media chip body -> Media tab, weather chip -> Weather tab. */
+    DC_BAR_REGION_DASHBOARD,
+    DC_BAR_REGION_MEDIA_BODY,
+    DC_BAR_REGION_WEATHER,
 } dc_bar_region;
 
 /* Which region a surface-local logical coordinate falls in, from the last

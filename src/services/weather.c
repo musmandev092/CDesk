@@ -18,7 +18,7 @@
 #define DC_WEATHER_REFRESH_SEC (15 * 60)
 #define DC_WEATHER_RETRY_SEC (2 * 60)
 #define DC_WEATHER_FETCH_TIMEOUT_SEC 10 /* guards against a hung curl */
-#define DC_WEATHER_BUF_CAP 4096
+#define DC_WEATHER_BUF_CAP 8192          /* daily block + current extras */
 
 static struct {
     bool configured;
@@ -87,10 +87,73 @@ static bool parse_response(void)
         const cJSON *code = cJSON_GetObjectItemCaseSensitive(current, "weather_code");
         const cJSON *is_day = cJSON_GetObjectItemCaseSensitive(current, "is_day");
         if (cJSON_IsNumber(temp) && cJSON_IsNumber(code)) {
-            g_weather.cache.temp_c = (int)lround(temp->valuedouble);
-            g_weather.cache.weather_code = code->valueint;
-            g_weather.cache.is_day = cJSON_IsNumber(is_day) ? is_day->valueint != 0 : true;
-            g_weather.cache.valid = true;
+            dc_weather_state st = {0};
+            st.temp_c = (int)lround(temp->valuedouble);
+            st.weather_code = code->valueint;
+            st.is_day = cJSON_IsNumber(is_day) ? is_day->valueint != 0 : true;
+            st.valid = true;
+
+            /* Extended current conditions (docs/13-POPOUTS-SPEC.md sec.5). Any
+             * subset may be absent on a limited response; only mark
+             * have_current_extra once at least the "feels like" landed. */
+            const cJSON *feels = cJSON_GetObjectItemCaseSensitive(current, "apparent_temperature");
+            const cJSON *hum = cJSON_GetObjectItemCaseSensitive(current, "relative_humidity_2m");
+            const cJSON *wind = cJSON_GetObjectItemCaseSensitive(current, "wind_speed_10m");
+            const cJSON *press = cJSON_GetObjectItemCaseSensitive(current, "surface_pressure");
+            const cJSON *precip =
+                cJSON_GetObjectItemCaseSensitive(current, "precipitation_probability");
+            if (cJSON_IsNumber(feels)) {
+                st.feels_like = (int)lround(feels->valuedouble);
+                st.have_current_extra = true;
+            } else {
+                st.feels_like = st.temp_c;
+            }
+            if (cJSON_IsNumber(hum))
+                st.humidity = (int)lround(hum->valuedouble);
+            if (cJSON_IsNumber(wind))
+                st.wind_kmh = (int)lround(wind->valuedouble);
+            if (cJSON_IsNumber(press))
+                st.pressure_hpa = (int)lround(press->valuedouble);
+            if (cJSON_IsNumber(precip))
+                st.precip_prob = (int)lround(precip->valuedouble);
+
+            /* 7-day daily forecast: parallel arrays keyed by index. */
+            const cJSON *daily = cJSON_GetObjectItemCaseSensitive(root, "daily");
+            if (cJSON_IsObject(daily)) {
+                const cJSON *dcode = cJSON_GetObjectItemCaseSensitive(daily, "weather_code");
+                const cJSON *dmax = cJSON_GetObjectItemCaseSensitive(daily, "temperature_2m_max");
+                const cJSON *dmin = cJSON_GetObjectItemCaseSensitive(daily, "temperature_2m_min");
+                const cJSON *sunrise = cJSON_GetObjectItemCaseSensitive(daily, "sunrise");
+                const cJSON *sunset = cJSON_GetObjectItemCaseSensitive(daily, "sunset");
+                int n = cJSON_IsArray(dmax) ? cJSON_GetArraySize(dmax) : 0;
+                if (n > 7)
+                    n = 7;
+                for (int i = 0; i < n; i++) {
+                    dc_weather_daily *d = &st.daily[i];
+                    const cJSON *c = cJSON_GetArrayItem(dcode, i);
+                    const cJSON *mx = cJSON_GetArrayItem(dmax, i);
+                    const cJSON *mn = cJSON_GetArrayItem(dmin, i);
+                    const cJSON *sr = cJSON_GetArrayItem(sunrise, i);
+                    const cJSON *ss = cJSON_GetArrayItem(sunset, i);
+                    d->weather_code = cJSON_IsNumber(c) ? c->valueint : 0;
+                    d->temp_max = cJSON_IsNumber(mx) ? (int)lround(mx->valuedouble) : 0;
+                    d->temp_min = cJSON_IsNumber(mn) ? (int)lround(mn->valuedouble) : 0;
+                    /* ISO "2026-07-02T05:29" -> take the "HH:MM" after 'T'. */
+                    if (cJSON_IsString(sr) && sr->valuestring) {
+                        const char *t = strchr(sr->valuestring, 'T');
+                        if (t)
+                            snprintf(d->sunrise, sizeof(d->sunrise), "%.5s", t + 1);
+                    }
+                    if (cJSON_IsString(ss) && ss->valuestring) {
+                        const char *t = strchr(ss->valuestring, 'T');
+                        if (t)
+                            snprintf(d->sunset, sizeof(d->sunset), "%.5s", t + 1);
+                    }
+                    st.daily_count = i + 1;
+                }
+            }
+
+            g_weather.cache = st;
             g_weather.have_cache = true;
             ok = true;
         }
@@ -167,10 +230,13 @@ static void drain_fetch(void)
 
 static void start_fetch(void)
 {
-    char url[320];
+    char url[512];
     snprintf(url, sizeof(url),
               "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
-              "&current=temperature_2m,weather_code,is_day&temperature_unit=%s",
+              "&current=temperature_2m,weather_code,is_day,apparent_temperature,"
+              "relative_humidity_2m,wind_speed_10m,surface_pressure,precipitation_probability"
+              "&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset"
+              "&forecast_days=7&timezone=auto&temperature_unit=%s",
               g_weather.lat, g_weather.lon, g_weather.fahrenheit ? "fahrenheit" : "celsius");
 
     int fds[2];
@@ -270,6 +336,68 @@ const char *dc_weather_icon_name(int wmo_code, bool is_day)
         return "thunderstorm";
     default:
         return "cloud";
+    }
+}
+
+/* WMO code -> short condition text, matching DMS WeatherService's descriptions
+ * (docs/13-POPOUTS-SPEC.md sec.5). */
+const char *dc_weather_condition_name(int wmo_code)
+{
+    switch (wmo_code) {
+    case 0:
+        return "Clear Sky";
+    case 1:
+        return "Mainly Clear";
+    case 2:
+        return "Partly Cloudy";
+    case 3:
+        return "Overcast";
+    case 45:
+        return "Fog";
+    case 48:
+        return "Rime Fog";
+    case 51:
+        return "Light Drizzle";
+    case 53:
+        return "Drizzle";
+    case 55:
+        return "Heavy Drizzle";
+    case 56:
+    case 57:
+        return "Freezing Drizzle";
+    case 61:
+        return "Light Rain";
+    case 63:
+        return "Rain";
+    case 65:
+        return "Heavy Rain";
+    case 66:
+    case 67:
+        return "Freezing Rain";
+    case 71:
+        return "Light Snow";
+    case 73:
+        return "Snow";
+    case 75:
+        return "Heavy Snow";
+    case 77:
+        return "Snow Grains";
+    case 80:
+        return "Light Showers";
+    case 81:
+        return "Showers";
+    case 82:
+        return "Heavy Showers";
+    case 85:
+    case 86:
+        return "Snow Showers";
+    case 95:
+        return "Thunderstorm";
+    case 96:
+    case 99:
+        return "Thunderstorm";
+    default:
+        return "Unknown";
     }
 }
 

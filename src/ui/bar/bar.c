@@ -999,6 +999,11 @@ static float layout_media(dc_bar *bar, float x0, bool draw)
     x += btn_sm;
 
     if (draw) {
+        /* Body (icon + title/artist, left of the transport) opens the Media tab
+         * of the dashboard (docs/13-POPOUTS-SPEC.md sec.5); pushed first so the
+         * three transport rects below win where they overlap (last-drawn-wins,
+         * see bar_find_hit()). */
+        bar_push_hit(bar, x0, prev_x0, DC_BAR_REGION_MEDIA_BODY, 0);
         bar_push_hit(bar, prev_x0, prev_x0 + btn_sm, DC_BAR_REGION_MEDIA_PREV, 0);
         bar_push_hit(bar, play_x0, play_x0 + btn_play, DC_BAR_REGION_MEDIA_PLAY, 0);
         bar_push_hit(bar, next_x0, next_x0 + btn_sm, DC_BAR_REGION_MEDIA_NEXT, 0);
@@ -1431,8 +1436,8 @@ static const dc_bar_widget_def *find_widget(const char *id)
         {"focusedWindow", measure_focused_window, draw_focused_window_pill, true, false,
          DC_BAR_REGION_NONE},
         {"music", measure_media, draw_media_pill, true, true, DC_BAR_REGION_NONE},
-        {"clock", measure_clock, draw_clock_pill, true, false, DC_BAR_REGION_CLOCK},
-        {"weather", measure_weather, draw_weather_pill, true, false, DC_BAR_REGION_NONE},
+        {"clock", measure_clock, draw_clock_pill, true, false, DC_BAR_REGION_DASHBOARD},
+        {"weather", measure_weather, draw_weather_pill, true, false, DC_BAR_REGION_WEATHER},
         {"systemTray", measure_tray, draw_tray_pill, false, true, DC_BAR_REGION_NONE},
         {"clipboard", measure_clipboard, draw_clipboard_pill, true, false,
          DC_BAR_REGION_CLIPBOARD},

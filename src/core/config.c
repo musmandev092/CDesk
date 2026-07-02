@@ -34,6 +34,7 @@ static dc_config config = {
     .weather_lat = 40.7128,
     .weather_lon = -74.0060,
     .weather_fahrenheit = false,
+    .weather_location = "New York",
 
     /* User's live DMS layout (docs/12-BAR-SPEC.md sec.0). */
     .bar_left_widgets = {"launcherButton", "workspaceSwitcher", "focusedWindow"},
@@ -247,6 +248,7 @@ void dc_config_load(void)
     get_double(root, "weatherLat", &config.weather_lat, -90.0, 90.0);
     get_double(root, "weatherLon", &config.weather_lon, -180.0, 180.0);
     get_bool(root, "weatherFahrenheit", &config.weather_fahrenheit);
+    get_string(root, "weatherLocation", config.weather_location, sizeof(config.weather_location));
 
     get_string_array(root, "barLeftWidgets", config.bar_left_widgets, DC_CONFIG_WIDGETS_MAX,
                      &config.bar_left_widgets_n);

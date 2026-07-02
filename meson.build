@@ -77,6 +77,7 @@ src = files(
   'src/ui/popout.c', 'src/ui/hover.c',
   'src/ui/controlcenter.c', 'src/ui/battery_popout.c', 'src/ui/osd.c', 'src/ui/toasts.c',
   'src/ui/launcher.c', 'src/ui/notifcenter.c', 'src/ui/clip_picker.c', 'src/ui/settings.c',
+  'src/ui/dashboard.c',
   'src/ui/lock.c', 'src/ui/processes.c',
   'src/services/battery.c', 'src/services/audio.c', 'src/services/net.c',
   'src/services/dbus.c', 'src/services/bluez.c', 'src/services/mpris.c',

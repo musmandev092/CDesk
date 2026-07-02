@@ -57,6 +57,8 @@ static struct {
     dc_sysmon_proc top[DC_SYSMON_PROC_MAX];
     int top_count;
     int scan_total;
+
+    int temp_c; /* -1 until a sensor is read */
 } g_sysmon;
 
 static long secs_since(const struct timespec *from, const struct timespec *now)
@@ -159,6 +161,86 @@ static void update_mem_percent(void)
             : 0;
 }
 
+/* Read one millidegree-Celsius integer from `path` into `*out_c` (whole °C).
+ * Returns true on success. */
+static bool read_millideg(const char *path, int *out_c)
+{
+    FILE *file = fopen(path, "r");
+    if (!file)
+        return false;
+    long milli = 0;
+    bool ok = fscanf(file, "%ld", &milli) == 1;
+    fclose(file);
+    if (!ok || milli <= 0)
+        return false;
+    *out_c = (int)((milli + 500) / 1000);
+    return true;
+}
+
+/* CPU package temperature. Prefer a /sys/class/thermal zone whose `type`
+ * mentions the CPU package (x86_pkg_temp / cpu / coretemp / k10temp), else the
+ * first readable zone, else a hwmon tempN_input. -1 if nothing is readable.
+ * No allocation, mirrors the other /sys readers here. */
+static void update_temp_c(void)
+{
+    int best = -1;
+    int fallback = -1;
+
+    DIR *dir = opendir("/sys/class/thermal");
+    if (dir) {
+        struct dirent *ent;
+        char path[320], type[64];
+        while ((ent = readdir(dir))) {
+            if (strncmp(ent->d_name, "thermal_zone", 12) != 0)
+                continue;
+            int val;
+            snprintf(path, sizeof(path), "/sys/class/thermal/%s/temp", ent->d_name);
+            if (!read_millideg(path, &val))
+                continue;
+            if (fallback < 0)
+                fallback = val;
+
+            snprintf(path, sizeof(path), "/sys/class/thermal/%s/type", ent->d_name);
+            FILE *tf = fopen(path, "r");
+            if (tf) {
+                if (fgets(type, sizeof(type), tf)) {
+                    if (strstr(type, "x86_pkg_temp") || strstr(type, "coretemp") ||
+                        strstr(type, "k10temp") || strstr(type, "cpu") || strstr(type, "CPU")) {
+                        best = val;
+                    }
+                }
+                fclose(tf);
+            }
+            if (best >= 0)
+                break;
+        }
+        closedir(dir);
+    }
+
+    int result = best >= 0 ? best : fallback;
+    if (result < 0) {
+        /* hwmon fallback: first hwmonN/temp1_input we can read. */
+        DIR *hd = opendir("/sys/class/hwmon");
+        if (hd) {
+            struct dirent *ent;
+            char path[320];
+            while ((ent = readdir(hd))) {
+                if (ent->d_name[0] == '.')
+                    continue;
+                int val;
+                snprintf(path, sizeof(path), "/sys/class/hwmon/%s/temp1_input", ent->d_name);
+                if (read_millideg(path, &val)) {
+                    result = val;
+                    break;
+                }
+            }
+            closedir(hd);
+        }
+    }
+
+    g_sysmon.temp_c = result;
+}
+
 void dc_sysmon_poll(void)
 {
     struct timespec now;
@@ -170,6 +252,7 @@ void dc_sysmon_poll(void)
 
     update_cpu_percent();
     update_mem_percent();
+    update_temp_c();
 
     g_sysmon.last_poll = now;
     g_sysmon.polled_once = true;
@@ -448,6 +531,11 @@ int dc_sysmon_processes(dc_sysmon_proc *out, int max)
 int dc_sysmon_process_total(void)
 {
     return g_sysmon.scan_total;
+}
+
+int dc_sysmon_temp_c(void)
+{
+    return g_sysmon.polled_once ? g_sysmon.temp_c : -1;
 }
 
 #ifdef DC_SERVICE_TEST

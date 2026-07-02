@@ -93,6 +93,25 @@
  * .codepoints file maps "delete_sweep" to. */
 #define DC_ICON_DELETE_SWEEP 0xe16c
 
+/* Dashboard popout ("DankDash", docs/13-POPOUTS-SPEC.md sec.5). Tab-bar icons
+ * (dashboard/music_note/wallpaper/wb_sunny/settings), Overview cards
+ * (schedule/device_thermostat), Weather stats grid (humidity_low/air/speed/
+ * rainy/wb_twilight/bedtime) and calendar chevrons. All values from DMS's
+ * MaterialSymbolsRounded[...].codepoints (the full variable font dankc now
+ * bundles). */
+#define DC_ICON_DASHBOARD 0xe871
+#define DC_ICON_WALLPAPER 0xe1bc
+#define DC_ICON_WB_SUNNY 0xe430
+#define DC_ICON_SCHEDULE 0xefd6
+#define DC_ICON_DEVICE_THERMOSTAT 0xe1ff
+#define DC_ICON_HUMIDITY_LOW 0xf164
+#define DC_ICON_AIR 0xefd8
+#define DC_ICON_SPEED 0xe9e4
+#define DC_ICON_WB_TWILIGHT 0xe1c6
+#define DC_ICON_BEDTIME 0xf159 /* moon glyph; doubles as the sunset icon */
+#define DC_ICON_FOLDER 0xe2c7
+#define DC_ICON_CHEVRON_LEFT 0xe5cb
+
 /* Clipboard History popout (docs/13-POPOUTS-SPEC.md sec.4, ClipboardHeader.qml
  * / ClipboardEntry.qml / ClipboardThumbnail.qml). All values taken from DMS's
  * own MaterialSymbolsRounded .codepoints file (the same font dankc bundles)
@@ -105,10 +124,9 @@
 #define DC_ICON_IMAGE 0xe3f4        /* image-entry fallback glyph (thumbnail decode failure) */
 
 /* Processes popout (docs/13-POPOUTS-SPEC.md; ProcessListPopout.qml /
- * ProcessesView.qml). Values taken from DMS's own MaterialSymbolsRounded
- * .codepoints file and confirmed present in the bundled TTF's cmap. */
+ * ProcessesView.qml). SCHEDULE (uptime glyph) is defined in the dashboard
+ * block above. */
 #define DC_ICON_ANALYTICS 0xef3e /* header "Processes" icon */
-#define DC_ICON_SCHEDULE 0xefd6  /* uptime clock glyph in the distro info row */
 
 /* Launcher (docs/13-POPOUTS-SPEC.md sec.6): section-header view-mode toggles
  * and footer source-filter pills. Values taken from DMS's own MaterialSymbols
@@ -116,7 +134,7 @@
 #define DC_ICON_VIEW_LIST 0xe8ef   /* list view (default, fully implemented) */
 #define DC_ICON_GRID_VIEW 0xe9b0   /* grid view */
 #define DC_ICON_VIEW_MODULE 0xe8f0 /* compact view (TODO, dim/disabled) */
-#define DC_ICON_FOLDER 0xe2c7      /* footer "Files" pill (TODO, dim/disabled) */
+/* FOLDER (footer "Files" pill) is defined in the dashboard block above. */
 #define DC_ICON_EXTENSION 0xe87b   /* footer "Plugins" pill (TODO, dim/disabled) */
 
 #endif /* DC_RENDER_ICONS_H */
