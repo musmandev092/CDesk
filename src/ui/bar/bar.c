@@ -533,16 +533,31 @@ static unsigned bar_next_utf8(const unsigned char *s, int *out_len)
     return cp;
 }
 
-/* Strip codepoints neither the UI font nor its non-Latin fallback can render
- * before building any display string (docs/12-BAR-SPEC.md sec.8:
- * focusedWindow + music titles need "no more tofu") — plus, as before,
- * supplementary-plane codepoints (emoji and friends, >= U+10000; dankc has
- * no emoji glyphs to offer regardless of font coverage), variation selectors
- * (U+FE00-U+FE0F), and private-use-area codepoints (U+E000-U+F8FF, which
- * includes the Material Symbols block itself, in case a stray one ends up in
- * a window/track title). A run of one or more consecutive dropped
- * codepoints collapses into a single "…" (U+2026) instead of vanishing
- * silently or leaving disconnected fragments.
+/* True for codepoints that are *invisible* text machinery — dropped silently
+ * (no "…" collapse marker; they never had visible width): C0/C1 control
+ * chars, zero-width space/joiners (U+200B-U+200D; emoji ZWJ sequences thus
+ * decompose into their component emoji, the best a shaping-less renderer can
+ * do), BOM/ZWNBSP (U+FEFF), and variation selectors (U+FE00-U+FE0F,
+ * U+E0100-U+E01EF — e.g. the VS16 riding on U+2764 "❤️", whose base heart
+ * renders fine on its own from the monochrome emoji fallback). */
+static bool bar_cp_invisible(unsigned cp)
+{
+    return cp < 0x20 || cp == 0x7F || (cp >= 0x80 && cp <= 0x9F) ||
+           (cp >= 0x200B && cp <= 0x200D) || cp == 0xFEFF || (cp >= 0xFE00 && cp <= 0xFE0F) ||
+           (cp >= 0xE0100 && cp <= 0xE01EF);
+}
+
+/* Strip codepoints no loaded font can render before building any display
+ * string (docs/12-BAR-SPEC.md sec.8: focusedWindow + music titles need "no
+ * more tofu"). Coverage (dc_render_font_has()) is the union of the UI font
+ * and every fallback nvg.c loaded — CJK, Devanagari, Thai, Cyrillic/Greek,
+ * Arabic, and the vendored monochrome NotoEmoji — over the FULL Unicode
+ * range, so supplementary-plane emoji now render (monochrome outlines; the
+ * old blanket >= U+10000 and private-use bans are gone, replaced by real
+ * coverage checks). A run of one or more consecutive dropped codepoints
+ * collapses into a single "…" (U+2026) instead of vanishing silently or
+ * leaving disconnected fragments; invisible formatting codepoints (see
+ * bar_cp_invisible()) are removed without leaving a marker.
  *
  * Builds into a bounded local buffer first, then copies into `out` — an
  * ellipsis can make a dropped run GROW instead of shrink, which would break
@@ -564,13 +579,12 @@ static void bar_sanitize_utf8(const char *in, char *out, size_t out_sz)
     while (*s) {
         int len;
         unsigned cp = bar_next_utf8(s, &len);
-        if (cp == BAR_UTF8_INVALID) {
+        if (cp == BAR_UTF8_INVALID || bar_cp_invisible(cp)) {
             s += len;
             continue;
         }
 
-        bool banned = cp >= 0x10000 || (cp >= 0xFE00 && cp <= 0xFE0F) ||
-                     (cp >= 0xE000 && cp <= 0xF8FF) || !dc_render_font_has(cp);
+        bool banned = !dc_render_font_has(cp);
         if (banned) {
             if (!dropping && oi + 3 < cap) {
                 memcpy(tmp + oi, "\xe2\x80\xa6", 3);

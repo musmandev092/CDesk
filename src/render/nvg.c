@@ -33,23 +33,36 @@ static const char *const ICON_FONT_CANDIDATES[] = {
 /* --- TTF/OTF cmap coverage (docs/12-BAR-SPEC.md: no-tofu for non-Latin text)
  *
  * A minimal, read-only cmap parser: given a font file, build a bitmap of
- * which BMP codepoints (U+0000-U+FFFF) it has a glyph for. dankc never tries
- * to render above the BMP (bar_sanitize_utf8() drops those before consulting
- * this), so the bitmap doesn't bother tracking supplementary planes. Only
- * format 4 (BMP segment mapping) and format 12 (full-Unicode groups) are
- * understood — the two subtable formats every font we've seen (Inter,
- * DejaVu Sans, Noto Sans Arabic, ...) actually ships. Anything else is
- * silently skipped, leaving that font's coverage bitmap all-zero and
- * `valid = false` (fail-open at the call site, see cov_get()). */
-#define COV_BYTES 8192 /* 65536 codepoints / 8 bits */
+ * which codepoints (full Unicode, U+0000-U+10FFFF — supplementary planes
+ * included, so emoji coverage from the vendored monochrome NotoEmoji is
+ * tracked too) it has a glyph for. Only format 4 (BMP segment mapping) and
+ * format 12 (full-Unicode groups) are understood — the two subtable formats
+ * every font we've seen (Inter, DejaVu Sans, Noto Sans *, Noto Emoji, ...)
+ * actually ships. Anything else is silently skipped, leaving that font's
+ * coverage bitmap all-zero and `valid = false`.
+ *
+ * TrueType Collections (.ttc, e.g. Noto Sans CJK) are supported by reading
+ * the first font's table directory — matching fontstash/stb_truetype, which
+ * only ever loads collection index 0 through nvgCreateFont().
+ *
+ * Per-font bitmaps are heap-allocated transiently at startup and OR-ed into
+ * one static union bitmap (g_cov, 136 KiB): dc_render_font_has() only ever
+ * needs "does ANY loaded font cover this codepoint". */
+#define COV_MAX_CP 0x110000u
+#define COV_BYTES (COV_MAX_CP / 8) /* 136 KiB */
 
 typedef struct {
     unsigned char bits[COV_BYTES];
     bool valid;
 } font_coverage;
 
-static font_coverage g_cov_ui;
-static font_coverage g_cov_fallback;
+/* Union of every successfully parsed loaded font. `ui_valid` records whether
+ * the primary UI font's cmap parsed: if it didn't, dc_render_font_has() fails
+ * open (an unparsable bundled font shouldn't make every character vanish). */
+static struct {
+    unsigned char bits[COV_BYTES];
+    bool ui_valid;
+} g_cov;
 
 static uint16_t be16(const unsigned char *p)
 {
@@ -63,22 +76,23 @@ static uint32_t be32(const unsigned char *p)
 
 static void cov_set(font_coverage *cov, uint32_t cp)
 {
-    if (cp > 0xFFFF)
+    if (cp >= COV_MAX_CP)
         return;
     cov->bits[cp >> 3] |= (unsigned char)(1u << (cp & 7));
 }
 
-/* `fail_open`: what to return when this coverage set was never successfully
- * parsed (cov->valid == false) — true for the primary UI font (an unparsable
- * bundled font shouldn't make every character disappear), false for the
- * optional fallback font (no fallback loaded just means "not covered"). */
-static bool cov_get(const font_coverage *cov, uint32_t cp, bool fail_open)
+static bool cov_get(const font_coverage *cov, uint32_t cp)
 {
-    if (!cov->valid)
-        return fail_open;
-    if (cp > 0xFFFF)
+    if (cp >= COV_MAX_CP)
         return false;
     return (cov->bits[cp >> 3] >> (cp & 7)) & 1u;
+}
+
+/* OR a successfully parsed per-font bitmap into the global union. */
+static void cov_merge(const font_coverage *cov)
+{
+    for (size_t i = 0; i < COV_BYTES; i++)
+        g_cov.bits[i] |= cov->bits[i];
 }
 
 /* cmap format 4: BMP-only segmented mapping (see the OpenType spec's `cmap`
@@ -138,18 +152,20 @@ static void parse_cmap_format12(const unsigned char *sub, size_t avail, font_cov
             break;
         uint32_t start = be32(g);
         uint32_t end = be32(g + 4);
-        if (start > 0xFFFF)
+        if (start >= COV_MAX_CP)
             continue;
-        if (end > 0xFFFF)
-            end = 0xFFFF;
+        if (end >= COV_MAX_CP)
+            end = COV_MAX_CP - 1;
         for (uint32_t cp = start; cp <= end; cp++)
             cov_set(cov, cp);
     }
 }
 
 /* Read `path`'s sfnt table directory, find the best available Unicode cmap
- * subtable (format 12 preferred over format 4), and fill `cov`. Best-effort:
- * `cov->valid` stays false on any I/O or parse problem. */
+ * subtable (format 12 preferred over format 4), and fill `cov`. For .ttc
+ * collections, the FIRST font's table directory is used (see the coverage
+ * block comment above — fontstash only loads collection index 0). Best-
+ * effort: `cov->valid` stays false on any I/O or parse problem. */
 static void load_cmap(const char *path, font_coverage *cov)
 {
     memset(cov, 0, sizeof(*cov));
@@ -160,7 +176,7 @@ static void load_cmap(const char *path, font_coverage *cov)
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (sz < 12 || sz > (16 << 20)) {
+    if (sz < 16 || sz > (64L << 20)) { /* Noto Sans CJK .ttc is ~20 MB */
         fclose(f);
         return;
     }
@@ -173,10 +189,19 @@ static void load_cmap(const char *path, font_coverage *cov)
     }
 
     size_t n = (size_t)sz;
-    uint16_t num_tables = be16(data + 4);
+    /* TrueType Collection: hop to the first member font's table directory. */
+    size_t dir = 0;
+    if (memcmp(data, "ttcf", 4) == 0) {
+        uint32_t first = be32(data + 12); /* offsetTable[0] */
+        if ((size_t)first + 12 > n)
+            goto out;
+        dir = first;
+    }
+
+    uint16_t num_tables = be16(data + dir + 4);
     uint32_t cmap_off = 0;
-    for (uint16_t i = 0; i < num_tables && 12u + (uint32_t)i * 16u + 16u <= n; i++) {
-        const unsigned char *rec = data + 12 + i * 16;
+    for (uint16_t i = 0; i < num_tables && dir + 12u + (uint32_t)i * 16u + 16u <= n; i++) {
+        const unsigned char *rec = data + dir + 12 + i * 16;
         if (memcmp(rec, "cmap", 4) == 0) {
             cmap_off = be32(rec + 8);
             break;
@@ -218,38 +243,144 @@ out:
     free(data);
 }
 
-/* fontconfig lookup for a fallback family covering Arabic script (the user's
- * language — Urdu shares the Arabic block). Linked at build time (see
- * meson.build/Makefile); FcInit()/FcFini() bracket a single one-shot query at
- * startup, not held open for the process lifetime. Rendering is unshaped
- * (letters stay in isolated form rather than joining) since dankc has no
- * text-shaping engine — still far better than a tofu box. Returns a
- * heap-allocated path (caller frees) or NULL if fontconfig found nothing. */
-static char *find_fallback_font_path(void)
+/* --- fallback font chain (docs/12-BAR-SPEC.md: no-tofu for non-Latin text)
+ *
+ * fontconfig-located script fallbacks, chained after Inter via
+ * nvgAddFallbackFontId() so they're ONLY consulted for glyphs the UI font
+ * lacks. Rendering is unshaped (Arabic letters stay in isolated form,
+ * Devanagari conjuncts don't form) since dankc has no text-shaping engine —
+ * still far better than a tofu box.
+ *
+ * Each pattern carries a probe codepoint: if the matched file's cmap lacks
+ * it, the match is rejected (guards against fontconfig handing back a file
+ * whose collection index 0 — the only face stb_truetype reads — doesn't
+ * actually cover the script) and `retry_path` is tried instead, if set.
+ *
+ * Emoji come from the vendored monochrome NotoEmoji (assets/fonts/) — the
+ * distro noto-fonts-emoji is COLOR (CBDT bitmaps, no outlines), which
+ * stb_truetype cannot rasterise, so emoji intentionally render MONOCHROME.
+ * Variation selectors/ZWJ are stripped by bar_sanitize_utf8(), so ZWJ
+ * sequences decompose into their component emoji. */
+typedef struct {
+    const char *pattern;    /* fontconfig pattern, or NULL: `retry_path` only */
+    uint32_t probe;         /* codepoint the matched font must cover; 0 = any */
+    const char *retry_path; /* literal fallback path if the fc match fails */
+} fallback_spec;
+
+static const fallback_spec FALLBACK_SPECS[] = {
+    {"sans", 0x0410, NULL},          /* general: Cyrillic/Greek/... (Noto Sans) */
+    {"sans:lang=ar", 0x0627, NULL},  /* Arabic/Urdu (existing behavior) */
+    {":lang=zh-cn", 0x4F60, "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"},
+    {":lang=ja", 0x3053, "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"},
+    {":lang=ko", 0xC548, "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"},
+    {":lang=hi", 0x0928, NULL},      /* Devanagari */
+    {":lang=th", 0x0E2A, NULL},      /* Thai */
+};
+
+/* Vendored monochrome emoji font, appended after the fontconfig chain. */
+static const char *const EMOJI_FONT_CANDIDATES[] = {
+    "assets/fonts/NotoEmoji-Regular.ttf",
+    "/usr/share/dankc/fonts/NotoEmoji-Regular.ttf",
+};
+
+#define DC_MAX_FALLBACK_FONTS DC_RENDER_MAX_FALLBACKS
+
+/* One fc-match query. Caller brackets with FcInit()/FcFini(). Returns a
+ * heap-allocated file path (caller frees) or NULL. */
+static char *fc_match_path(const char *pattern)
 {
-    if (!FcInit()) {
-        dc_warn("fontconfig init failed; no non-Latin fallback font");
-        return NULL;
-    }
-
     char *result = NULL;
-    FcPattern *pat = FcNameParse((const FcChar8 *)"sans:lang=ar");
-    if (pat) {
-        FcConfigSubstitute(NULL, pat, FcMatchPattern);
-        FcDefaultSubstitute(pat);
-        FcResult fc_result;
-        FcPattern *match = FcFontMatch(NULL, pat, &fc_result);
-        if (match) {
-            FcChar8 *file = NULL;
-            if (FcPatternGetString(match, FC_FILE, 0, &file) == FcResultMatch && file)
-                result = strdup((const char *)file);
-            FcPatternDestroy(match);
-        }
-        FcPatternDestroy(pat);
+    FcPattern *pat = FcNameParse((const FcChar8 *)pattern);
+    if (!pat)
+        return NULL;
+    FcConfigSubstitute(NULL, pat, FcMatchPattern);
+    FcDefaultSubstitute(pat);
+    FcResult fc_result;
+    FcPattern *match = FcFontMatch(NULL, pat, &fc_result);
+    if (match) {
+        FcChar8 *file = NULL;
+        if (FcPatternGetString(match, FC_FILE, 0, &file) == FcResultMatch && file)
+            result = strdup((const char *)file);
+        FcPatternDestroy(match);
+    }
+    FcPatternDestroy(pat);
+    return result;
+}
+
+/* Load `path` as one more fallback of the UI font, unless it's already
+ * loaded (dedupe — zh-cn/ja/ko usually all resolve to the same CJK .ttc),
+ * fails the `probe` coverage check, or the chain is full. On success its
+ * cmap coverage is merged into g_cov. `loaded`/`n_loaded` is the dedupe list
+ * of paths accepted so far (borrowed pointers, owned by the caller). */
+static bool add_fallback_font(dc_render *render, const char *path, uint32_t probe,
+                              char loaded[][256], int *n_loaded)
+{
+    if (!path || render->font_fallback_count >= DC_MAX_FALLBACK_FONTS)
+        return false;
+    for (int i = 0; i < *n_loaded; i++)
+        if (strcmp(loaded[i], path) == 0)
+            return true; /* already in the chain; nothing to do */
+    if (*n_loaded >= DC_MAX_FALLBACK_FONTS)
+        return false;
+
+    font_coverage *cov = malloc(sizeof(*cov));
+    if (!cov)
+        return false;
+    load_cmap(path, cov);
+    if (!cov->valid || (probe && !cov_get(cov, probe))) {
+        if (cov->valid)
+            dc_warn("fallback font %s lacks probe glyph U+%04X; skipped", path, probe);
+        free(cov);
+        return false;
     }
 
-    FcFini();
-    return result;
+    int fb = nvgCreateFont(render->vg, path, path); /* name just needs uniqueness */
+    if (fb < 0 || !nvgAddFallbackFontId(render->vg, render->font_ui, fb)) {
+        dc_warn("could not load fallback font %s", path);
+        free(cov);
+        return false;
+    }
+
+    cov_merge(cov);
+    free(cov);
+    render->font_fallbacks[render->font_fallback_count++] = fb;
+    snprintf(loaded[(*n_loaded)++], 256, "%s", path);
+    dc_info("fallback font %d: %s", render->font_fallback_count, path);
+    return true;
+}
+
+/* Resolve and load the whole fallback chain (script fonts via fontconfig,
+ * then the vendored emoji font). Every step is best-effort: a missing font
+ * just leaves that script uncovered, and bar_sanitize_utf8() collapses it
+ * to "…" instead of tofu. */
+static void load_fallback_fonts(dc_render *render)
+{
+    char loaded[DC_MAX_FALLBACK_FONTS][256];
+    int n_loaded = 0;
+
+    if (!FcInit()) {
+        dc_warn("fontconfig init failed; no non-Latin fallback fonts");
+    } else {
+        for (size_t i = 0; i < sizeof(FALLBACK_SPECS) / sizeof(FALLBACK_SPECS[0]); i++) {
+            const fallback_spec *spec = &FALLBACK_SPECS[i];
+            char *path = fc_match_path(spec->pattern);
+            bool ok = path && add_fallback_font(render, path, spec->probe, loaded, &n_loaded);
+            free(path);
+            if (!ok && spec->retry_path && access(spec->retry_path, R_OK) == 0)
+                add_fallback_font(render, spec->retry_path, spec->probe, loaded, &n_loaded);
+        }
+        FcFini();
+    }
+
+    for (size_t i = 0; i < sizeof(EMOJI_FONT_CANDIDATES) / sizeof(char *); i++) {
+        if (access(EMOJI_FONT_CANDIDATES[i], R_OK) != 0)
+            continue;
+        if (add_fallback_font(render, EMOJI_FONT_CANDIDATES[i], 0x1F600, loaded, &n_loaded))
+            break;
+    }
+
+    if (render->font_fallback_count == 0)
+        dc_warn("no fallback fonts loaded; non-Latin text and emoji will be dropped");
 }
 
 static int load_font(NVGcontext *vg, const char *name, const char *const *candidates, size_t count,
@@ -314,9 +445,18 @@ bool dc_render_ensure(dc_render *render)
         render->vg = NULL;
         return false;
     }
-    if (ui_path)
-        load_cmap(ui_path, &g_cov_ui);
-    if (!g_cov_ui.valid)
+    if (ui_path) {
+        font_coverage *cov = malloc(sizeof(*cov));
+        if (cov) {
+            load_cmap(ui_path, cov);
+            if (cov->valid) {
+                cov_merge(cov);
+                g_cov.ui_valid = true;
+            }
+            free(cov);
+        }
+    }
+    if (!g_cov.ui_valid)
         dc_warn("could not parse UI font cmap; non-Latin coverage check disabled (fail-open)");
 
     render->font_icons = load_font(render->vg, "icons", ICON_FONT_CANDIDATES,
@@ -324,25 +464,12 @@ bool dc_render_ensure(dc_render *render)
     if (render->font_icons < 0)
         dc_warn("Material Symbols icon font not found; icons disabled");
 
-    /* Non-Latin fallback (docs/12-BAR-SPEC.md: no-tofu). Added via
-     * nvgAddFallbackFontId() so it's ONLY consulted for glyphs `font_ui`
+    /* Script + emoji fallbacks (docs/12-BAR-SPEC.md: no-tofu). Added via
+     * nvgAddFallbackFontId() so they're ONLY consulted for glyphs `font_ui`
      * lacks — Inter's own Latin glyphs are always used first, so this can't
      * change how Latin text renders. */
-    render->font_fallback = -1;
-    char *fallback_path = find_fallback_font_path();
-    if (fallback_path) {
-        int fb = nvgCreateFont(render->vg, "fallback", fallback_path);
-        if (fb >= 0 && nvgAddFallbackFontId(render->vg, render->font_ui, fb)) {
-            render->font_fallback = fb;
-            load_cmap(fallback_path, &g_cov_fallback);
-            dc_info("non-Latin fallback font: %s", fallback_path);
-        } else {
-            dc_warn("could not load fallback font %s", fallback_path);
-        }
-        free(fallback_path);
-    } else {
-        dc_warn("fontconfig found no Arabic-covering fallback font; non-Latin text will be dropped");
-    }
+    render->font_fallback_count = 0;
+    load_fallback_fonts(render);
 
     render->ready = true;
     dc_debug("nanovg render context ready");
@@ -351,9 +478,11 @@ bool dc_render_ensure(dc_render *render)
 
 bool dc_render_font_has(uint32_t codepoint)
 {
-    if (cov_get(&g_cov_ui, codepoint, true))
-        return true;
-    return cov_get(&g_cov_fallback, codepoint, false);
+    if (!g_cov.ui_valid)
+        return true; /* fail open: no coverage data to rule anything out */
+    if (codepoint >= COV_MAX_CP)
+        return false;
+    return (g_cov.bits[codepoint >> 3] >> (codepoint & 7)) & 1u;
 }
 
 void dc_render_icon(dc_render *render, int codepoint, float x, float y, float size, dc_color color,
@@ -409,7 +538,6 @@ void dc_render_finish(dc_render *render)
         nvgDeleteGLES3(render->vg);
     render->vg = NULL;
     render->ready = false;
-    render->font_fallback = -1;
-    g_cov_ui.valid = false;
-    g_cov_fallback.valid = false;
+    render->font_fallback_count = 0;
+    memset(&g_cov, 0, sizeof(g_cov));
 }

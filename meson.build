@@ -104,4 +104,5 @@ executable('dankc',
 
 install_data('assets/fonts/InterVariable.ttf',
              'assets/fonts/MaterialSymbolsRounded.ttf',
+             'assets/fonts/NotoEmoji-Regular.ttf',
              install_dir: get_option('datadir') / 'dankc/fonts')
