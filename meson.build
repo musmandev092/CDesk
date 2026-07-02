@@ -75,7 +75,7 @@ src = files(
   'src/render/nvg.c',
   'src/ui/bar/bar.c',
   'src/ui/popout.c',
-  'src/ui/controlcenter.c', 'src/ui/osd.c', 'src/ui/toasts.c',
+  'src/ui/controlcenter.c', 'src/ui/battery_popout.c', 'src/ui/osd.c', 'src/ui/toasts.c',
   'src/ui/launcher.c', 'src/ui/notifcenter.c', 'src/ui/clip_picker.c', 'src/ui/settings.c',
   'src/ui/lock.c',
   'src/services/battery.c', 'src/services/audio.c', 'src/services/net.c',

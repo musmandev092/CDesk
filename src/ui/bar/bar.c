@@ -1438,9 +1438,8 @@ static const dc_bar_widget_def *find_widget(const char *id)
         {"memUsage", measure_mem, draw_mem_pill, true, false, DC_BAR_REGION_NONE},
         {"notificationButton", measure_notif, draw_notif_pill, true, false,
          DC_BAR_REGION_NOTIFICATIONS},
-        /* battery -> control center for now (docs/12-BAR-SPEC.md sec.5: "battery→battery
-         * popout (phase 2: CC)"). */
-        {"battery", measure_battery, draw_battery_pill, true, false, DC_BAR_REGION_CONTROL_CENTER},
+        /* battery -> its own popout (docs/13-POPOUTS-SPEC.md sec.2). */
+        {"battery", measure_battery, draw_battery_pill, true, false, DC_BAR_REGION_BATTERY},
         {"controlCenterButton", measure_cc, draw_cc_pill, true, false, DC_BAR_REGION_CONTROL_CENTER},
     };
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++)
