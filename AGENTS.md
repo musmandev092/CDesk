@@ -43,9 +43,9 @@ niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
   theme/dynamic.cpp from wallpaper (config dynamicColor+wallpaper). **Clipboard** (T23): wlr-data-control
   history + picker (bar icon / Mod+V). **Screenshot** (T23): grim via `ctl screenshot` / Print.
   **Build**: meson.build (T28, verified) + packaging/ (T30).
-- **Remaining:** T27 settings GUI (not started, large; config is file-driven). BLOCKED on tooling: T23
-  region-shot/color-picker (need `slurp`), T23 night mode (need gamma proto/gammastep), T16 tray (need a
-  tray app to verify). DEFERRED: T22 lock (PAM lockout risk — do with user awake), T29 plugins (by design),
+- **T23 fully done**: clipboard, full+region screenshot, color-picker (slurp+grim), night mode (gammastep).
+- **Remaining:** T27 settings GUI (not started, large; config is file-driven). T16 tray (needs a tray app
+  to verify). DEFERRED: T22 lock (PAM lockout risk — do with user awake), T29 plugins (by design),
   T17 logind (plumbing). Polish: workspace-pill + per-card toast animation (need bar/per-card frame drive).
 - **Whole UI visually verified via grim** (2026-07-02): bar, launcher, control center, clipboard picker all
   match DMS. Screenshots in the session scratchpad.
