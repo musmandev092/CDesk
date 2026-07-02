@@ -33,4 +33,11 @@ void dc_launcher_handle_key(dc_launcher *l, uint32_t keysym, const char *utf8);
 /* Click at logical (x, y) on the launcher surface: select+launch a row. */
 void dc_launcher_handle_click(dc_launcher *l, double x, double y);
 
+/* Pointer motion at logical (x, y): moves the selection to the row under the
+ * cursor (docs/13-POPOUTS-SPEC.md sec.6 hover behavior). No-op off the list. */
+void dc_launcher_handle_motion(dc_launcher *l, double x, double y);
+
+/* Wheel scroll over the result list (positive steps_v = scroll down). */
+void dc_launcher_handle_scroll(dc_launcher *l, int steps_v);
+
 #endif /* DC_UI_LAUNCHER_H */

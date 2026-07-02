@@ -58,6 +58,11 @@ static int parse_desktop(const char *path, const char *id, dc_app *app)
 
     char name[DC_APP_NAME] = {0};
     char exec[DC_APP_EXEC] = {0};
+    /* Comment= wins over GenericName= (e.g. "Access the Internet" vs "Web
+     * Browser"), matching the reference launcher's row descriptions
+     * (docs/13-POPOUTS-SPEC.md sec.6). Both are optional. */
+    char comment[DC_APP_DESC] = {0};
+    char generic[DC_APP_DESC] = {0};
     int is_application = 1; /* assume Application unless Type says otherwise */
     int hidden = 0;
     int in_entry = 0;
@@ -80,6 +85,10 @@ static int parse_desktop(const char *path, const char *id, dc_app *app)
             snprintf(name, sizeof(name), "%.*s", DC_APP_NAME - 1, line + 5);
         } else if (strncmp(line, "Exec=", 5) == 0 && !exec[0]) {
             clean_exec(exec, sizeof(exec), line + 5);
+        } else if (strncmp(line, "Comment=", 8) == 0 && !comment[0]) {
+            snprintf(comment, sizeof(comment), "%.*s", DC_APP_DESC - 1, line + 8);
+        } else if (strncmp(line, "GenericName=", 12) == 0 && !generic[0]) {
+            snprintf(generic, sizeof(generic), "%.*s", DC_APP_DESC - 1, line + 12);
         } else if (strncmp(line, "Type=", 5) == 0) {
             is_application = strcmp(line + 5, "Application") == 0;
         } else if (strncmp(line, "NoDisplay=", 10) == 0) {
@@ -96,6 +105,7 @@ static int parse_desktop(const char *path, const char *id, dc_app *app)
     snprintf(app->name, sizeof(app->name), "%s", name);
     snprintf(app->exec, sizeof(app->exec), "%s", exec);
     snprintf(app->id, sizeof(app->id), "%s", id);
+    snprintf(app->desc, sizeof(app->desc), "%s", comment[0] ? comment : generic);
     app->score = 0;
     return 1;
 }

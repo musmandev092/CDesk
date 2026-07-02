@@ -377,20 +377,20 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
 }
 
 /* Pointer motion over any DankC surface: forward to whichever one it's over
- * — the bar's own per-pixel hover tracking (docs/12-BAR-SPEC.md sec.5), or
- * (S7) one of the popouts' own hover/drag tracking (docs/13-POPOUTS-SPEC.md).
- * Each target internally re-renders only when its hovered id actually
- * changes (or, for control center's slider drag, on every motion while
- * armed) -- this dispatch itself never redraws anything. Launcher/settings
- * are intentionally not wired here (owned by other tasks); a miss is a
- * silent no-op, same as before this surface list grew. wl.c's motion_cb
- * already fires generically for wl->pointer_surface regardless of which
- * surface that is (see pointer_handle_motion/_enter), so nothing there
- * needed to change for this — only this dispatch grew a few more surfaces
- * to check, mirroring handle_bar_axis's existing per-surface pattern below. */
+ * — the bar's own per-pixel hover tracking (docs/12-BAR-SPEC.md sec.5), the
+ * launcher's hover-selection (docs/13-POPOUTS-SPEC.md sec.6), or one of the
+ * popouts' own hover/drag tracking (docs/13-POPOUTS-SPEC.md). Each target
+ * internally re-renders only when its hovered id actually changes (or, for
+ * control center's slider drag, on every motion while armed) — this dispatch
+ * itself never redraws anything; a miss is a silent no-op. */
 static void handle_bar_motion(struct wl_surface *surface, double x, double y, void *data)
 {
     struct click_ctx *ctx = data;
+
+    if (dc_launcher_visible(ctx->launcher) && surface == dc_launcher_surface(ctx->launcher)) {
+        dc_launcher_handle_motion(ctx->launcher, x, y);
+        return;
+    }
 
     for (int i = 0; i < ctx->set->count; i++) {
         if (dc_bar_surface(ctx->set->bars[i]) == surface) {
@@ -470,6 +470,7 @@ struct axis_ctx {
     dc_notif_center *notif_center;
     dc_clip_picker *clip_picker;
     dc_processes *processes;
+    dc_launcher *launcher;
 };
 
 /* Scroll on a bar surface: vertical wheel -> workspace focus, horizontal ->
@@ -484,8 +485,8 @@ struct axis_ctx {
  * offsets the active tab's card list instead — the axis routing itself is
  * already generic (see above), so this only needed a surface check + a call
  * into dc_notif_center_handle_scroll(). Same pattern for the clipboard
- * picker's row list (docs/13-POPOUTS-SPEC.md sec.4) and the Processes
- * popout's process table. */
+ * picker's row list (docs/13-POPOUTS-SPEC.md sec.4), the Processes popout's
+ * process table, and the launcher's result list/grid (sec.6). */
 static void handle_bar_axis(struct wl_surface *surface, int steps_v, int steps_h, void *data)
 {
     struct axis_ctx *actx = data;
@@ -502,6 +503,10 @@ static void handle_bar_axis(struct wl_surface *surface, int steps_v, int steps_h
     }
     if (dc_processes_visible(actx->processes) && surface == dc_processes_surface(actx->processes)) {
         dc_processes_handle_scroll(actx->processes, steps_v);
+        return;
+    }
+    if (dc_launcher_visible(actx->launcher) && surface == dc_launcher_surface(actx->launcher)) {
+        dc_launcher_handle_scroll(actx->launcher, steps_v);
         return;
     }
 
@@ -641,7 +646,8 @@ int main(int argc, char **argv)
     struct axis_ctx actx = {.set = &set,
                             .notif_center = notif_center,
                             .clip_picker = clip_picker,
-                            .processes = processes};
+                            .processes = processes,
+                            .launcher = launcher};
     dc_wayland_set_axis_cb(wl, handle_bar_axis, &actx);
 
     struct control_ctx control_ctx = {.wl = wl,
