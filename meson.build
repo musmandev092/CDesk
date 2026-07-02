@@ -21,8 +21,8 @@ egl            = dependency('egl')
 glesv2         = dependency('glesv2')
 xkbcommon      = dependency('xkbcommon')
 libsystemd     = dependency('libsystemd')          # sd-bus (swap for elogind/basu on non-systemd distros)
-wl_protos      = dependency('wayland-protocols')
 m_dep          = cc.find_library('m', required: false)
+# Protocol XML is vendored under protocol/; only wayland-scanner is needed.
 
 deps = [wayland_client, wayland_egl, egl, glesv2, xkbcommon, libsystemd, m_dep]
 
