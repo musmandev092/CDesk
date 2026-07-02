@@ -19,6 +19,7 @@
 
 #include <ctype.h>
 #include <GLES2/gl2.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,11 +30,39 @@
 #include "viewporter-client-protocol.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 
-/* Reference bar height in logical pixels (docs/10-DESIGN-SYSTEM.md). */
-#define DC_BAR_HEIGHT 48
+/* Fallback logical height before the first layer-surface configure lands
+ * (docs/12-BAR-SPEC.md sec.1 overrides this via dc_bar_geometry()). */
+#define DC_BAR_HEIGHT_FALLBACK 48
+
+/* Corner radius of the floating bar rect (docs/12-BAR-SPEC.md sec.1). */
+#define DC_BAR_CORNER_RADIUS 12.0f
 
 /* Fractional-scale numerator base: preferred_scale is reported over 120. */
 #define DC_SCALE_BASE 120
+
+/* Bar container geometry, derived from config (docs/12-BAR-SPEC.md sec.1):
+ *   widgetThickness       = max(20, 26 + innerPadding*0.6)
+ *   effectiveBarThickness = max(widgetThickness + innerPadding + 4,
+ *                                48 - 4 - (8 - innerPadding))
+ *   windowHeight           = effectiveBarThickness + spacing (layer-surface
+ *                             size + exclusive zone; the extra `spacing` px
+ *                             is the transparent gap toward the outer edge)
+ */
+typedef struct {
+    float widget_thickness;
+    float effective_thickness;
+    int window_height;
+} dc_bar_geometry;
+
+static dc_bar_geometry bar_compute_geometry(const dc_config *cfg)
+{
+    float ip = (float)cfg->bar_inner_padding;
+    dc_bar_geometry g;
+    g.widget_thickness = fmaxf(20.0f, 26.0f + ip * 0.6f);
+    g.effective_thickness = fmaxf(g.widget_thickness + ip + 4.0f, 48.0f - 4.0f - (8.0f - ip));
+    g.window_height = (int)lroundf(g.effective_thickness) + cfg->bar_spacing;
+    return g;
+}
 
 /* dc_color -> nanovg color. */
 static inline NVGcolor tc(dc_color c)
@@ -81,6 +110,12 @@ struct dc_bar {
     int phys_width; /* buffer size = logical * scale120 / 120 */
     int phys_height;
 
+    /* The floating bar rect within the (larger, mostly transparent)
+     * layer-surface buffer — see bar_compute_geometry() and
+     * recompute_content_rect(). Widgets draw relative to this rect, not the
+     * full surface. */
+    float rect_x, rect_y, rect_w, rect_h;
+
     bool configured;
     bool egl_ready;
 };
@@ -91,12 +126,50 @@ static void recompute_physical(dc_bar *bar)
     bar->phys_height = (bar->logical_height * bar->scale120 + DC_SCALE_BASE / 2) / DC_SCALE_BASE;
 }
 
+/* Position the floating rect inside the surface: spacing-px gap on the outer
+ * (screen) edge, flush against the inner (desktop-facing) edge, spacing-px
+ * inset from the left/right sides. Call whenever logical size changes. */
+static void recompute_content_rect(dc_bar *bar)
+{
+    const dc_config *cfg = dc_config_current;
+    dc_bar_geometry geo = bar_compute_geometry(cfg);
+    float spacing = (float)cfg->bar_spacing;
+
+    bar->rect_x = spacing;
+    bar->rect_w = (float)bar->logical_width - 2.0f * spacing;
+    bar->rect_h = geo.effective_thickness;
+    bar->rect_y = (cfg->bar_position == DC_BAR_POSITION_TOP) ? spacing : 0.0f;
+}
+
+/* Vertical center of the visible rect (widgets are y-centered in it). */
+static inline float bar_cy(const dc_bar *bar)
+{
+    return bar->rect_y + bar->rect_h / 2.0f;
+}
+
+/* Left/right content edges: spec content inset = max(4, innerPadding*0.8). */
+static inline float bar_content_inset(void)
+{
+    const dc_config *cfg = dc_config_current;
+    return fmaxf(4.0f, (float)cfg->bar_inner_padding * 0.8f);
+}
+
+static inline float bar_content_x0(const dc_bar *bar)
+{
+    return bar->rect_x + bar_content_inset();
+}
+
+static inline float bar_content_x1(const dc_bar *bar)
+{
+    return bar->rect_x + bar->rect_w - bar_content_inset();
+}
+
 /* Apps-grid launcher icon at the far left (like DMS). Returns the x past it. */
 static float draw_launcher(dc_bar *bar)
 {
-    const float pad = 12.0f;
+    const float pad = bar_content_x0(bar) + 12.0f;
     const float size = 22.0f;
-    dc_render_icon(bar->render, DC_ICON_APPS, pad, bar->logical_height / 2.0f, size,
+    dc_render_icon(bar->render, DC_ICON_APPS, pad, bar_cy(bar), size,
                    dc_theme_current->surface_text, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
     return pad + size + 10.0f;
 }
@@ -115,7 +188,7 @@ static float draw_workspaces(dc_bar *bar, float start_x)
 
     NVGcontext *vg = bar->render->vg;
     const dc_theme *t = dc_theme_current;
-    const float cy = bar->logical_height / 2.0f;
+    const float cy = bar_cy(bar);
     const float gap = 8.0f;
     const float dot = 9.0f;         /* inactive workspace dot diameter */
     const float pill_w = 30.0f;     /* focused workspace pill */
@@ -197,7 +270,7 @@ static void draw_focused_window(dc_bar *bar, float start_x)
         return;
 
     NVGcontext *vg = bar->render->vg;
-    const float cy = bar->logical_height / 2.0f;
+    const float cy = bar_cy(bar);
     float x = start_x + 8.0f;
 
     /* Refresh the cached app icon only when the focused app changes. */
@@ -230,7 +303,7 @@ static void draw_focused_window(dc_bar *bar, float start_x)
         return;
 
     nvgSave(vg);
-    nvgScissor(vg, x, 0.0f, avail, bar->logical_height);
+    nvgScissor(vg, x, bar->rect_y, avail, bar->rect_h);
     nvgFontFaceId(vg, bar->render->font_ui);
     nvgFontSize(vg, 14.0f);
     nvgFillColor(vg, tc(dc_theme_current->surface_text));
@@ -246,7 +319,7 @@ static float draw_clock(dc_bar *bar)
 {
     NVGcontext *vg = bar->render->vg;
     const dc_theme *t = dc_theme_current;
-    const float cy = bar->logical_height / 2.0f;
+    const float cy = bar_cy(bar);
 
     time_t now = time(NULL);
     struct tm tm;
@@ -297,7 +370,7 @@ static void draw_media(dc_bar *bar, float right_x)
 
     NVGcontext *vg = bar->render->vg;
     const dc_theme *t = dc_theme_current;
-    const float cy = bar->logical_height / 2.0f;
+    const float cy = bar_cy(bar);
 
     nvgFontFaceId(vg, bar->render->font_ui);
     nvgFontSize(vg, 13.0f);
@@ -310,7 +383,7 @@ static void draw_media(dc_bar *bar, float right_x)
     const float title_x = right_x - title_w;
 
     nvgSave(vg);
-    nvgScissor(vg, title_x, 0.0f, title_w, bar->logical_height);
+    nvgScissor(vg, title_x, bar->rect_y, title_w, bar->rect_h);
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
     nvgFillColor(vg, tc(t->surface_text));
     nvgText(vg, title_x, cy, media.title, NULL);
@@ -330,7 +403,7 @@ static float draw_battery(dc_bar *bar, float right_edge)
 
     NVGcontext *vg = bar->render->vg;
     const dc_theme *t = dc_theme_current;
-    const float cy = bar->logical_height / 2.0f;
+    const float cy = bar_cy(bar);
     const bool low = bat.percent <= 20 && !bat.charging;
 
     const NVGcolor text_color = low ? tc(t->error) : tc(t->surface_text);
@@ -436,13 +509,13 @@ static void draw_tray(dc_bar *bar, float *x, float cy, float isize, float step)
 static void draw_right_cluster(dc_bar *bar)
 {
     const dc_theme *t = dc_theme_current;
-    const float cy = bar->logical_height / 2.0f;
+    const float cy = bar_cy(bar);
     const float pad = 12.0f;
     const float isize = 19.0f;
     const float step = 26.0f;
     const int align = NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE;
 
-    float x = bar->logical_width - pad;
+    float x = bar_content_x1(bar) - pad;
 
     /* Volume — live level + mute state from wpctl. */
     dc_audio_info audio;
@@ -488,6 +561,56 @@ static void draw_right_cluster(dc_bar *bar)
     draw_tray(bar, &x, cy, isize, step);
 }
 
+/* Elevation level-2 shadow under the floating rect: a tight "key" shadow
+ * offset toward the outer screen edge, plus a soft wide "ambient" shadow
+ * (docs/12-BAR-SPEC.md sec.1). Drawn as a box-gradient with the rect punched
+ * out as a hole so it never paints over the (possibly translucent) bg fill. */
+static void draw_bar_shadow(dc_bar *bar)
+{
+    NVGcontext *vg = bar->render->vg;
+    const dc_config *cfg = dc_config_current;
+    const float outer_dir = (cfg->bar_position == DC_BAR_POSITION_TOP) ? -1.0f : 1.0f;
+
+    struct {
+        float blur, offset, alpha;
+    } layers[2] = {
+        {14.0f, 0.0f, 0.125f},        /* ambient */
+        {8.0f, 4.0f * outer_dir, 0.25f}, /* key */
+    };
+
+    for (int i = 0; i < 2; i++) {
+        float blur = layers[i].blur;
+        float oy = bar->rect_y + layers[i].offset;
+        unsigned char a = (unsigned char)(layers[i].alpha * 255.0f);
+
+        NVGpaint paint = nvgBoxGradient(vg, bar->rect_x, oy, bar->rect_w, bar->rect_h,
+                                        DC_BAR_CORNER_RADIUS, blur, nvgRGBA(0, 0, 0, a),
+                                        nvgRGBA(0, 0, 0, 0));
+        nvgBeginPath(vg);
+        nvgRect(vg, bar->rect_x - blur, oy - blur, bar->rect_w + 2.0f * blur,
+               bar->rect_h + 2.0f * blur);
+        nvgRoundedRect(vg, bar->rect_x, bar->rect_y, bar->rect_w, bar->rect_h,
+                       DC_BAR_CORNER_RADIUS);
+        nvgPathWinding(vg, NVG_HOLE);
+        nvgFillPaint(vg, paint);
+        nvgFill(vg);
+    }
+}
+
+/* The floating rounded rect itself: surfaceContainer x barTransparency. */
+static void draw_bar_background(dc_bar *bar)
+{
+    NVGcontext *vg = bar->render->vg;
+    const dc_config *cfg = dc_config_current;
+    dc_color c = dc_theme_current->surface_container;
+    unsigned char a = (unsigned char)((c.a / 255.0f) * cfg->bar_transparency * 255.0f);
+
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, bar->rect_x, bar->rect_y, bar->rect_w, bar->rect_h, DC_BAR_CORNER_RADIUS);
+    nvgFillColor(vg, nvgRGBA(c.r, c.g, c.b, a));
+    nvgFill(vg);
+}
+
 void dc_bar_render(dc_bar *bar)
 {
     if (!bar->configured || bar->phys_width <= 0)
@@ -511,13 +634,16 @@ void dc_bar_render(dc_bar *bar)
     if (bar->viewport)
         wp_viewport_set_destination(bar->viewport, bar->logical_width, bar->logical_height);
 
-    const dc_color bg = dc_theme_current->surface_container;
+    /* Fully transparent clear: the bar is a floating rect, not an
+     * edge-to-edge fill, so most of the buffer must stay see-through. */
     glViewport(0, 0, bar->phys_width, bar->phys_height);
-    glClearColor(bg.r / 255.0f, bg.g / 255.0f, bg.b / 255.0f, 1.0f);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
     float pixel_ratio = (float)bar->scale120 / DC_SCALE_BASE;
     nvgBeginFrame(bar->render->vg, bar->logical_width, bar->logical_height, pixel_ratio);
+    draw_bar_shadow(bar);
+    draw_bar_background(bar);
     float launcher_end = draw_launcher(bar);
     float workspaces_end = draw_workspaces(bar, launcher_end);
     draw_focused_window(bar, workspaces_end);
@@ -560,11 +686,13 @@ static void layer_surface_handle_configure(void *data, struct zwlr_layer_surface
     zwlr_layer_surface_v1_ack_configure(surface, serial);
 
     bar->logical_width = width > 0 ? (int)width : bar->logical_width;
-    bar->logical_height = height > 0 ? (int)height : DC_BAR_HEIGHT;
+    bar->logical_height = height > 0 ? (int)height : bar->logical_height;
     bar->configured = true;
     recompute_physical(bar);
-    dc_debug("bar configured: %dx%d logical (buffer %dx%d) on %s", bar->logical_width,
-             bar->logical_height, bar->phys_width, bar->phys_height,
+    recompute_content_rect(bar);
+    dc_debug("bar configured: %dx%d logical (buffer %dx%d), rect %.0fx%.0f+%.0f+%.0f on %s",
+             bar->logical_width, bar->logical_height, bar->phys_width, bar->phys_height,
+             bar->rect_w, bar->rect_h, bar->rect_x, bar->rect_y,
              bar->output->model ? bar->output->model : "?");
     dc_bar_render(bar);
 }
@@ -586,13 +714,16 @@ static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
 dc_bar *dc_bar_create(dc_wayland *wl, dc_output *output, dc_egl *egl, dc_render *render,
                       dc_niri *niri)
 {
+    const dc_config *cfg = dc_config_current;
+    dc_bar_geometry geo = bar_compute_geometry(cfg);
+
     dc_bar *bar = calloc(1, sizeof(*bar));
     bar->wl = wl;
     bar->output = output;
     bar->egl = egl;
     bar->render = render;
     bar->niri = niri;
-    bar->logical_height = DC_BAR_HEIGHT;
+    bar->logical_height = geo.window_height > 0 ? geo.window_height : DC_BAR_HEIGHT_FALLBACK;
     bar->scale120 = (output->scale > 0 ? output->scale : 1) * DC_SCALE_BASE;
 
     bar->surface = wl_compositor_create_surface(wl->compositor);
@@ -610,12 +741,14 @@ dc_bar *dc_bar_create(dc_wayland *wl, dc_output *output, dc_egl *egl, dc_render 
         wl->layer_shell, bar->surface, output->wl_output, ZWLR_LAYER_SHELL_V1_LAYER_TOP,
         "dankc:bar");
 
+    uint32_t edge_anchor = (cfg->bar_position == DC_BAR_POSITION_TOP)
+                               ? ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP
+                               : ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM;
     zwlr_layer_surface_v1_set_anchor(bar->layer_surface,
-                                     ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-                                         ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+                                     edge_anchor | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
                                          ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
-    zwlr_layer_surface_v1_set_size(bar->layer_surface, 0, DC_BAR_HEIGHT);
-    zwlr_layer_surface_v1_set_exclusive_zone(bar->layer_surface, DC_BAR_HEIGHT);
+    zwlr_layer_surface_v1_set_size(bar->layer_surface, 0, (uint32_t)bar->logical_height);
+    zwlr_layer_surface_v1_set_exclusive_zone(bar->layer_surface, bar->logical_height);
     zwlr_layer_surface_v1_add_listener(bar->layer_surface, &layer_surface_listener, bar);
 
     /* Commit with no buffer to elicit the first configure. */
@@ -642,15 +775,23 @@ void dc_bar_set_tray(dc_bar *bar, struct dc_tray *tray)
 
 dc_bar_region dc_bar_hittest(dc_bar *bar, double x, double y)
 {
-    DC_UNUSED(y);
-    if (x < 44.0)
+    /* The rect no longer fills the whole surface: the spacing-px gap toward
+     * the outer edge (and the 4px side insets) are transparent, so a click
+     * there hits nothing. */
+    if (y < (double)bar->rect_y || y > (double)(bar->rect_y + bar->rect_h))
+        return DC_BAR_REGION_NONE;
+
+    double content_x0 = (double)bar_content_x0(bar);
+    double content_x1 = (double)bar_content_x1(bar);
+
+    if (x < content_x0 + 44.0)
         return DC_BAR_REGION_LAUNCHER;
     /* Notification bell + clipboard (checked before the control-center cluster). */
     if (bar->notif_cx > 0.0f && x >= bar->notif_cx - 14.0 && x <= bar->notif_cx + 14.0)
         return DC_BAR_REGION_NOTIFICATIONS;
     if (bar->clip_cx > 0.0f && x >= bar->clip_cx - 14.0 && x <= bar->clip_cx + 14.0)
         return DC_BAR_REGION_CLIPBOARD;
-    if (x > bar->logical_width - 210.0)
+    if (x > content_x1 - 210.0)
         return DC_BAR_REGION_CONTROL_CENTER;
     if (x > bar->logical_width / 2.0 - 70.0 && x < bar->logical_width / 2.0 + 70.0)
         return DC_BAR_REGION_CLOCK;

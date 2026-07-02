@@ -12,6 +12,11 @@
 #define DC_CONFIG_THEME_MAX 32
 #define DC_CONFIG_PATH_MAX 512
 
+typedef enum {
+    DC_BAR_POSITION_TOP = 0,
+    DC_BAR_POSITION_BOTTOM,
+} dc_bar_position;
+
 typedef struct dc_config {
     char theme_id[DC_CONFIG_THEME_MAX];   /* built-in palette id, e.g. "green" */
     bool clock_24h;                       /* 24-hour vs 12-hour clock */
@@ -20,6 +25,13 @@ typedef struct dc_config {
     float animation_speed;                /* duration multiplier (0.25..4.0; 1 = DMS) */
     bool dynamic_color;                   /* derive the palette from the wallpaper */
     char wallpaper[DC_CONFIG_PATH_MAX];   /* image for dynamic color */
+
+    dc_bar_position bar_position;         /* top or bottom edge */
+    int bar_spacing;                      /* gap between the bar rect and the outer edge/screen sides */
+    int bar_inner_padding;                /* drives the pill/bar-thickness formulas (docs/12-BAR-SPEC.md) */
+    int bar_widget_padding;               /* horizontal padding inside each widget pill */
+    float bar_transparency;               /* 0..1 alpha multiplier for the bar background */
+    float bar_widget_transparency;        /* 0..1 alpha multiplier for widget pill backgrounds */
 } dc_config;
 
 /* The active config. Read-only for the rest of the app. */

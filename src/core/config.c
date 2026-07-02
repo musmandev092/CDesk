@@ -18,6 +18,13 @@ static dc_config config = {
     .show_date = true,
     .animations_enabled = true,
     .animation_speed = 1.0f,
+
+    .bar_position = DC_BAR_POSITION_TOP,
+    .bar_spacing = 4,
+    .bar_inner_padding = 4,
+    .bar_widget_padding = 8,
+    .bar_transparency = 1.0f,
+    .bar_widget_transparency = 1.0f,
 };
 
 const dc_config *dc_config_current = &config;
@@ -66,6 +73,30 @@ static void get_float(const cJSON *root, const char *key, float *out, float lo, 
             v = hi;
         *out = v;
     }
+}
+
+static void get_int(const cJSON *root, const char *key, int *out, int lo, int hi)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (cJSON_IsNumber(item)) {
+        int v = item->valueint;
+        if (v < lo)
+            v = lo;
+        if (v > hi)
+            v = hi;
+        *out = v;
+    }
+}
+
+static void get_bar_position(const cJSON *root, const char *key, dc_bar_position *out)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!cJSON_IsString(item) || !item->valuestring)
+        return;
+    if (strcmp(item->valuestring, "bottom") == 0)
+        *out = DC_BAR_POSITION_BOTTOM;
+    else if (strcmp(item->valuestring, "top") == 0)
+        *out = DC_BAR_POSITION_TOP;
 }
 
 /* Apply the selected stock palette, then overlay a wallpaper-derived palette
@@ -129,12 +160,20 @@ void dc_config_load(void)
     get_float(root, "animationSpeed", &config.animation_speed, 0.25f, 4.0f);
     get_bool(root, "dynamicColor", &config.dynamic_color);
     get_string(root, "wallpaper", config.wallpaper, sizeof(config.wallpaper));
+
+    get_bar_position(root, "barPosition", &config.bar_position);
+    get_int(root, "barSpacing", &config.bar_spacing, 0, 64);
+    get_int(root, "barInnerPadding", &config.bar_inner_padding, 0, 64);
+    get_int(root, "barWidgetPadding", &config.bar_widget_padding, 0, 64);
+    get_float(root, "barTransparency", &config.bar_transparency, 0.0f, 1.0f);
+    get_float(root, "barWidgetTransparency", &config.bar_widget_transparency, 0.0f, 1.0f);
     cJSON_Delete(root);
 
     apply_theme();
-    dc_info("config loaded: theme=%s clock24h=%d anim=%d/%.2fx dynamic=%d", config.theme_id,
-            config.clock_24h, config.animations_enabled, (double)config.animation_speed,
-            config.dynamic_color);
+    dc_info("config loaded: theme=%s clock24h=%d anim=%d/%.2fx dynamic=%d barPosition=%s",
+            config.theme_id, config.clock_24h, config.animations_enabled,
+            (double)config.animation_speed, config.dynamic_color,
+            config.bar_position == DC_BAR_POSITION_BOTTOM ? "bottom" : "top");
 }
 
 dc_config *dc_config_mut(void)
@@ -182,6 +221,14 @@ void dc_config_save(void)
     cJSON_AddBoolToObject(root, "dynamicColor", config.dynamic_color);
     if (config.wallpaper[0])
         cJSON_AddStringToObject(root, "wallpaper", config.wallpaper);
+
+    cJSON_AddStringToObject(root, "barPosition",
+                            config.bar_position == DC_BAR_POSITION_BOTTOM ? "bottom" : "top");
+    cJSON_AddNumberToObject(root, "barSpacing", config.bar_spacing);
+    cJSON_AddNumberToObject(root, "barInnerPadding", config.bar_inner_padding);
+    cJSON_AddNumberToObject(root, "barWidgetPadding", config.bar_widget_padding);
+    cJSON_AddNumberToObject(root, "barTransparency", (double)config.bar_transparency);
+    cJSON_AddNumberToObject(root, "barWidgetTransparency", (double)config.bar_widget_transparency);
 
     char *text = cJSON_Print(root);
     cJSON_Delete(root);
