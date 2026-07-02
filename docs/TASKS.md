@@ -69,8 +69,9 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
   running DMS) + IconName/Title, refresh on register/unregister; bar renders the icons (cached, dc_icon_
   resolve; dot fallback). Verified reading nm_applet; fixed the resolver to search 22x22 icons. Click-to-
   activate + IconPixmap-only items are later refinements.
-- [ ] **T17 logind** (idle/lid/sleep signals) — plumbing; mainly feeds the lock screen (T22), so parked
-  with it.
+- [x] **T17 logind** — DONE: services/logind.c watches login1 Manager.PrepareForSleep (lock before sleep)
+  + Session.Lock (loginctl lock-session) and engages the lock. Subscription verified active. (Full trigger
+  test deferred to avoid the running DMS grabbing the lock; the callback is the verified engage path.)
 
 ## Then — panels (M4+)
 - [x] **Pointer input** (prerequisite) — wl_seat + wl_pointer + bar click hit-testing (launcher/
@@ -97,8 +98,10 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
   click-to-launch. Backed by apps.c (XDG scan + fuzzy search) and xkb keyboard input in wl.c. Opens from
   the bar launcher button. Also fixed a latent libwayland abort: wl_pointer needs frame/axis_* listener
   stubs (see memory dankc-wl-listener-stubs). TODO later: math/calc/actions, recent apps, mouse hover.
-- [ ] **T22 Lock screen** — DEFERRED (safety): needs PAM auth; testing means locking the live session with
-  unverified code (lockout risk). Do when the user is awake.
+- [x] **T22 Lock screen** — DONE: ext-session-lock-v1 client locks every output (fractional-scale aware)
+  with a clock + date + password field; PAM auth (auth.c, verified AUTH OK) unlocks; `finished`/shutdown
+  tear down without unlocking. `dankc ctl lock`. Safety: DANKC_LOCK_ESCAPE=1 -> F1 force-unlock + env-gated
+  `ctl unlock` (testing). Verified: engage/render (screenshot)/unlock on 2 outputs, no protocol error.
 - [x] **T23 clipboard / screenshot / color-picker / night** — DONE:
   - **Clipboard** — wlr-data-control capture + 32-entry history + picker overlay (type-filter, Enter/click
     copies back via wl-copy), bar clipboard icon + `dankc ctl clipboard`.

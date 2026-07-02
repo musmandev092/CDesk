@@ -46,9 +46,11 @@ niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
 - **T23 done**: clipboard, full+region screenshot, color-picker (slurp+grim), night mode (gammastep).
 - **T16 tray done**: SNI host reads the watcher's items + renders icons on the bar (resolver now finds
   22x22). **T27 settings done**: theme picker + toggles + speed slider, live-apply + persist.
-- **Remaining (all deferred, not blocked-by-me):** T22 lock (PAM — do with user awake, lockout risk),
-  T17 logind (feeds lock; parked with it), T29 plugins (post-v1 by design). Polish: workspace-pill +
-  per-card toast animation, tray click-to-activate + pixmap icons, settings→full DMS parity.
+- **T22 lock done**: ext-session-lock + PAM (auth.c), clock+password UI, `dankc ctl lock`; F1/ctl-unlock
+  escape hatch gated by DANKC_LOCK_ESCAPE. **T17 logind done**: lock on sleep / lock-session.
+- **Only T29 plugins remains** — deferred by user ("skip plugins right now"); post-v1 by design.
+- Polish (optional): workspace-pill + per-card toast animation, tray click-to-activate + pixmap icons,
+  lock-before-sleep inhibitor, settings→full DMS parity, notification action buttons.
 - **Whole UI visually verified via grim** (2026-07-02): bar, launcher, control center, clipboard picker all
   match DMS. Screenshots in the session scratchpad.
 - Vendored: nanovg (GLES3, `third_party/nanovg`), cJSON (`third_party/cjson`); Inter bundled

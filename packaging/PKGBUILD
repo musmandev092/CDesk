@@ -6,7 +6,7 @@ pkgdesc="Lightweight C Wayland shell for niri (DankMaterialShell rewrite)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/AvengeMedia/DankMaterialShell"
 license=('MIT')
-depends=('wayland' 'libxkbcommon' 'systemd-libs' 'mesa')
+depends=('wayland' 'libxkbcommon' 'systemd-libs' 'mesa' 'pam')
 makedepends=('meson' 'ninja' 'wayland-protocols' 'pkgconf')
 optdepends=(
   'wireplumber: volume control (wpctl)'
