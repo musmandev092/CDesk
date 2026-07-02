@@ -7,6 +7,7 @@
 #include "core/config.h"
 #include "core/log.h"
 #include "core/loop.h"
+#include "ipc/control.h"
 #include "dc.h"
 #include "niri/niri.h"
 #include "render/nvg.h"
@@ -27,7 +28,9 @@
 
 #include <poll.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 
@@ -121,6 +124,62 @@ static void handle_key(uint32_t keysym, const char *utf8, void *data)
     dc_launcher_handle_key(data, keysym, utf8);
 }
 
+/* State the control socket dispatches commands against. */
+struct control_ctx {
+    struct dc_wayland *wl;
+    dc_launcher *launcher;
+    dc_control_center *control_center;
+    dc_notif_center *notif_center;
+};
+
+static struct dc_output *first_output(struct dc_wayland *wl)
+{
+    dc_output *o = NULL;
+    wl_list_for_each(o, &wl->outputs, link) {
+        return o;
+    }
+    return NULL;
+}
+
+/* Map a dankctl command to a shell action. */
+static void control_dispatch(const char *cmd, void *data)
+{
+    struct control_ctx *c = data;
+    dc_output *out = first_output(c->wl);
+    if (strcmp(cmd, "launcher") == 0 || strcmp(cmd, "launcher toggle") == 0)
+        dc_launcher_toggle(c->launcher, out);
+    else if (strcmp(cmd, "control-center") == 0 || strcmp(cmd, "control-center toggle") == 0)
+        dc_control_center_toggle(c->control_center, out);
+    else if (strcmp(cmd, "notifications") == 0 || strcmp(cmd, "notifications toggle") == 0)
+        dc_notif_center_toggle(c->notif_center, out);
+    else if (strcmp(cmd, "quit") == 0)
+        dc_loop_stop(g_loop);
+    else
+        dc_warn("unknown control command: %s", cmd);
+}
+
+/* `dankc ctl <words...>` — send a command to the running shell. */
+static int run_client(int argc, char **argv)
+{
+    char cmd[512] = {0};
+    size_t len = 0;
+    for (int i = 2; i < argc && len < sizeof(cmd) - 1; i++) {
+        int w = snprintf(cmd + len, sizeof(cmd) - len, "%s%s", len ? " " : "", argv[i]);
+        if (w > 0)
+            len += (size_t)w;
+    }
+    return dc_control_send(cmd) == 0 ? 0 : 1;
+}
+
+/* `dankc keybinds` — print a niri config snippet for the control commands. */
+static void print_keybinds(void)
+{
+    printf("// DankC keybinds — add inside the binds { } block of ~/.config/niri/config.kdl\n"
+           "    Mod+D            { spawn \"dankc\" \"ctl\" \"launcher\"; }\n"
+           "    Mod+N            { spawn \"dankc\" \"ctl\" \"notifications\"; }\n"
+           "    Mod+Shift+C      { spawn \"dankc\" \"ctl\" \"control-center\"; }\n");
+}
+
 /* Route a left click: into the control-center popup if it's the target, else to
  * the bar under the pointer (toggle the control center, or dismiss it). */
 static void handle_bar_click(struct wl_surface *surface, double x, double y, void *data)
@@ -168,8 +227,16 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
     }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    /* Client modes exit immediately without starting the shell. */
+    if (argc >= 2 && strcmp(argv[1], "ctl") == 0)
+        return run_client(argc, argv);
+    if (argc >= 2 && strcmp(argv[1], "keybinds") == 0) {
+        print_keybinds();
+        return 0;
+    }
+
     dc_log_init(DC_LOG_DEBUG);
     dc_info("DankC %s starting", DC_VERSION);
     dc_theme_init();
@@ -236,6 +303,12 @@ dc_osd_integrate(osd, g_loop);
 
     dc_loop_set_tick(g_loop, clock_tick, &tick, 1000);
 
+    struct control_ctx control_ctx = {.wl = wl,
+                                      .launcher = launcher,
+                                      .control_center = control_center,
+                                      .notif_center = notif_center};
+    dc_control *control = dc_control_create(g_loop, control_dispatch, &control_ctx);
+
     struct sigaction sa = {.sa_handler = handle_signal};
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
@@ -271,6 +344,7 @@ dc_osd_integrate(osd, g_loop);
     dc_loop_run(g_loop);
 
     dc_info("shutting down");
+    dc_control_destroy(control);
     dc_launcher_destroy(launcher);
     dc_notif_center_destroy(notif_center);
     dc_toasts_destroy(toasts);
