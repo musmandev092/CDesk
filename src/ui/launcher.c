@@ -7,6 +7,8 @@
 #include "render/icons.h"
 #include "render/nvg.h"
 #include "services/apps.h"
+#include "services/calc.h"
+#include "services/history.h"
 #include "services/icons.h"
 #include "theme/theme.h"
 #include "ui/popout.h"
@@ -17,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <xkbcommon/xkbcommon-keysyms.h>
 
@@ -52,6 +55,18 @@
 #define DC_LAUNCHER_SCROLL_STEP 56.0f
 #define DC_LAUNCHER_QUERY_MAX 128
 
+/* Calculator row (docs/POLISH.md P4 item 1): a non-scrolling banner pinned
+ * above the (list- or grid-shaped) results whenever the query parses as a
+ * math expression. Taller than a normal row so the result reads as the
+ * answer, not just another entry. */
+#define DC_LAUNCHER_CALC_ROW_H 64.0f
+#define DC_LAUNCHER_CALC_RESULT_MAX 48
+
+/* Run-actions sub-list (docs/POLISH.md P4 item 3): Tab on a selected app
+ * with Actions= swaps the results area for that app's action list. Rows
+ * reuse DC_LAUNCHER_ROW_H. */
+#define DC_LAUNCHER_ACTION_BREADCRUMB_H 32.0f
+
 /* Per-app_id nanovg image cache, same convention as bar.c's tray_cache:
  * images must stay alive until nanovg actually flushes the draw calls at
  * nvgEndFrame(), so they can't be created+deleted within the same draw_*_row
@@ -78,6 +93,7 @@ struct dc_launcher {
     dc_render *render;
     dc_output *output;
     dc_apps *apps;
+    dc_history *hist; /* recent/frequent launch tracking, docs/POLISH.md P4 item 2 */
 
     struct wl_surface *surface;
     struct zwlr_layer_surface_v1 *layer_surface;
@@ -94,6 +110,27 @@ struct dc_launcher {
     char query[DC_LAUNCHER_QUERY_MAX];
     const dc_app *results[64];
     int result_count;
+
+    /* Calculator row state (docs/POLISH.md P4 item 1). When calc_active,
+     * `selected == -1` means the calc row itself is highlighted (Enter/click
+     * copies calc_result_str to the clipboard); selected >= 0 still indexes
+     * `results` as usual. DMS's current DankLauncherV2 QML doesn't actually
+     * ship a calculator (checked: no Scorer/Controller trigger evaluates
+     * expressions) -- this mirrors the common spotlight-calculator pattern
+     * instead of a specific DMS source, per the task's "if DMS supports it"
+     * scope note. */
+    bool calc_active;
+    char calc_result_str[DC_LAUNCHER_CALC_RESULT_MAX];
+
+    /* Run-actions sub-list (docs/POLISH.md P4 item 3): Tab on a selected app
+     * that has Actions= swaps the results area for its action list; query
+     * editing is suspended while browsing (Backspace/printable keys are
+     * ignored) so `action_app` (a stable pointer into dc_apps's permanent,
+     * never-reallocated index) can't be invalidated by a re-search
+     * underneath it. */
+    bool action_mode;
+    const dc_app *action_app;
+    int action_selected;
 
     /* App-icon nanovg image cache, keyed by app_id (see
      * DC_LAUNCHER_ICON_CACHE_MAX comment above). */
@@ -215,13 +252,29 @@ static float launcher_content_height(const dc_launcher *l)
     return (float)l->result_count * DC_LAUNCHER_ROW_H;
 }
 
+/* The results area shrinks by the calc banner's height whenever it's shown
+ * (docs/POLISH.md P4 item 1) -- every consumer of lay->list_y0/list_h for
+ * the actual app list/grid (hit-testing, scroll clamping, rendering) goes
+ * through this so they can't drift out of sync. */
+static void launcher_results_region(const dc_launcher *l, const launcher_layout *lay, float *y0,
+                                    float *h)
+{
+    float off = (l->calc_active && !l->action_mode) ? DC_LAUNCHER_CALC_ROW_H : 0.0f;
+    *y0 = lay->list_y0 + off;
+    *h = lay->list_h - off;
+    if (*h < 0.0f)
+        *h = 0.0f;
+}
+
 /* Result index under logical (x, y), or -1 if outside the list/grid area or
  * past the last result. Mode-aware so click and hover share one formula. */
 static int launcher_row_at(const dc_launcher *l, const launcher_layout *lay, double x, double y)
 {
-    if (y < (double)lay->list_y0 || y > (double)lay->list_y1)
+    float ry0, rh;
+    launcher_results_region(l, lay, &ry0, &rh);
+    if (y < (double)ry0 || y > (double)(ry0 + rh))
         return -1;
-    float ly = (float)y - lay->list_y0 + l->scroll;
+    float ly = (float)y - ry0 + l->scroll;
 
     if (l->view_mode == DC_LAUNCHER_VIEW_GRID) {
         if (x < (double)lay->ix || x > (double)(lay->ix + lay->iw))
@@ -239,31 +292,100 @@ static int launcher_row_at(const dc_launcher *l, const launcher_layout *lay, dou
     return (idx >= 0 && idx < l->result_count) ? idx : -1;
 }
 
+/* How many whole rows/grid-cells fit in the visible results region -- used
+ * for PageUp/PageDown (docs/POLISH.md P4 item 4). At least 1 so a very short
+ * list still pages. */
+static int launcher_page_step(const dc_launcher *l, const launcher_layout *lay)
+{
+    float ry0, rh;
+    launcher_results_region(l, lay, &ry0, &rh);
+    if (l->view_mode == DC_LAUNCHER_VIEW_GRID) {
+        int rows = (int)(rh / DC_LAUNCHER_GRID_CELL_H);
+        if (rows < 1)
+            rows = 1;
+        return rows * DC_LAUNCHER_GRID_COLS;
+    }
+    int rows = (int)(rh / DC_LAUNCHER_ROW_H);
+    if (rows < 1)
+        rows = 1;
+    return rows;
+}
+
+/* Empty-query ordering (docs/POLISH.md P4 item 2): DMS's Scorer.js scores
+ * apps as `typeBonus + usageCount*100` when there's no search query, so with
+ * every item being an app (equal typeBonus) that's just usage-count
+ * descending, ties broken alphabetically -- see Scorer.js's score(). `results`
+ * is already alphabetical (apps_search's fallback for an empty query), so a
+ * stable insertion sort by usage count reproduces that exactly. N is capped
+ * at 64 (l->results' size), so O(n^2) is negligible. */
+static void sort_by_frecency(dc_launcher *l)
+{
+    for (int i = 1; i < l->result_count; i++) {
+        const dc_app *key = l->results[i];
+        int key_count = dc_history_count(l->hist, key->id);
+        int j = i - 1;
+        while (j >= 0) {
+            int cnt_j = dc_history_count(l->hist, l->results[j]->id);
+            bool move = cnt_j < key_count ||
+                        (cnt_j == key_count && strcasecmp(l->results[j]->name, key->name) > 0);
+            if (!move)
+                break;
+            l->results[j + 1] = l->results[j];
+            j--;
+        }
+        l->results[j + 1] = key;
+    }
+}
+
 static void run_search(dc_launcher *l)
 {
     l->result_count =
         dc_apps_search(l->apps, l->query, l->results,
                        (int)(sizeof(l->results) / sizeof(l->results[0])));
-    l->selected = 0;
+    if (!l->query[0] && l->hist)
+        sort_by_frecency(l);
+
+    l->action_mode = false;
+    l->action_app = NULL;
+
+    /* Calculator row (docs/POLISH.md P4 item 1): only try to parse `query`
+     * as math when it can't plausibly be anything else (dc_calc_looks_like_
+     * math's char-whitelist + digit/operator requirement). */
+    l->calc_active = false;
+    if (dc_calc_looks_like_math(l->query)) {
+        double result = 0.0;
+        if (dc_calc_eval(l->query, &result) == DC_CALC_OK) {
+            l->calc_active = true;
+            dc_calc_format(result, l->calc_result_str, sizeof(l->calc_result_str));
+        }
+    }
+
+    l->selected = l->calc_active ? -1 : 0;
     l->scroll = 0.0f;
 }
 
 /* Keep the selected row/cell scrolled into view (mode-aware). */
 static void clamp_scroll(dc_launcher *l)
 {
-    if (l->selected < 0)
-        l->selected = 0;
+    int floor_idx = l->calc_active ? -1 : 0;
+    if (l->selected < floor_idx)
+        l->selected = floor_idx;
     if (l->selected >= l->result_count)
         l->selected = l->result_count - 1;
     if (l->selected < 0) {
-        l->selected = 0;
+        /* Either the calc row is selected (-1, calc_active) or there are
+         * truly no results at all. */
+        if (!l->calc_active)
+            l->selected = 0;
         l->scroll = 0.0f;
         return;
     }
 
     launcher_layout lay = launcher_get_layout((float)l->logical_width, (float)l->logical_height);
+    float ry0, list_h;
+    launcher_results_region(l, &lay, &ry0, &list_h);
     float content_h = launcher_content_height(l);
-    float scroll_max = content_h > lay.list_h ? content_h - lay.list_h : 0.0f;
+    float scroll_max = content_h > list_h ? content_h - list_h : 0.0f;
 
     float row_top, row_bot;
     if (l->view_mode == DC_LAUNCHER_VIEW_GRID) {
@@ -276,8 +398,8 @@ static void clamp_scroll(dc_launcher *l)
     }
     if (row_top < l->scroll)
         l->scroll = row_top;
-    else if (row_bot > l->scroll + lay.list_h)
-        l->scroll = row_bot - lay.list_h;
+    else if (row_bot > l->scroll + list_h)
+        l->scroll = row_bot - list_h;
     if (l->scroll < 0.0f)
         l->scroll = 0.0f;
     if (l->scroll > scroll_max)
@@ -341,8 +463,17 @@ static void draw_list_row(dc_launcher *l, const dc_app *app, float x, float y, f
                        NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
     }
 
+    /* Right-side chevron (docs/POLISH.md P4 item 3): hints that Tab opens
+     * this app's Actions= sub-list, mirroring DMS's context-menu affordance
+     * (LauncherContextMenu.qml, invoked the same way -- Menu/F10/right-click
+     * there, Tab here) without a whole context-menu subsystem. */
+    bool has_actions = app->action_count > 0;
+    if (has_actions)
+        dc_render_icon(l->render, DC_ICON_CHEVRON_RIGHT, x + w - 14.0f, row_cy, 14.0f,
+                       dc_alpha(t->surface_text, 90), NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+
     const float text_x = icx + isz + 14.0f;
-    const float text_w = x + w - 10.0f - text_x;
+    const float text_w = x + w - (has_actions ? 24.0f : 10.0f) - text_x;
     if (text_w <= 8.0f)
         return;
 
@@ -407,6 +538,86 @@ static void draw_grid_cell(dc_launcher *l, const dc_app *app, float x, float y, 
     nvgFillColor(vg, tc(t->surface_text));
     nvgText(vg, x + w / 2.0f, icy + isz + 6.0f, app->name, NULL);
     nvgRestore(vg);
+}
+
+/* Calculator banner (docs/POLISH.md P4 item 1): pinned above the results,
+ * full-width regardless of list/grid view mode. `selected` (l->selected ==
+ * -1) tints it like a normal selected row. */
+static void draw_calc_row(dc_launcher *l, const launcher_layout *lay, bool selected)
+{
+    NVGcontext *vg = l->render->vg;
+    const dc_theme *t = dc_theme_current;
+    float y = lay->list_y0;
+    float h = DC_LAUNCHER_CALC_ROW_H;
+
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, lay->ix, y + 2.0f, lay->iw, h - 4.0f, 10.0f);
+    nvgFillColor(vg, selected ? tc_alpha(t->primary, 46) : tc(t->surface_container_high));
+    nvgFill(vg);
+
+    float cy = y + h / 2.0f;
+    dc_render_icon(l->render, DC_ICON_CALCULATE, lay->ix + 26.0f, cy, 22.0f, t->primary,
+                   NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+
+    char result_line[64];
+    snprintf(result_line, sizeof(result_line), "= %s", l->calc_result_str);
+    nvgFontFaceId(vg, l->render->font_ui);
+    nvgFontSize(vg, 20.0f);
+    nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+    nvgFillColor(vg, tc(t->surface_text));
+    nvgText(vg, lay->ix + 52.0f, cy, result_line, NULL);
+
+    nvgFontSize(vg, 12.0f);
+    nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
+    nvgFillColor(vg, tc_alpha(t->surface_text, 130));
+    nvgText(vg, lay->ix + lay->iw - 14.0f, cy, "\xe2\x8f\x8e copy", NULL); /* enter-glyph "copy" */
+}
+
+/* Breadcrumb above the action sub-list (docs/POLISH.md P4 item 3): back
+ * chevron + the app's name, non-interactive (Tab/Escape are the way back —
+ * see dc_launcher_handle_key). */
+static void draw_action_breadcrumb(dc_launcher *l, const launcher_layout *lay)
+{
+    NVGcontext *vg = l->render->vg;
+    const dc_theme *t = dc_theme_current;
+    float cy = lay->list_y0 + DC_LAUNCHER_ACTION_BREADCRUMB_H / 2.0f;
+
+    dc_render_icon(l->render, DC_ICON_CHEVRON_LEFT, lay->ix + 8.0f, cy, 16.0f,
+                   dc_alpha(t->surface_text, 160), NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+
+    char label[DC_APP_NAME + 16];
+    snprintf(label, sizeof(label), "%s actions", l->action_app ? l->action_app->name : "");
+    nvgFontFaceId(vg, l->render->font_ui);
+    nvgFontSize(vg, 13.5f);
+    nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+    nvgFillColor(vg, tc_alpha(t->surface_text, 200));
+    nvgText(vg, lay->ix + 28.0f, cy, label, NULL);
+}
+
+/* One action row: play_arrow glyph + action name (docs/POLISH.md P4 item 3,
+ * matches DMS's LauncherContextMenu action icon, "play_arrow"). */
+static void draw_action_row(dc_launcher *l, const dc_app_action *action, float x, float y, float w,
+                            bool selected)
+{
+    NVGcontext *vg = l->render->vg;
+    const dc_theme *t = dc_theme_current;
+
+    if (selected) {
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, x, y + 2.0f, w, DC_LAUNCHER_ROW_H - 4.0f, 10.0f);
+        nvgFillColor(vg, tc_alpha(t->primary, 46));
+        nvgFill(vg);
+    }
+
+    float row_cy = y + DC_LAUNCHER_ROW_H / 2.0f;
+    dc_render_icon(l->render, DC_ICON_PLAY_ARROW, x + 12.0f + 18.0f, row_cy, 20.0f,
+                   dc_alpha(t->surface_text, 180), NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+
+    nvgFontFaceId(vg, l->render->font_ui);
+    nvgFontSize(vg, 14.0f);
+    nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+    nvgFillColor(vg, tc(t->surface_text));
+    nvgText(vg, x + 12.0f + 36.0f + 12.0f, row_cy, action->name, NULL);
 }
 
 /* Section header: apps icon + "Applications N" (count dim) + right-aligned
@@ -540,12 +751,15 @@ static void draw_footer(dc_launcher *l, const launcher_layout *lay)
     nvgFillColor(vg, tc_alpha(t->surface_text, 110));
     nvgText(vg, px + 22.0f, fcy, "Plugins", NULL);
 
-    /* Right-aligned keybind hints. */
+    /* Right-aligned keybind hints -- swapped while browsing an app's
+     * Actions= sub-list (docs/POLISH.md P4 item 3). */
     nvgFontSize(vg, 11.5f);
     nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
     nvgFillColor(vg, tc_alpha(t->surface_text, 120));
-    nvgText(vg, lay->ix + lay->iw, fcy, "\xe2\x86\x91\xe2\x86\x93 nav \xc2\xb7 \xe2\x8f\x8e open \xc2\xb7 Tab actions",
-            NULL);
+    const char *hint = l->action_mode
+                           ? "\xe2\x86\x91\xe2\x86\x93 nav \xc2\xb7 \xe2\x8f\x8e run \xc2\xb7 Tab back"
+                           : "\xe2\x86\x91\xe2\x86\x93 nav \xc2\xb7 \xe2\x8f\x8e open \xc2\xb7 Tab actions";
+    nvgText(vg, lay->ix + lay->iw, fcy, hint, NULL);
 }
 
 static void launcher_render(dc_launcher *l)
@@ -647,59 +861,86 @@ static void launcher_render(dc_launcher *l)
         nvgText(vg, tx, scy, "Search applications\xe2\x80\xa6", NULL);
     }
 
-    draw_header(l, &lay);
-
-    /* Result list/grid, scrollable + scissored to the list area. */
-    float content_h = launcher_content_height(l);
-    float scroll_max = content_h > lay.list_h ? content_h - lay.list_h : 0.0f;
-    if (l->scroll < 0.0f)
-        l->scroll = 0.0f;
-    if (l->scroll > scroll_max)
-        l->scroll = scroll_max;
-
-    if (l->result_count == 0) {
-        nvgFontFaceId(vg, l->render->font_ui);
-        nvgFontSize(vg, 15.0f);
-        nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
-        nvgFillColor(vg, tc_alpha(t->surface_text, 120));
-        nvgText(vg, w / 2.0f, lay.list_y0 + lay.list_h / 2.0f, "No matching applications", NULL);
+    /* Run-actions sub-list (docs/POLISH.md P4 item 3) replaces the normal
+     * header + results entirely while browsing; calc row + list/grid results
+     * (with the calc banner, item 1) render otherwise. */
+    if (l->action_mode) {
+        draw_action_breadcrumb(l, &lay);
     } else {
+        draw_header(l, &lay);
+        if (l->calc_active)
+            draw_calc_row(l, &lay, l->selected == -1);
+    }
+
+    float ry0, list_h;
+    launcher_results_region(l, &lay, &ry0, &list_h);
+    float ry1 = ry0 + list_h;
+
+    if (l->action_mode) {
+        int n = l->action_app ? l->action_app->action_count : 0;
         nvgSave(vg);
-        nvgScissor(vg, lay.ix, lay.list_y0, lay.iw, lay.list_h);
-
-        if (l->view_mode == DC_LAUNCHER_VIEW_GRID) {
-            float cell_w = lay.iw / DC_LAUNCHER_GRID_COLS;
-            for (int i = 0; i < l->result_count; i++) {
-                int row = i / DC_LAUNCHER_GRID_COLS;
-                int col = i % DC_LAUNCHER_GRID_COLS;
-                float cx = lay.ix + (float)col * cell_w;
-                float cy = lay.list_y0 + (float)row * DC_LAUNCHER_GRID_CELL_H - l->scroll;
-                if (cy + DC_LAUNCHER_GRID_CELL_H < lay.list_y0 || cy > lay.list_y1)
-                    continue;
-                draw_grid_cell(l, l->results[i], cx, cy, cell_w, DC_LAUNCHER_GRID_CELL_H,
-                               i == l->selected);
-            }
-        } else {
-            for (int i = 0; i < l->result_count; i++) {
-                float ry = lay.list_y0 + (float)i * DC_LAUNCHER_ROW_H - l->scroll;
-                if (ry + DC_LAUNCHER_ROW_H < lay.list_y0 || ry > lay.list_y1)
-                    continue;
-                draw_list_row(l, l->results[i], lay.ix, ry, lay.iw, i == l->selected);
-            }
+        nvgScissor(vg, lay.ix, ry0, lay.iw, list_h);
+        for (int i = 0; i < n; i++) {
+            float ry = ry0 + (float)i * DC_LAUNCHER_ROW_H;
+            if (ry > ry1)
+                break;
+            draw_action_row(l, &l->action_app->actions[i], lay.ix, ry, lay.iw,
+                            i == l->action_selected);
         }
-
         nvgRestore(vg);
+    } else {
+        /* Result list/grid, scrollable + scissored to the results area. */
+        float content_h = launcher_content_height(l);
+        float scroll_max = content_h > list_h ? content_h - list_h : 0.0f;
+        if (l->scroll < 0.0f)
+            l->scroll = 0.0f;
+        if (l->scroll > scroll_max)
+            l->scroll = scroll_max;
 
-        if (scroll_max > 0.0f) {
-            float track_x = lay.ix + lay.iw - 3.0f;
-            float thumb_h = lay.list_h * (lay.list_h / content_h);
-            if (thumb_h < 24.0f)
-                thumb_h = 24.0f;
-            float thumb_y = lay.list_y0 + (lay.list_h - thumb_h) * (l->scroll / scroll_max);
-            nvgBeginPath(vg);
-            nvgRoundedRect(vg, track_x, thumb_y, 3.0f, thumb_h, 1.5f);
-            nvgFillColor(vg, tc_alpha(t->outline, 140));
-            nvgFill(vg);
+        if (l->result_count == 0) {
+            nvgFontFaceId(vg, l->render->font_ui);
+            nvgFontSize(vg, 15.0f);
+            nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+            nvgFillColor(vg, tc_alpha(t->surface_text, 120));
+            nvgText(vg, w / 2.0f, ry0 + list_h / 2.0f, "No matching applications", NULL);
+        } else {
+            nvgSave(vg);
+            nvgScissor(vg, lay.ix, ry0, lay.iw, list_h);
+
+            if (l->view_mode == DC_LAUNCHER_VIEW_GRID) {
+                float cell_w = lay.iw / DC_LAUNCHER_GRID_COLS;
+                for (int i = 0; i < l->result_count; i++) {
+                    int row = i / DC_LAUNCHER_GRID_COLS;
+                    int col = i % DC_LAUNCHER_GRID_COLS;
+                    float cx = lay.ix + (float)col * cell_w;
+                    float cy = ry0 + (float)row * DC_LAUNCHER_GRID_CELL_H - l->scroll;
+                    if (cy + DC_LAUNCHER_GRID_CELL_H < ry0 || cy > ry1)
+                        continue;
+                    draw_grid_cell(l, l->results[i], cx, cy, cell_w, DC_LAUNCHER_GRID_CELL_H,
+                                   i == l->selected);
+                }
+            } else {
+                for (int i = 0; i < l->result_count; i++) {
+                    float ry = ry0 + (float)i * DC_LAUNCHER_ROW_H - l->scroll;
+                    if (ry + DC_LAUNCHER_ROW_H < ry0 || ry > ry1)
+                        continue;
+                    draw_list_row(l, l->results[i], lay.ix, ry, lay.iw, i == l->selected);
+                }
+            }
+
+            nvgRestore(vg);
+
+            if (scroll_max > 0.0f) {
+                float track_x = lay.ix + lay.iw - 3.0f;
+                float thumb_h = list_h * (list_h / content_h);
+                if (thumb_h < 24.0f)
+                    thumb_h = 24.0f;
+                float thumb_y = ry0 + (list_h - thumb_h) * (l->scroll / scroll_max);
+                nvgBeginPath(vg);
+                nvgRoundedRect(vg, track_x, thumb_y, 3.0f, thumb_h, 1.5f);
+                nvgFillColor(vg, tc_alpha(t->outline, 140));
+                nvgFill(vg);
+            }
         }
     }
 
@@ -762,6 +1003,7 @@ dc_launcher *dc_launcher_create(dc_wayland *wl, dc_egl *egl, dc_render *render)
     l->egl = egl;
     l->render = render;
     l->apps = dc_apps_load();
+    l->hist = dc_history_load();
     l->logical_width = DC_LAUNCHER_WIDTH;
     l->logical_height = DC_LAUNCHER_HEIGHT;
     l->scale120 = DC_SCALE_BASE;
@@ -775,7 +1017,15 @@ static void launcher_show(dc_launcher *l, dc_output *output)
     l->configured = false;
     l->egl_ready = false;
     l->scale120 = (output && output->scale > 0 ? output->scale : 1) * DC_SCALE_BASE;
-    l->query[0] = '\0';
+    /* DANKC_LAUNCHER_QUERY: pre-fill the search field on open, for
+     * verification without needing real keyboard input synthesis (docs/
+     * POLISH.md P4 verification note) -- e.g. DANKC_LAUNCHER_QUERY="2+2*3"
+     * to screenshot the calculator row. */
+    const char *preset_query = getenv("DANKC_LAUNCHER_QUERY");
+    if (preset_query && preset_query[0])
+        snprintf(l->query, sizeof(l->query), "%s", preset_query);
+    else
+        l->query[0] = '\0';
     run_search(l);
     dc_anim_start(&l->anim, DC_DUR_MEDIUM, DC_EASE_EXPRESSIVE);
 
@@ -878,27 +1128,83 @@ struct wl_surface *dc_launcher_surface(dc_launcher *l)
     return l->surface;
 }
 
+/* Copy the calculator row's result to the clipboard via wl-copy, detached
+ * the same way clipboard.c's dc_clipboard_copy() does for text entries
+ * (docs/POLISH.md P4 item 1: "Enter copies result to clipboard, like DMS"). */
+static void launcher_copy_calc_result(dc_launcher *l)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        execlp("wl-copy", "wl-copy", "--", l->calc_result_str, (char *)NULL);
+        _exit(127);
+    }
+    dc_debug("launcher: copied calc result '%s' to clipboard", l->calc_result_str);
+}
+
+/* Launch the currently-selected app (or its selected action, in
+ * action_mode), record it in history, and close the launcher. Shared by
+ * Enter and click. */
+static void launcher_activate_selection(dc_launcher *l)
+{
+    if (l->action_mode) {
+        if (l->action_app && l->action_selected >= 0 &&
+            l->action_selected < l->action_app->action_count) {
+            dc_app_launch_action(l->action_app, l->action_selected);
+            dc_history_record(l->hist, l->action_app->id);
+            launcher_begin_close(l);
+        }
+        return;
+    }
+    if (l->calc_active && l->selected == -1) {
+        launcher_copy_calc_result(l);
+        launcher_begin_close(l);
+        return;
+    }
+    if (l->selected >= 0 && l->selected < l->result_count) {
+        dc_app_launch(l->results[l->selected]);
+        dc_history_record(l->hist, l->results[l->selected]->id);
+        launcher_begin_close(l);
+    }
+}
+
 void dc_launcher_handle_key(dc_launcher *l, uint32_t keysym, const char *utf8)
 {
     if (!l->visible || l->closing)
         return;
 
+    launcher_layout lay = launcher_get_layout((float)l->logical_width, (float)l->logical_height);
+
     switch (keysym) {
     case XKB_KEY_Escape:
+        if (l->action_mode) {
+            l->action_mode = false;
+            break;
+        }
         launcher_begin_close(l);
         return;
     case XKB_KEY_Return:
     case XKB_KEY_KP_Enter:
-        if (l->selected >= 0 && l->selected < l->result_count) {
-            dc_app_launch(l->results[l->selected]);
-            launcher_begin_close(l);
-        }
+        launcher_activate_selection(l);
         return;
     case XKB_KEY_Tab:
-        /* "Tab actions" footer hint is a TODO (sec.6) -- no-op for now,
-         * rather than inserting a tab character into the search field. */
-        return;
+        /* Toggle the Actions= sub-list for the selected app (docs/POLISH.md
+         * P4 item 3) -- back out if already browsing it. */
+        if (l->action_mode) {
+            l->action_mode = false;
+        } else {
+            const dc_app *app =
+                (l->selected >= 0 && l->selected < l->result_count) ? l->results[l->selected] : NULL;
+            if (app && app->action_count > 0) {
+                l->action_mode = true;
+                l->action_app = app;
+                l->action_selected = 0;
+            }
+        }
+        break;
     case XKB_KEY_BackSpace: {
+        if (l->action_mode) /* query editing suspended while browsing actions */
+            break;
         size_t n = strlen(l->query);
         if (n > 0) {
             l->query[n - 1] = '\0';
@@ -907,28 +1213,74 @@ void dc_launcher_handle_key(dc_launcher *l, uint32_t keysym, const char *utf8)
         break;
     }
     case XKB_KEY_Up:
-        l->selected -= (l->view_mode == DC_LAUNCHER_VIEW_GRID) ? DC_LAUNCHER_GRID_COLS : 1;
-        clamp_scroll(l);
+        if (l->action_mode) {
+            if (l->action_selected > 0)
+                l->action_selected--;
+        } else {
+            l->selected -= (l->view_mode == DC_LAUNCHER_VIEW_GRID) ? DC_LAUNCHER_GRID_COLS : 1;
+            clamp_scroll(l);
+        }
         break;
     case XKB_KEY_Down:
-        l->selected += (l->view_mode == DC_LAUNCHER_VIEW_GRID) ? DC_LAUNCHER_GRID_COLS : 1;
-        clamp_scroll(l);
+        if (l->action_mode) {
+            if (l->action_app && l->action_selected < l->action_app->action_count - 1)
+                l->action_selected++;
+        } else {
+            l->selected += (l->view_mode == DC_LAUNCHER_VIEW_GRID) ? DC_LAUNCHER_GRID_COLS : 1;
+            clamp_scroll(l);
+        }
         break;
     case XKB_KEY_Left:
-        if (l->view_mode == DC_LAUNCHER_VIEW_GRID) {
+        if (!l->action_mode && l->view_mode == DC_LAUNCHER_VIEW_GRID) {
             l->selected--;
             clamp_scroll(l);
         }
         break;
     case XKB_KEY_Right:
-        if (l->view_mode == DC_LAUNCHER_VIEW_GRID) {
+        if (!l->action_mode && l->view_mode == DC_LAUNCHER_VIEW_GRID) {
             l->selected++;
             clamp_scroll(l);
         }
         break;
+    case XKB_KEY_Page_Up:
+        if (l->action_mode) {
+            l->action_selected = 0;
+        } else {
+            l->selected -= launcher_page_step(l, &lay);
+            clamp_scroll(l);
+        }
+        break;
+    case XKB_KEY_Page_Down:
+        if (l->action_mode) {
+            if (l->action_app)
+                l->action_selected = l->action_app->action_count - 1;
+        } else {
+            l->selected += launcher_page_step(l, &lay);
+            clamp_scroll(l);
+        }
+        break;
+    case XKB_KEY_Home:
+        if (l->action_mode) {
+            l->action_selected = 0;
+        } else {
+            l->selected = l->calc_active ? -1 : 0;
+            clamp_scroll(l);
+        }
+        break;
+    case XKB_KEY_End:
+        if (l->action_mode) {
+            if (l->action_app)
+                l->action_selected = l->action_app->action_count - 1;
+        } else {
+            l->selected = l->result_count - 1;
+            clamp_scroll(l);
+        }
+        break;
     default: {
-        /* Append printable text (single-byte control chars filtered). */
-        if (utf8 && utf8[0] && !((unsigned char)utf8[0] < 0x20) && (unsigned char)utf8[0] != 0x7f) {
+        /* Append printable text (single-byte control chars filtered). Query
+         * editing is suspended while browsing an app's actions. */
+        if (!l->action_mode && utf8 && utf8[0] && !((unsigned char)utf8[0] < 0x20) &&
+            (unsigned char)utf8[0] != 0x7f) {
             size_t n = strlen(l->query);
             size_t add = strlen(utf8);
             if (n + add < sizeof(l->query)) {
@@ -947,6 +1299,24 @@ void dc_launcher_handle_click(dc_launcher *l, double x, double y)
     if (!l->visible || l->closing)
         return;
 
+    launcher_layout lay = launcher_get_layout((float)l->logical_width, (float)l->logical_height);
+
+    /* Run-actions sub-list (docs/POLISH.md P4 item 3): while browsing,
+     * clicks target action rows only -- the header view-toggle rects below
+     * are stale (last drawn before action_mode) and must not hit-test. */
+    if (l->action_mode) {
+        float ry0, list_h;
+        launcher_results_region(l, &lay, &ry0, &list_h);
+        if (y >= (double)ry0 && y <= (double)(ry0 + list_h) && l->action_app) {
+            int idx = (int)((y - (double)ry0) / (double)DC_LAUNCHER_ROW_H);
+            if (idx >= 0 && idx < l->action_app->action_count) {
+                l->action_selected = idx;
+                launcher_activate_selection(l);
+            }
+        }
+        return;
+    }
+
     if (in_rect(x, y, l->list_btn_x0, l->list_btn_y0, l->list_btn_x1, l->list_btn_y1)) {
         if (l->view_mode != DC_LAUNCHER_VIEW_LIST) {
             l->view_mode = DC_LAUNCHER_VIEW_LIST;
@@ -964,11 +1334,18 @@ void dc_launcher_handle_click(dc_launcher *l, double x, double y)
         return;
     }
 
-    launcher_layout lay = launcher_get_layout((float)l->logical_width, (float)l->logical_height);
+    /* Calculator banner (docs/POLISH.md P4 item 1): click == Enter, copies. */
+    if (l->calc_active && in_rect(x, y, lay.ix, lay.list_y0, lay.ix + lay.iw,
+                                  lay.list_y0 + DC_LAUNCHER_CALC_ROW_H)) {
+        l->selected = -1;
+        launcher_activate_selection(l);
+        return;
+    }
+
     int idx = launcher_row_at(l, &lay, x, y);
     if (idx >= 0) {
-        dc_app_launch(l->results[idx]);
-        launcher_begin_close(l);
+        l->selected = idx;
+        launcher_activate_selection(l);
     }
 }
 
@@ -1009,5 +1386,6 @@ void dc_launcher_destroy(dc_launcher *l)
     if (l->visible)
         launcher_teardown(l);
     dc_apps_destroy(l->apps);
+    dc_history_destroy(l->hist);
     free(l);
 }
