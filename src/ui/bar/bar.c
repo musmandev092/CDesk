@@ -62,8 +62,9 @@ struct dc_bar {
     char icon_app_id[64];
     int icon_image; /* nanovg image handle, 0 = none */
 
-    /* Center x of the notification-bell icon (dynamic; for hit-testing). */
+    /* Center x of the notification-bell + clipboard icons (dynamic; hit-test). */
     float notif_cx;
+    float clip_cx;
 
     int logical_width;  /* from the layer-surface configure */
     int logical_height;
@@ -419,6 +420,7 @@ static void draw_right_cluster(dc_bar *bar)
     bar->notif_cx = x - isize / 2.0f; /* right-aligned icon spans [x-isize, x] */
     x -= step;
     dc_render_icon(bar->render, DC_ICON_CONTENT_PASTE, x, cy, isize, t->surface_text, align);
+    bar->clip_cx = x - isize / 2.0f;
     x -= step;
     dc_render_icon(bar->render, DC_ICON_SIGNAL_CELLULAR_ALT, x, cy, isize, t->primary, align);
 }
@@ -575,9 +577,11 @@ dc_bar_region dc_bar_hittest(dc_bar *bar, double x, double y)
     DC_UNUSED(y);
     if (x < 44.0)
         return DC_BAR_REGION_LAUNCHER;
-    /* Notification bell (checked before the broader control-center cluster). */
+    /* Notification bell + clipboard (checked before the control-center cluster). */
     if (bar->notif_cx > 0.0f && x >= bar->notif_cx - 14.0 && x <= bar->notif_cx + 14.0)
         return DC_BAR_REGION_NOTIFICATIONS;
+    if (bar->clip_cx > 0.0f && x >= bar->clip_cx - 14.0 && x <= bar->clip_cx + 14.0)
+        return DC_BAR_REGION_CLIPBOARD;
     if (x > bar->logical_width - 210.0)
         return DC_BAR_REGION_CONTROL_CENTER;
     if (x > bar->logical_width / 2.0 - 70.0 && x < bar->logical_width / 2.0 + 70.0)

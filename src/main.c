@@ -19,6 +19,7 @@
 #include "services/notifications.h"
 #include "theme/theme.h"
 #include "ui/bar/bar.h"
+#include "ui/clip_picker.h"
 #include "ui/controlcenter.h"
 #include "ui/launcher.h"
 #include "ui/notifcenter.h"
@@ -117,12 +118,22 @@ struct click_ctx {
     dc_toasts *toasts;
     dc_launcher *launcher;
     dc_notif_center *notif_center;
+    dc_clip_picker *clip_picker;
 };
 
-/* Keyboard input routed to the launcher (the only keyboard-grabbing surface). */
+/* Keyboard input routed to whichever keyboard-grabbing overlay is open. */
+struct kbd_ctx {
+    dc_launcher *launcher;
+    dc_clip_picker *clip_picker;
+};
+
 static void handle_key(uint32_t keysym, const char *utf8, void *data)
 {
-    dc_launcher_handle_key(data, keysym, utf8);
+    struct kbd_ctx *k = data;
+    if (dc_clip_picker_visible(k->clip_picker))
+        dc_clip_picker_handle_key(k->clip_picker, keysym, utf8);
+    else
+        dc_launcher_handle_key(k->launcher, keysym, utf8);
 }
 
 /* State the control socket dispatches commands against. */
@@ -131,6 +142,7 @@ struct control_ctx {
     dc_launcher *launcher;
     dc_control_center *control_center;
     dc_notif_center *notif_center;
+    dc_clip_picker *clip_picker;
 };
 
 static struct dc_output *first_output(struct dc_wayland *wl)
@@ -153,6 +165,8 @@ static void control_dispatch(const char *cmd, void *data)
         dc_control_center_toggle(c->control_center, out);
     else if (strcmp(cmd, "notifications") == 0 || strcmp(cmd, "notifications toggle") == 0)
         dc_notif_center_toggle(c->notif_center, out);
+    else if (strcmp(cmd, "clipboard") == 0 || strcmp(cmd, "clipboard toggle") == 0)
+        dc_clip_picker_toggle(c->clip_picker, out);
     else if (strcmp(cmd, "quit") == 0)
         dc_loop_stop(g_loop);
     else
@@ -207,6 +221,12 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
         return;
     }
 
+    if (dc_clip_picker_visible(ctx->clip_picker) &&
+        surface == dc_clip_picker_surface(ctx->clip_picker)) {
+        dc_clip_picker_handle_click(ctx->clip_picker, x, y);
+        return;
+    }
+
     for (int i = 0; i < ctx->set->count; i++) {
         dc_bar *bar = ctx->set->bars[i];
         if (dc_bar_surface(bar) != surface)
@@ -216,6 +236,8 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
             dc_launcher_toggle(ctx->launcher, dc_bar_output(bar));
         } else if (region == DC_BAR_REGION_NOTIFICATIONS) {
             dc_notif_center_toggle(ctx->notif_center, dc_bar_output(bar));
+        } else if (region == DC_BAR_REGION_CLIPBOARD) {
+            dc_clip_picker_toggle(ctx->clip_picker, dc_bar_output(bar));
         } else if (region == DC_BAR_REGION_CONTROL_CENTER) {
             dc_control_center_toggle(cc, dc_bar_output(bar));
         } else {
@@ -285,31 +307,36 @@ int main(int argc, char **argv)
     dc_notifications_set_changed_cb(notifications, notifications_changed, &notif_ui);
 
     dc_launcher *launcher = dc_launcher_create(wl, &egl, &render);
-    dc_wayland_set_key_cb(wl, handle_key, launcher);
-
-    struct click_ctx cctx = {.set = &set,
-                             .control_center = control_center,
-                             .toasts = toasts,
-                             .launcher = launcher,
-                             .notif_center = notif_center};
     struct tick_ctx tick = {.set = &set, .osd = osd, .wl = wl, .notifications = notifications};
 
     g_loop = dc_loop_create();
     dc_wayland_integrate(wl, g_loop);
     dc_niri_integrate(niri, g_loop);
     dc_niri_set_changed_cb(niri, niri_changed, &set);
-    dc_wayland_set_click_cb(wl, handle_bar_click, &cctx);
-dc_dbus_integrate(dbus, g_loop);
-dc_osd_integrate(osd, g_loop);
-
+    dc_dbus_integrate(dbus, g_loop);
+    dc_osd_integrate(osd, g_loop);
     dc_loop_set_tick(g_loop, clock_tick, &tick, 1000);
+
+    dc_clipboard *clipboard = dc_clipboard_create(wl, g_loop);
+    dc_clip_picker *clip_picker = dc_clip_picker_create(wl, &egl, &render, clipboard);
+
+    struct kbd_ctx kbd = {.launcher = launcher, .clip_picker = clip_picker};
+    dc_wayland_set_key_cb(wl, handle_key, &kbd);
+
+    struct click_ctx cctx = {.set = &set,
+                             .control_center = control_center,
+                             .toasts = toasts,
+                             .launcher = launcher,
+                             .notif_center = notif_center,
+                             .clip_picker = clip_picker};
+    dc_wayland_set_click_cb(wl, handle_bar_click, &cctx);
 
     struct control_ctx control_ctx = {.wl = wl,
                                       .launcher = launcher,
                                       .control_center = control_center,
-                                      .notif_center = notif_center};
+                                      .notif_center = notif_center,
+                                      .clip_picker = clip_picker};
     dc_control *control = dc_control_create(g_loop, control_dispatch, &control_ctx);
-    dc_clipboard *clipboard = dc_clipboard_create(wl, g_loop);
 
     struct sigaction sa = {.sa_handler = handle_signal};
     sigaction(SIGINT, &sa, NULL);
@@ -346,6 +373,7 @@ dc_osd_integrate(osd, g_loop);
     dc_loop_run(g_loop);
 
     dc_info("shutting down");
+    dc_clip_picker_destroy(clip_picker);
     dc_clipboard_destroy(clipboard);
     dc_control_destroy(control);
     dc_launcher_destroy(launcher);
