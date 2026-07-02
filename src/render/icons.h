@@ -93,6 +93,25 @@
  * .codepoints file maps "delete_sweep" to. */
 #define DC_ICON_DELETE_SWEEP 0xe16c
 
+/* Dashboard popout ("DankDash", docs/13-POPOUTS-SPEC.md sec.5). Tab-bar icons
+ * (dashboard/music_note/wallpaper/wb_sunny/settings), Overview cards
+ * (schedule/device_thermostat), Weather stats grid (humidity_low/air/speed/
+ * rainy/wb_twilight/bedtime) and calendar chevrons. All values from DMS's
+ * MaterialSymbolsRounded[...].codepoints (the full variable font dankc now
+ * bundles). */
+#define DC_ICON_DASHBOARD 0xe871
+#define DC_ICON_WALLPAPER 0xe1bc
+#define DC_ICON_WB_SUNNY 0xe430
+#define DC_ICON_SCHEDULE 0xefd6
+#define DC_ICON_DEVICE_THERMOSTAT 0xe1ff
+#define DC_ICON_HUMIDITY_LOW 0xf164
+#define DC_ICON_AIR 0xefd8
+#define DC_ICON_SPEED 0xe9e4
+#define DC_ICON_WB_TWILIGHT 0xe1c6
+#define DC_ICON_BEDTIME 0xf159 /* moon glyph; doubles as the sunset icon */
+#define DC_ICON_FOLDER 0xe2c7
+#define DC_ICON_CHEVRON_LEFT 0xe5cb
+
 /* Clipboard History popout (docs/13-POPOUTS-SPEC.md sec.4, ClipboardHeader.qml
  * / ClipboardEntry.qml / ClipboardThumbnail.qml). All values taken from DMS's
  * own MaterialSymbolsRounded .codepoints file (the same font dankc bundles)
