@@ -367,6 +367,7 @@ static void handle_bar_leave(struct wl_surface *surface, void *data)
 struct axis_ctx {
     struct bar_set *set;
     dc_notif_center *notif_center;
+    dc_clip_picker *clip_picker;
 };
 
 /* Scroll on a bar surface: vertical wheel -> workspace focus, horizontal ->
@@ -380,7 +381,8 @@ struct axis_ctx {
  * Scroll over the notification center (docs/13-POPOUTS-SPEC.md sec.3):
  * offsets the active tab's card list instead — the axis routing itself is
  * already generic (see above), so this only needed a surface check + a call
- * into dc_notif_center_handle_scroll(). */
+ * into dc_notif_center_handle_scroll(). Same pattern for the clipboard
+ * picker's row list (docs/13-POPOUTS-SPEC.md sec.4). */
 static void handle_bar_axis(struct wl_surface *surface, int steps_v, int steps_h, void *data)
 {
     struct axis_ctx *actx = data;
@@ -388,6 +390,11 @@ static void handle_bar_axis(struct wl_surface *surface, int steps_v, int steps_h
     if (dc_notif_center_visible(actx->notif_center) &&
         surface == dc_notif_center_surface(actx->notif_center)) {
         dc_notif_center_handle_scroll(actx->notif_center, steps_v);
+        return;
+    }
+    if (dc_clip_picker_visible(actx->clip_picker) &&
+        surface == dc_clip_picker_surface(actx->clip_picker)) {
+        dc_clip_picker_handle_scroll(actx->clip_picker, steps_v);
         return;
     }
 
@@ -514,7 +521,7 @@ int main(int argc, char **argv)
     dc_wayland_set_click_cb(wl, handle_bar_click, &cctx);
     dc_wayland_set_motion_cb(wl, handle_bar_motion, &set);
     dc_wayland_set_leave_cb(wl, handle_bar_leave, &set);
-    struct axis_ctx actx = {.set = &set, .notif_center = notif_center};
+    struct axis_ctx actx = {.set = &set, .notif_center = notif_center, .clip_picker = clip_picker};
     dc_wayland_set_axis_cb(wl, handle_bar_axis, &actx);
 
     struct control_ctx control_ctx = {.wl = wl,

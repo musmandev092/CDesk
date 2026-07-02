@@ -1,8 +1,9 @@
 /* clip_picker.h — clipboard history picker overlay.
  *
- * A centered keyboard overlay (like the launcher) listing recent clipboard
- * entries; type to filter, Up/Down to select, Enter to copy it back, Esc to
- * dismiss. Opened from the bar clipboard icon. Matches DMS's clipboard modal.
+ * A bar-adjacent popout (docs/13-POPOUTS-SPEC.md sec.4) listing recent
+ * clipboard entries (text and images) with search, pin, and delete; type to
+ * filter, Up/Down to select, Enter to copy it back, Esc to dismiss. Opened
+ * from the bar clipboard icon. Matches DMS's ClipboardHistoryPopout.
  */
 #ifndef DC_UI_CLIP_PICKER_H
 #define DC_UI_CLIP_PICKER_H
@@ -30,5 +31,6 @@ struct wl_surface *dc_clip_picker_surface(dc_clip_picker *p);
 
 void dc_clip_picker_handle_key(dc_clip_picker *p, uint32_t keysym, const char *utf8);
 void dc_clip_picker_handle_click(dc_clip_picker *p, double x, double y);
+void dc_clip_picker_handle_scroll(dc_clip_picker *p, int steps_v);
 
 #endif /* DC_UI_CLIP_PICKER_H */

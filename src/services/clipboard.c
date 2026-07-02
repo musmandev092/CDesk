@@ -10,29 +10,61 @@
 #include <string.h>
 #include <unistd.h>
 
+/* Declarations only (no STB_IMAGE_IMPLEMENTATION here) -- the implementation
+ * is compiled once into third_party/nanovg/nanovg.c and linked in via
+ * dankc-thirdparty, so this just needs stbi_info_from_memory()'s prototype
+ * for a cheap PNG/JPEG header parse (width/height, no pixel decode). */
+#include "stb_image.h"
+
 #include "wlr-data-control-unstable-v1-client-protocol.h"
 
 #define DC_CLIP_MAX 32
-#define DC_CLIP_ENTRY_MAX 65536 /* cap a single entry's stored size */
+#define DC_CLIP_TEXT_MAX (64 * 1024)          /* cap a single text entry */
+#define DC_CLIP_IMAGE_MAX (5 * 1024 * 1024)   /* cap a single image entry (docs/13-POPOUTS-SPEC.md sec.4) */
 
 #define DC_MIME_UTF8 "text/plain;charset=utf-8"
 #define DC_MIME_TEXT "text/plain"
+#define DC_MIME_PNG "image/png"
+#define DC_MIME_JPEG "image/jpeg"
+
+/* Internal storage for one history entry -- superset of the public
+ * dc_clip_entry view (adds ownership + a fixed ext buffer). */
+struct clip_item {
+    uint64_t id;
+    dc_clip_kind kind;
+    bool pinned;
+
+    char *text;
+    size_t text_len;
+
+    unsigned char *image;
+    size_t image_len;
+    int width, height;
+    char ext[8];
+};
 
 struct dc_clipboard {
     dc_wayland *wl;
     struct dc_loop *loop;
     struct zwlr_data_control_device_v1 *device;
-    char *entries[DC_CLIP_MAX]; /* ring, oldest at head */
+
+    /* oldest at [0], newest at [count-1]; plain array (not a ring) so
+     * id-based delete/pin can memmove-compact in place. */
+    struct clip_item entries[DC_CLIP_MAX];
     int count;
-    int head;
+    uint64_t next_id;
+
     dc_clip_changed_cb cb;
     void *cb_data;
 };
 
-/* Per-offer: which text mimes it advertises. */
+/* Per-offer: which mimes it advertises. Text is preferred over image when an
+ * offer somehow has both (shouldn't normally happen). */
 struct offer_state {
     bool has_utf8;
     bool has_text;
+    bool has_png;
+    bool has_jpeg;
 };
 
 /* An in-flight read of the selection into memory. */
@@ -43,32 +75,110 @@ struct transfer {
     char *buf;
     size_t len;
     size_t cap;
+    size_t cap_limit;
+    bool is_image;
+    char ext[8];
 };
 
+static void free_item(struct clip_item *e)
+{
+    free(e->text);
+    e->text = NULL;
+    free(e->image);
+    e->image = NULL;
+}
+
+static int find_by_id(dc_clipboard *c, uint64_t id)
+{
+    for (int i = 0; i < c->count; i++)
+        if (c->entries[i].id == id)
+            return i;
+    return -1;
+}
+
+/* Evict the oldest *unpinned* entry to make room. Returns false if the whole
+ * history is pinned (nothing to evict -- new entry is dropped). */
+static bool evict_oldest_unpinned(dc_clipboard *c)
+{
+    int idx = -1;
+    for (int i = 0; i < c->count; i++) {
+        if (!c->entries[i].pinned) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0)
+        return false;
+    free_item(&c->entries[idx]);
+    memmove(&c->entries[idx], &c->entries[idx + 1],
+           (size_t)(c->count - idx - 1) * sizeof(c->entries[0]));
+    c->count--;
+    return true;
+}
+
 /* Store `text` as the newest history entry (dedup vs the current newest). */
-static void store_entry(dc_clipboard *c, const char *text)
+static void store_text(dc_clipboard *c, const char *text)
 {
     if (!text || !*text)
         return;
     if (c->count > 0) {
-        int newest = (c->head + c->count - 1) % DC_CLIP_MAX;
-        if (strcmp(c->entries[newest], text) == 0)
+        struct clip_item *newest = &c->entries[c->count - 1];
+        if (newest->kind == DC_CLIP_TEXT && strcmp(newest->text, text) == 0)
             return; /* same as last copy */
     }
     char *dup = strdup(text);
     if (!dup)
         return;
-    int idx;
-    if (c->count < DC_CLIP_MAX) {
-        idx = (c->head + c->count) % DC_CLIP_MAX;
-        c->count++;
-    } else {
-        idx = c->head;
-        free(c->entries[idx]);
-        c->head = (c->head + 1) % DC_CLIP_MAX;
+    if (c->count >= DC_CLIP_MAX && !evict_oldest_unpinned(c)) {
+        free(dup);
+        return;
     }
-    c->entries[idx] = dup;
-    dc_debug("clipboard: stored %zu bytes (%d entries)", strlen(dup), c->count);
+    struct clip_item *e = &c->entries[c->count++];
+    memset(e, 0, sizeof(*e));
+    e->id = ++c->next_id;
+    e->kind = DC_CLIP_TEXT;
+    e->text = dup;
+    e->text_len = strlen(dup);
+    dc_debug("clipboard: stored %zu bytes of text (%d entries)", e->text_len, c->count);
+    if (c->cb)
+        c->cb(c->cb_data);
+}
+
+/* Store an already-decoded image buffer as the newest entry. Takes ownership
+ * of `data` in every case (frees it if not stored). */
+static void store_image(dc_clipboard *c, unsigned char *data, size_t len, const char *ext)
+{
+    if (!data || len == 0) {
+        free(data);
+        return;
+    }
+    if (c->count > 0) {
+        struct clip_item *newest = &c->entries[c->count - 1];
+        if (newest->kind == DC_CLIP_IMAGE && newest->image_len == len &&
+            memcmp(newest->image, data, len) == 0) {
+            free(data);
+            return; /* same as last copy */
+        }
+    }
+    if (c->count >= DC_CLIP_MAX && !evict_oldest_unpinned(c)) {
+        free(data);
+        return;
+    }
+    struct clip_item *e = &c->entries[c->count++];
+    memset(e, 0, sizeof(*e));
+    e->id = ++c->next_id;
+    e->kind = DC_CLIP_IMAGE;
+    e->image = data;
+    e->image_len = len;
+    snprintf(e->ext, sizeof(e->ext), "%s", (ext && ext[0]) ? ext : "png");
+
+    int w = 0, h = 0, comp = 0;
+    if (stbi_info_from_memory(data, (int)len, &w, &h, &comp)) {
+        e->width = w;
+        e->height = h;
+    }
+    dc_debug("clipboard: stored image %zu bytes (%dx%d %s, %d entries)", len, e->width, e->height,
+            e->ext, c->count);
     if (c->cb)
         c->cb(c->cb_data);
 }
@@ -78,9 +188,14 @@ static void transfer_finish(struct transfer *t)
     dc_loop_remove_fd(t->c->loop, t->fd);
     close(t->fd);
     if (t->buf) {
-        t->buf[t->len] = '\0';
-        store_entry(t->c, t->buf);
-        free(t->buf);
+        if (t->is_image) {
+            store_image(t->c, (unsigned char *)t->buf, t->len, t->ext);
+            t->buf = NULL; /* ownership moved into store_image() */
+        } else {
+            t->buf[t->len] = '\0';
+            store_text(t->c, t->buf);
+            free(t->buf);
+        }
     }
     if (t->offer)
         zwlr_data_control_offer_v1_destroy(t->offer);
@@ -95,9 +210,9 @@ static void transfer_read(int fd, uint32_t revents, void *data)
     for (;;) {
         if (t->len + 4096 > t->cap) {
             size_t ncap = t->cap ? t->cap * 2 : 8192;
-            if (ncap > DC_CLIP_ENTRY_MAX)
-                ncap = DC_CLIP_ENTRY_MAX;
-            if (ncap <= t->len) { /* entry too big — stop reading */
+            if (ncap > t->cap_limit)
+                ncap = t->cap_limit;
+            if (ncap <= t->len) { /* entry too big -- stop reading */
                 transfer_finish(t);
                 return;
             }
@@ -131,6 +246,10 @@ static void offer_handle_offer(void *data, struct zwlr_data_control_offer_v1 *of
         st->has_utf8 = true;
     else if (strcmp(mime, DC_MIME_TEXT) == 0)
         st->has_text = true;
+    else if (strcmp(mime, DC_MIME_PNG) == 0)
+        st->has_png = true;
+    else if (strcmp(mime, DC_MIME_JPEG) == 0)
+        st->has_jpeg = true;
 }
 
 static const struct zwlr_data_control_offer_v1_listener offer_listener = {
@@ -146,7 +265,8 @@ static void device_handle_data_offer(void *data, struct zwlr_data_control_device
     zwlr_data_control_offer_v1_add_listener(offer, &offer_listener, st);
 }
 
-/* A new selection is available: read its text into history. */
+/* A new selection is available: read its text or image into history. Text
+ * mimes are preferred over image mimes when both are offered. */
 static void device_handle_selection(void *data, struct zwlr_data_control_device_v1 *device,
                                     struct zwlr_data_control_offer_v1 *offer)
 {
@@ -157,10 +277,21 @@ static void device_handle_selection(void *data, struct zwlr_data_control_device_
 
     struct offer_state *st = zwlr_data_control_offer_v1_get_user_data(offer);
     const char *mime = NULL;
-    if (st && st->has_utf8)
+    bool is_image = false;
+    const char *ext = NULL;
+    if (st && st->has_utf8) {
         mime = DC_MIME_UTF8;
-    else if (st && st->has_text)
+    } else if (st && st->has_text) {
         mime = DC_MIME_TEXT;
+    } else if (st && st->has_png) {
+        mime = DC_MIME_PNG;
+        is_image = true;
+        ext = "png";
+    } else if (st && st->has_jpeg) {
+        mime = DC_MIME_JPEG;
+        is_image = true;
+        ext = "jpg";
+    }
     free(st);
     zwlr_data_control_offer_v1_set_user_data(offer, NULL);
 
@@ -182,6 +313,10 @@ static void device_handle_selection(void *data, struct zwlr_data_control_device_
     t->c = c;
     t->fd = fds[0];
     t->offer = offer;
+    t->is_image = is_image;
+    t->cap_limit = is_image ? DC_CLIP_IMAGE_MAX : DC_CLIP_TEXT_MAX;
+    if (is_image)
+        snprintf(t->ext, sizeof(t->ext), "%s", ext);
     dc_loop_add_fd(c->loop, fds[0], POLLIN, transfer_read, t);
 }
 
@@ -234,7 +369,7 @@ void dc_clipboard_destroy(dc_clipboard *c)
     if (c->device)
         zwlr_data_control_device_v1_destroy(c->device);
     for (int i = 0; i < c->count; i++)
-        free(c->entries[(c->head + i) % DC_CLIP_MAX]);
+        free_item(&c->entries[i]);
     free(c);
 }
 
@@ -246,13 +381,31 @@ void dc_clipboard_set_changed_cb(dc_clipboard *c, dc_clip_changed_cb cb, void *u
     c->cb_data = user_data;
 }
 
-int dc_clipboard_history(dc_clipboard *c, const char **out, int max)
+static void fill_public(dc_clip_entry *out, const struct clip_item *e)
+{
+    out->id = e->id;
+    out->kind = e->kind;
+    out->pinned = e->pinned;
+    out->text = e->text;
+    out->text_len = e->text_len;
+    out->image_data = e->image;
+    out->image_len = e->image_len;
+    out->width = e->width;
+    out->height = e->height;
+    out->image_ext = (e->kind == DC_CLIP_IMAGE) ? e->ext : NULL;
+}
+
+int dc_clipboard_list(dc_clipboard *c, dc_clip_entry *out, int max)
 {
     if (!c)
         return 0;
     int n = 0;
     for (int i = c->count - 1; i >= 0 && n < max; i--)
-        out[n++] = c->entries[(c->head + i) % DC_CLIP_MAX];
+        if (c->entries[i].pinned)
+            fill_public(&out[n++], &c->entries[i]);
+    for (int i = c->count - 1; i >= 0 && n < max; i--)
+        if (!c->entries[i].pinned)
+            fill_public(&out[n++], &c->entries[i]);
     return n;
 }
 
@@ -261,16 +414,96 @@ int dc_clipboard_count(dc_clipboard *c)
     return c ? c->count : 0;
 }
 
-void dc_clipboard_copy(dc_clipboard *c, const char *text)
+void dc_clipboard_copy(dc_clipboard *c, uint64_t id)
 {
-    DC_UNUSED(c);
-    if (!text)
+    if (!c)
         return;
-    /* Hand off to wl-copy, detached: robust and avoids owning a data source. */
+    int idx = find_by_id(c, id);
+    if (idx < 0)
+        return;
+    struct clip_item *e = &c->entries[idx];
+
+    if (e->kind == DC_CLIP_TEXT) {
+        /* Hand off to wl-copy, detached: robust and avoids owning a data
+         * source. Text fits comfortably in argv. */
+        pid_t pid = fork();
+        if (pid == 0) {
+            setsid();
+            execlp("wl-copy", "wl-copy", "--", e->text, (char *)NULL);
+            _exit(127);
+        }
+        return;
+    }
+
+    /* Image: binary data can't go through argv, so stage it in a temp file
+     * and let a detached shell pipe it into wl-copy (then clean up). */
+    char path[] = "/tmp/dankc-clip-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0)
+        return;
+    size_t off = 0;
+    while (off < e->image_len) {
+        ssize_t n = write(fd, e->image + off, e->image_len - off);
+        if (n <= 0)
+            break;
+        off += (size_t)n;
+    }
+    close(fd);
+
     pid_t pid = fork();
     if (pid == 0) {
         setsid();
-        execlp("wl-copy", "wl-copy", "--", text, (char *)NULL);
+        char mime[32];
+        snprintf(mime, sizeof(mime), "image/%s", strcmp(e->ext, "jpg") == 0 ? "jpeg" : e->ext);
+        char cmd[512];
+        snprintf(cmd, sizeof(cmd), "wl-copy --type '%s' < '%s'; rm -f '%s'", mime, path, path);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
+}
+
+void dc_clipboard_delete(dc_clipboard *c, uint64_t id)
+{
+    if (!c)
+        return;
+    int idx = find_by_id(c, id);
+    if (idx < 0)
+        return;
+    free_item(&c->entries[idx]);
+    memmove(&c->entries[idx], &c->entries[idx + 1],
+           (size_t)(c->count - idx - 1) * sizeof(c->entries[0]));
+    c->count--;
+    if (c->cb)
+        c->cb(c->cb_data);
+}
+
+void dc_clipboard_toggle_pin(dc_clipboard *c, uint64_t id)
+{
+    if (!c)
+        return;
+    int idx = find_by_id(c, id);
+    if (idx < 0)
+        return;
+    c->entries[idx].pinned = !c->entries[idx].pinned;
+    if (c->cb)
+        c->cb(c->cb_data);
+}
+
+void dc_clipboard_clear_all(dc_clipboard *c)
+{
+    if (!c)
+        return;
+    int w = 0;
+    for (int i = 0; i < c->count; i++) {
+        if (c->entries[i].pinned) {
+            if (w != i)
+                c->entries[w] = c->entries[i];
+            w++;
+        } else {
+            free_item(&c->entries[i]);
+        }
+    }
+    c->count = w;
+    if (c->cb)
+        c->cb(c->cb_data);
 }

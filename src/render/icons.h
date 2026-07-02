@@ -86,9 +86,22 @@
 /* controlCenterButton bluetooth sub-icon, connected state. */
 #define DC_ICON_BLUETOOTH_CONNECTED 0xe1a8
 
-/* Notification Center header's "Clear" button (docs/13-POPOUTS-SPEC.md
- * sec.3, NotificationHeader.qml's "delete_sweep"). Confirmed present in the
- * bundled font via fontTools (unlike the numbered battery glyphs above). */
-#define DC_ICON_DELETE_SWEEP 0xea79
+/* Notification Center + Clipboard headers' clear button (docs/13-POPOUTS-
+ * SPEC.md sec.3/4, NotificationHeader.qml/ClipboardHeader.qml's
+ * "delete_sweep"). NOT 0xea79 -- that codepoint exists in the font but is a
+ * *tractor* glyph (verified on-screen); e16c is what the font's own
+ * .codepoints file maps "delete_sweep" to. */
+#define DC_ICON_DELETE_SWEEP 0xe16c
+
+/* Clipboard History popout (docs/13-POPOUTS-SPEC.md sec.4, ClipboardHeader.qml
+ * / ClipboardEntry.qml / ClipboardThumbnail.qml). All values taken from DMS's
+ * own MaterialSymbolsRounded .codepoints file (the same font dankc bundles)
+ * and confirmed mapped in the TTF's cmap directly -- the classic Material
+ * Icons table disagrees for some names (e.g. push_pin is f10d here, while
+ * e840 exists but is a *different* glyph; verified visually on-screen). */
+#define DC_ICON_PUSH_PIN 0xf10d     /* per-entry pin/unpin */
+#define DC_ICON_CONTENT_COPY 0xe14d /* text-entry fallback glyph */
+#define DC_ICON_SUBJECT 0xe8d2      /* long-text-entry fallback glyph */
+#define DC_ICON_IMAGE 0xe3f4        /* image-entry fallback glyph (thumbnail decode failure) */
 
 #endif /* DC_RENDER_ICONS_H */
