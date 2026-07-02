@@ -12,6 +12,7 @@
 #include "niri/niri.h"
 #include "render/nvg.h"
 #include "services/bluez.h"
+#include "services/clipboard.h"
 #include "services/dbus.h"
 #include "services/audio.h"
 #include "services/mpris.h"
@@ -308,6 +309,7 @@ dc_osd_integrate(osd, g_loop);
                                       .control_center = control_center,
                                       .notif_center = notif_center};
     dc_control *control = dc_control_create(g_loop, control_dispatch, &control_ctx);
+    dc_clipboard *clipboard = dc_clipboard_create(wl, g_loop);
 
     struct sigaction sa = {.sa_handler = handle_signal};
     sigaction(SIGINT, &sa, NULL);
@@ -344,6 +346,7 @@ dc_osd_integrate(osd, g_loop);
     dc_loop_run(g_loop);
 
     dc_info("shutting down");
+    dc_clipboard_destroy(clipboard);
     dc_control_destroy(control);
     dc_launcher_destroy(launcher);
     dc_notif_center_destroy(notif_center);

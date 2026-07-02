@@ -13,6 +13,7 @@
 #include <xkbcommon/xkbcommon.h>
 
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
+#include "wlr-data-control-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 #include "viewporter-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
@@ -353,6 +354,10 @@ static void registry_handle_global(void *data, struct wl_registry *registry, uin
     } else if (strcmp(interface, wp_fractional_scale_manager_v1_interface.name) == 0) {
         wl->fractional_scale_mgr =
             wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1);
+    } else if (strcmp(interface, zwlr_data_control_manager_v1_interface.name) == 0) {
+        wl->data_control_manager =
+            wl_registry_bind(registry, name, &zwlr_data_control_manager_v1_interface,
+                             DC_MIN(version, 2u));
     } else if (strcmp(interface, wl_seat_interface.name) == 0) {
         wl->seat = wl_registry_bind(registry, name, &wl_seat_interface, DC_MIN(version, 7u));
         wl_seat_add_listener(wl->seat, &seat_listener, wl);
