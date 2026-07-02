@@ -24,11 +24,17 @@ Weather w/ 7-day forecast/Media w/ album art/Wallpapers; clock/music/weather chi
 Plus: full-Unicode fallback fonts + monochrome emoji; **Makefile now does header dep
 tracking (-MMD)** — stale-.o struct mismatches previously caused phantom "corruption";
 dc_render_icon now saves/restores nvg state (recurring garbled-text class killed).
-Remaining polish: power menu modal, tuned power-profile backend, Hourly forecast,
-wallpaper browser, notif action-images, HarfBuzz shaping, P7 perf (damage tracking, poll
-reduction, font subsetting). Plugins (T29) still deferred.
+Remaining polish: tuned power-profile backend (in flight), notif action-images (in flight),
+settings/launcher/CC-depth/clipboard waves (in flight), HarfBuzz shaping, P7 perf (damage
+tracking, poll reduction, font subsetting). Plugins (T29) still deferred.
+Power menu modal DONE (wt/powermenu): centered modal, arm-then-confirm, login1 actions,
+`ctl power-menu`, Mod+Escape keybind, DANKC_POWER_DRYRUN/POWERMENU_DEMO hooks.
 Media marquee DONE (wt/marquee): bar music title scrolls DMS-style (2s pause / 60ms-per-px
 bounce, playing+overflow gated, frame-callback driven, DANKC_MARQUEE_TEST=1 test hook).
+Hourly forecast + wallpaper grid DONE (wt/dash): weather.c fetches &hourly=..., Weather tab
+Daily/Hourly pills toggle a next-24h strip; Wallpapers tab is a lazy-thumbnail 4-col grid
+(stb decode + box-sample, 2/frame), click = config wallpaper + dynamic color +
+swaybg-if-present, wheel scroll.
 
 ## Previous status — bar parity DONE ✅ (S1–S6, 2026-07-02); panels parity next
 Bar now pixel-matches the user's live DMS bottom bar (docs/12-BAR-SPEC.md, commits
