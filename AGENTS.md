@@ -14,7 +14,18 @@ A lightweight desktop shell for the **niri** Wayland compositor, written in C �
 DankMaterialShell's core (QML/Quickshell + Go) as one native binary. Full spec in `docs/` (00–11).
 niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
 
-## Current status — M2/M3/M4 in progress 🔨 (bar live, control center + OSD done)
+## Current status — bar parity DONE ✅ (S1–S6, 2026-07-02); panels parity next
+Bar now pixel-matches the user's live DMS bottom bar (docs/12-BAR-SPEC.md, commits
+07831c7..c412bb6): floating rounded 40px container + elevation shadow + bottom position,
+config-driven widget host (BasePill chips, user's exact L/C/R widget arrays), workspace
+capsules w/ morph animation, music+transport, weather (Open-Meteo svc), cpu/mem (sysmon svc),
+CC compound pill, Material battery glyph + AC bolt, unread dot, hover states + cursor-shape
+pointer + wheel-scroll workspace switching, DMS settings.json auto-import, Arabic/Urdu
+fallback font (fontconfig) + cmap-coverage sanitizer. Full Material Symbols variable font
+vendored (14.5MB — subset later, P7). NEXT: docs/13-POPOUTS-SPEC.md (panel parity vs user
+screenshots in ~/Pictures/Screenshots/), starting with P4a bar-position-aware popout anchoring.
+
+## Previous status — M2/M3/M4 (bar live, control center + OSD done)
 - **Builds clean** (gcc + wayland-scanner, `make` → `./bin/dankc`, zero warnings).
 - **Runs on niri**: layer-shell bar per output via **nanovg**, closely matching DMS. LEFT: apps-grid
   launcher · workspace green-pill + grey dots (sorted) · app icon (PNG+SVG) + "AppName · Title". CENTER:

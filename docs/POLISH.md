@@ -29,16 +29,13 @@ Reference DMS live (it's running): read its QML at
 - **Rounded screen corners** (DMS Frame): overlay layer drawing screen-corner
   radius. New ui/frame.c.
 
-## P3 — Bar polish
-- **Hover states + tooltips** on every bar item (DMS highlights on hover with a
-  rounded bg; tooltips on icons). Needs pointer-motion tracking -> re-render.
-- **Workspace pill morph animation** on switch (width/position tween; needs bar
-  frame-callback driving, currently 1 Hz tick). Files: ui/bar/bar.c draw_workspaces.
-- **Click feedback** (ripple/press) on bar buttons.
-- **Media widget**: album art + play/pause/next inline (services/mpris.c already
-  reads title/artist; add art + controls).
-- **Battery**: charging bolt overlay + time-to-empty (UPower via D-Bus).
-- **Per-widget exact spacing/order** vs DMS right cluster (compare with grim).
+## P3 — Bar polish — DONE 2026-07-02 (S1–S6, see docs/12-BAR-SPEC.md)
+- ~~Hover states~~ ✅ (tooltips: DMS bar pills mostly have none — matched behavior).
+- ~~Workspace pill morph animation~~ ✅ frame-callback driven.
+- Click feedback: ripple OFF in user's DMS config — intentionally not implemented.
+- ~~Media widget~~ ✅ (transport inline; marquee + bar album-art N/A per DMS anatomy).
+- ~~Battery~~ ✅ glyph + AC bolt (time-to-empty deferred to battery popout, docs/13).
+- ~~Per-widget spacing/order~~ ✅ config-driven from user's DMS arrays.
 
 ## P4 — Panels: depth to match DMS
 - **Control Center**: expandable sections, live % labels on sliders, network
