@@ -154,6 +154,17 @@ static struct dc_output *first_output(struct dc_wayland *wl)
     return NULL;
 }
 
+/* Run a shell command detached (children auto-reaped via SIGCHLD SIG_IGN). */
+static void run_sh(const char *cmd)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+}
+
 /* Map a dankctl command to a shell action. */
 static void control_dispatch(const char *cmd, void *data)
 {
@@ -167,6 +178,10 @@ static void control_dispatch(const char *cmd, void *data)
         dc_notif_center_toggle(c->notif_center, out);
     else if (strcmp(cmd, "clipboard") == 0 || strcmp(cmd, "clipboard toggle") == 0)
         dc_clip_picker_toggle(c->clip_picker, out);
+    else if (strcmp(cmd, "screenshot") == 0)
+        /* Full screen -> ~/Pictures + clipboard (needs grim + wl-copy). */
+        run_sh("f=\"${XDG_PICTURES_DIR:-$HOME/Pictures}/screenshot-$(date +%Y%m%d-%H%M%S).png\"; "
+               "mkdir -p \"$(dirname \"$f\")\"; grim \"$f\" && wl-copy --type image/png < \"$f\"");
     else if (strcmp(cmd, "quit") == 0)
         dc_loop_stop(g_loop);
     else
@@ -192,7 +207,9 @@ static void print_keybinds(void)
     printf("// DankC keybinds — add inside the binds { } block of ~/.config/niri/config.kdl\n"
            "    Mod+D            { spawn \"dankc\" \"ctl\" \"launcher\"; }\n"
            "    Mod+N            { spawn \"dankc\" \"ctl\" \"notifications\"; }\n"
-           "    Mod+Shift+C      { spawn \"dankc\" \"ctl\" \"control-center\"; }\n");
+           "    Mod+Shift+C      { spawn \"dankc\" \"ctl\" \"control-center\"; }\n"
+           "    Mod+V            { spawn \"dankc\" \"ctl\" \"clipboard\"; }\n"
+           "    Print            { spawn \"dankc\" \"ctl\" \"screenshot\"; }\n");
 }
 
 /* Route a left click: into the control-center popup if it's the target, else to
