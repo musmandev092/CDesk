@@ -15,12 +15,16 @@ BASE_CFLAGS := -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE $(INCLUDES) 
 	$(shell $(PKG_CONFIG) --cflags $(PKGS))
 
 CFLAGS   ?= -O2 -g
-CFLAGS   += $(BASE_CFLAGS) $(WARNINGS)
+# -MMD -MP: emit .d dependency files so header edits rebuild every affected
+# object. Without this, a struct change in a header leaves stale .o files with
+# the OLD field offsets silently linked together (caused real cross-module
+# memory "corruption" after a merge touched core/config.h).
+CFLAGS   += $(BASE_CFLAGS) $(WARNINGS) -MMD -MP
 
 # C++ is used for exactly one module (theme/dynamic.cpp, Material colour math).
 CXXFLAGS ?= -O2 -g
 CXXFLAGS += -std=c++17 $(INCLUDES) $(shell $(PKG_CONFIG) --cflags $(PKGS)) -Wall -Wextra \
-	-Wno-unused-parameter
+	-Wno-unused-parameter -MMD -MP
 
 # Vendored third-party code (nanovg, cJSON): compile with warnings suppressed so
 # our own -Wextra output stays meaningful.
@@ -77,6 +81,9 @@ $(TP_OBJ): %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -rf bin protocol/generated $(OBJ) $(CXX_OBJ) $(TP_OBJ) $(PROTO_O)
+	rm -rf bin protocol/generated $(OBJ) $(CXX_OBJ) $(TP_OBJ) $(PROTO_O) $(DEPS)
+
+DEPS := $(OBJ:.o=.d) $(CXX_OBJ:.o=.d)
+-include $(DEPS)
 
 .PHONY: all clean

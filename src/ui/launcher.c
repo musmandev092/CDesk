@@ -51,6 +51,14 @@
 
 #define DC_LAUNCHER_SCROLL_STEP 56.0f
 #define DC_LAUNCHER_QUERY_MAX 128
+
+/* Per-app_id nanovg image cache, same convention as bar.c's tray_cache:
+ * images must stay alive until nanovg actually flushes the draw calls at
+ * nvgEndFrame(), so they can't be created+deleted within the same draw_*_row
+ * call (nvgDeleteImage() right after nvgFill() frees the GL texture before
+ * the batched draw ever executes, rendering the icon as solid black). Cache
+ * for the launcher's lifetime instead of reloading/deleting every frame. */
+#define DC_LAUNCHER_ICON_CACHE_MAX 128
 /* Inset from the screen's left edge when bar-adjacent (docs/13-POPOUTS-SPEC.md
  * sec.0/6: DMS anchors the launcher bottom-left above the bar, not centered). */
 #define DC_LAUNCHER_SIDE_MARGIN 12
@@ -86,6 +94,14 @@ struct dc_launcher {
     char query[DC_LAUNCHER_QUERY_MAX];
     const dc_app *results[64];
     int result_count;
+
+    /* App-icon nanovg image cache, keyed by app_id (see
+     * DC_LAUNCHER_ICON_CACHE_MAX comment above). */
+    struct {
+        char id[DC_APP_ID];
+        int image;
+    } icon_cache[DC_LAUNCHER_ICON_CACHE_MAX];
+    int icon_cache_n;
     int selected;
     float scroll; /* pixel offset into the (list- or grid-shaped) result list */
     int view_mode;
@@ -268,6 +284,29 @@ static void clamp_scroll(dc_launcher *l)
         l->scroll = scroll_max;
 }
 
+/* Resolve+load an app icon by app_id, cached per id (nanovg image handle) —
+ * see DC_LAUNCHER_ICON_CACHE_MAX comment: must not be deleted per-frame. */
+static int launcher_get_icon(dc_launcher *l, const dc_app *app, int size)
+{
+    for (int i = 0; i < l->icon_cache_n; i++)
+        if (strcmp(l->icon_cache[i].id, app->id) == 0)
+            return l->icon_cache[i].image;
+
+    int img = 0;
+    char *icon_path = dc_icon_resolve(app->id, size, 1);
+    if (icon_path) {
+        img = dc_render_load_icon(l->render, icon_path, size);
+        free(icon_path);
+    }
+    if (l->icon_cache_n < DC_LAUNCHER_ICON_CACHE_MAX) {
+        snprintf(l->icon_cache[l->icon_cache_n].id, sizeof(l->icon_cache[l->icon_cache_n].id), "%s",
+                 app->id);
+        l->icon_cache[l->icon_cache_n].image = img;
+        l->icon_cache_n++;
+    }
+    return img;
+}
+
 /* One list row: icon, name (14px), description (12px, dim) — sec.6. */
 static void draw_list_row(dc_launcher *l, const dc_app *app, float x, float y, float w,
                           bool selected)
@@ -284,13 +323,11 @@ static void draw_list_row(dc_launcher *l, const dc_app *app, float x, float y, f
 
     float row_cy = y + DC_LAUNCHER_ROW_H / 2.0f;
 
-    /* App icon (PNG/SVG), loaded per-render and freed after the frame. */
-    int img = 0;
-    char *icon_path = dc_icon_resolve(app->id, 36, 1);
-    if (icon_path) {
-        img = dc_render_load_icon(l->render, icon_path, 36);
-        free(icon_path);
-    }
+    /* App icon (PNG/SVG), resolved+loaded once and cached for the launcher's
+     * lifetime (launcher_get_icon) — nanovg doesn't flush draw calls until
+     * nvgEndFrame(), so deleting the image right after nvgFill() would free
+     * the texture before it's actually drawn. */
+    int img = launcher_get_icon(l, app, 36);
     const float isz = 36.0f;
     const float icx = x + 12.0f;
     if (img > 0) {
@@ -303,8 +340,6 @@ static void draw_list_row(dc_launcher *l, const dc_app *app, float x, float y, f
         dc_render_icon(l->render, DC_ICON_APPS, icx + isz / 2.0f, row_cy, 26.0f, t->surface_text,
                        NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
     }
-    if (img > 0)
-        nvgDeleteImage(vg, img);
 
     const float text_x = icx + isz + 14.0f;
     const float text_w = x + w - 10.0f - text_x;
@@ -350,19 +385,13 @@ static void draw_grid_cell(dc_launcher *l, const dc_app *app, float x, float y, 
     const float icx = x + w / 2.0f - isz / 2.0f;
     const float icy = y + 12.0f;
 
-    int img = 0;
-    char *icon_path = dc_icon_resolve(app->id, 40, 1);
-    if (icon_path) {
-        img = dc_render_load_icon(l->render, icon_path, 40);
-        free(icon_path);
-    }
+    int img = launcher_get_icon(l, app, 40);
     if (img > 0) {
         NVGpaint pat = nvgImagePattern(vg, icx, icy, isz, isz, 0.0f, img, 1.0f);
         nvgBeginPath(vg);
         nvgRoundedRect(vg, icx, icy, isz, isz, 9.0f);
         nvgFillPaint(vg, pat);
         nvgFill(vg);
-        nvgDeleteImage(vg, img);
     } else {
         dc_render_icon(l->render, DC_ICON_APPS, x + w / 2.0f, icy + isz / 2.0f, 28.0f,
                        t->surface_text, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
