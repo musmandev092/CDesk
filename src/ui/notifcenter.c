@@ -9,12 +9,14 @@
 #include "services/notifications.h"
 #include "theme/theme.h"
 #include "ui/hover.h"
+#include "ui/notif_image.h"
 #include "ui/popout.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
 #include <GLES2/gl2.h>
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,14 +68,17 @@ typedef struct {
     float card_x0, card_y0, card_x1, card_y1;
     float close_x0, close_y0, close_x1, close_y1;
     float dismiss_x0, dismiss_y0, dismiss_x1, dismiss_y1;
-    bool has_action;
-    float action_x0, action_y0, action_x1, action_y1;
+    bool has_dismiss;
+    int action_count;
+    float action_x0[DC_NOTIF_ACTION_MAX], action_x1[DC_NOTIF_ACTION_MAX];
+    float action_y0, action_y1; /* shared row -- same for every action button */
 } nc_card_hit;
 
 /* Hover ids (docs/13-POPOUTS-SPEC.md sec.3: hover bg on cards, X, Dismiss/
  * action buttons, tabs, Clear). The fixed header elements get small named
- * ids; each card's sub-regions are packed as NC_HOVER_CARD_BASE + hit-index*4
- * + {0:body,1:close,2:dismiss,3:action} since the card list is dynamic
+ * ids; each card's sub-regions are packed as
+ * NC_HOVER_CARD_BASE + hit-index*NC_HOVER_CARD_STRIDE + kind, kind in
+ * {0:body,1:close,2:dismiss,3+j:action j} since the card list is dynamic
  * (count/order changes every render). */
 #define NC_HOVER_NONE 0
 #define NC_HOVER_TAB0 1
@@ -81,6 +86,7 @@ typedef struct {
 #define NC_HOVER_CLEAR 3
 #define NC_HOVER_SETTINGS 4
 #define NC_HOVER_CARD_BASE 10
+#define NC_HOVER_CARD_STRIDE (3 + DC_NOTIF_ACTION_MAX)
 
 struct dc_notif_center {
     dc_wayland *wl;
@@ -253,21 +259,36 @@ static void draw_card(dc_notif_center *nc, const dc_notification *n, float x, fl
     nvgFillColor(vg, tc(t->surface_container_high));
     nvgFill(vg);
 
-    /* Avatar initial, centered on the header+title+body text block (leaves
-     * the bottom button row clear, matching the reference). */
+    /* Avatar: the notification's image (image-data hint / image-path /
+     * app_icon file) cover-fit into the circle, else an initial-letter
+     * circle -- centered on the header+title+body text block, leaving the
+     * bottom button row clear (matching the reference). See notif_image.h;
+     * the cache is shared with toasts.c so this doesn't re-decode/upload a
+     * texture that's already on-screen in the toast stack. */
     const float av_r = 18.0f;
     const float av_cx = x + 16.0f + av_r;
     const float av_cy = y + 14.0f + 34.0f;
+    int img_w = 0, img_h = 0;
+    int img = dc_notif_image_get(nc->render, n, &img_w, &img_h);
     nvgBeginPath(vg);
     nvgCircle(vg, av_cx, av_cy, av_r);
-    nvgFillColor(vg, tc_alpha(t->primary, n->urgency == DC_URGENCY_CRITICAL ? 255 : 150));
-    nvgFill(vg);
-    char initial[2] = {n->app_name[0] ? (char)toupper((unsigned char)n->app_name[0]) : '?', 0};
-    nvgFontFaceId(vg, nc->render->font_ui);
-    nvgFontSize(vg, 16.0f);
-    nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
-    nvgFillColor(vg, tc(t->surface_container));
-    nvgText(vg, av_cx, av_cy + 1.0f, initial, NULL);
+    if (img > 0 && img_w > 0 && img_h > 0) {
+        float scale = fmaxf((av_r * 2.0f) / (float)img_w, (av_r * 2.0f) / (float)img_h);
+        float iw = (float)img_w * scale, ih = (float)img_h * scale;
+        NVGpaint pat =
+            nvgImagePattern(vg, av_cx - iw / 2.0f, av_cy - ih / 2.0f, iw, ih, 0.0f, img, 1.0f);
+        nvgFillPaint(vg, pat);
+        nvgFill(vg);
+    } else {
+        nvgFillColor(vg, tc_alpha(t->primary, n->urgency == DC_URGENCY_CRITICAL ? 255 : 150));
+        nvgFill(vg);
+        char initial[2] = {n->app_name[0] ? (char)toupper((unsigned char)n->app_name[0]) : '?', 0};
+        nvgFontFaceId(vg, nc->render->font_ui);
+        nvgFontSize(vg, 16.0f);
+        nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+        nvgFillColor(vg, tc(t->surface_container));
+        nvgText(vg, av_cx, av_cy + 1.0f, initial, NULL);
+    }
 
     /* X (close/history) button, top-right. */
     const float close_r = 12.0f;
@@ -318,10 +339,16 @@ static void draw_card(dc_notif_center *nc, const dc_notification *n, float x, fl
         nvgRestore(vg);
     }
 
-    /* Bottom-right button row: [action] Dismiss, right-aligned. */
+    /* Bottom-right button row: [actions...] Dismiss, right-aligned. DMS hides
+     * its separate Dismiss pill once actionCount>=3 (NotificationCard.qml
+     * clearButton.visible: actionCount<3) since the row is already crowded
+     * with real action buttons by then -- mirrored here. Actions are drawn
+     * right-to-left (closest to Dismiss first) so array index order still
+     * reads left-to-right, matching the sender's actions[] order. */
     const float row_y1 = y + DC_NC_CARD_H - 12.0f;
     const float row_h = 22.0f;
     const float row_y0 = row_y1 - row_h;
+    const float row_min_x = tx; /* never crowd past the text column's left edge */
     float cursor_x1 = x + w - 14.0f;
 
     nvgFontFaceId(vg, nc->render->font_ui);
@@ -329,34 +356,39 @@ static void draw_card(dc_notif_center *nc, const dc_notification *n, float x, fl
     nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
 
     float b[4];
-    nvgTextBounds(vg, 0, 0, "Dismiss", NULL, b);
-    float dismiss_w = b[2] - b[0] + 18.0f;
-    float dismiss_x0 = cursor_x1 - dismiss_w;
-    nvgFillColor(vg, tc_alpha(t->surface_text, 190));
-    nvgText(vg, (dismiss_x0 + cursor_x1) / 2.0f, (row_y0 + row_y1) / 2.0f, "Dismiss", NULL);
-    hit->dismiss_x0 = dismiss_x0;
-    hit->dismiss_y0 = row_y0;
-    hit->dismiss_x1 = cursor_x1;
-    hit->dismiss_y1 = row_y1;
-    cursor_x1 = dismiss_x0 - 10.0f;
+    hit->has_dismiss = n->action_count < 3;
+    if (hit->has_dismiss) {
+        nvgTextBounds(vg, 0, 0, "Dismiss", NULL, b);
+        float dismiss_w = b[2] - b[0] + 18.0f;
+        float dismiss_x0 = cursor_x1 - dismiss_w;
+        nvgFillColor(vg, tc_alpha(t->surface_text, 190));
+        nvgText(vg, (dismiss_x0 + cursor_x1) / 2.0f, (row_y0 + row_y1) / 2.0f, "Dismiss", NULL);
+        hit->dismiss_x0 = dismiss_x0;
+        hit->dismiss_y0 = row_y0;
+        hit->dismiss_x1 = cursor_x1;
+        hit->dismiss_y1 = row_y1;
+        cursor_x1 = dismiss_x0 - 10.0f;
+    }
 
-    if (n->action_key[0]) {
-        char action_buf[DC_NOTIF_ACTION];
-        snprintf(action_buf, sizeof(action_buf), "%s",
-                (n->action_label[0]) ? n->action_label : "Open");
-        nvgTextBounds(vg, 0, 0, action_buf, NULL, b);
-        float action_w = b[2] - b[0] + 18.0f;
-        float action_min_x = tx; /* never crowd past the text column's left edge */
-        float action_x0 = cursor_x1 - action_w;
-        if (action_x0 < action_min_x)
-            action_x0 = action_min_x;
+    hit->action_count = n->action_count;
+    hit->action_y0 = row_y0;
+    hit->action_y1 = row_y1;
+    for (int i = n->action_count - 1; i >= 0; i--) {
+        const char *label = n->actions[i].label[0] ? n->actions[i].label : "Open";
+        nvgTextBounds(vg, 0, 0, label, NULL, b);
+        float aw = b[2] - b[0] + 18.0f;
+        if (aw < 48.0f)
+            aw = 48.0f;
+        float a_x0 = cursor_x1 - aw;
+        if (a_x0 < row_min_x || cursor_x1 <= row_min_x) {
+            hit->action_x0[i] = hit->action_x1[i] = 0.0f; /* no room -- not drawn, not clickable */
+            continue;
+        }
         nvgFillColor(vg, tc(t->primary));
-        nvgText(vg, (action_x0 + cursor_x1) / 2.0f, (row_y0 + row_y1) / 2.0f, action_buf, NULL);
-        hit->has_action = true;
-        hit->action_x0 = action_x0;
-        hit->action_y0 = row_y0;
-        hit->action_x1 = cursor_x1;
-        hit->action_y1 = row_y1;
+        nvgText(vg, (a_x0 + cursor_x1) / 2.0f, (row_y0 + row_y1) / 2.0f, label, NULL);
+        hit->action_x0[i] = a_x0;
+        hit->action_x1[i] = cursor_x1;
+        cursor_x1 = a_x0 - 8.0f;
     }
 }
 
@@ -430,42 +462,38 @@ static void draw_nc_hover(dc_notif_center *nc)
         radius = (y1 - y0) / 2.0f;
     } else if (nc->hover_id >= NC_HOVER_CARD_BASE) {
         int rel = nc->hover_id - NC_HOVER_CARD_BASE;
-        int i = rel / 4, kind = rel % 4;
+        int i = rel / NC_HOVER_CARD_STRIDE, kind = rel % NC_HOVER_CARD_STRIDE;
         if (i < 0 || i >= nc->hit_count)
             return;
         const nc_card_hit *hit = &nc->hits[i];
-        switch (kind) {
-        case 0:
+        if (kind == 0) {
             x0 = hit->card_x0;
             y0 = hit->card_y0;
             x1 = hit->card_x1;
             y1 = hit->card_y1;
             radius = 12.0f;
-            break;
-        case 1:
+        } else if (kind == 1) {
             x0 = hit->close_x0;
             y0 = hit->close_y0;
             x1 = hit->close_x1;
             y1 = hit->close_y1;
             radius = (x1 - x0) / 2.0f;
-            break;
-        case 2:
+        } else if (kind == 2) {
+            if (!hit->has_dismiss)
+                return;
             x0 = hit->dismiss_x0;
             y0 = hit->dismiss_y0;
             x1 = hit->dismiss_x1;
             y1 = hit->dismiss_y1;
             radius = (y1 - y0) / 2.0f;
-            break;
-        case 3:
-            if (!hit->has_action)
-                return;
-            x0 = hit->action_x0;
+        } else if (kind - 3 < hit->action_count) {
+            int j = kind - 3;
+            x0 = hit->action_x0[j];
             y0 = hit->action_y0;
-            x1 = hit->action_x1;
+            x1 = hit->action_x1[j];
             y1 = hit->action_y1;
             radius = (y1 - y0) / 2.0f;
-            break;
-        default:
+        } else {
             return;
         }
     } else {
@@ -693,6 +721,11 @@ static void nc_render(dc_notif_center *nc)
 
     nvgEndFrame(vg);
 
+    /* GL context is still current here -- drop cached textures for any
+     * notification that's no longer Current/History (dismissed/cleared)
+     * before it's possible to forget and leak the texture. */
+    dc_notif_image_gc(nc->render, nc->notifications);
+
     if ((dc_anim_active(&nc->anim) || nc->closing) && !nc->frame_cb) {
         nc->frame_cb = wl_surface_frame(nc->surface);
         wl_callback_add_listener(nc->frame_cb, &nc_frame_listener, nc);
@@ -885,14 +918,15 @@ static int nc_hittest(dc_notif_center *nc, double x, double y)
     for (int i = 0; i < nc->hit_count; i++) {
         nc_card_hit *hit = &nc->hits[i];
         if (in_rect(x, y, hit->close_x0, hit->close_y0, hit->close_x1, hit->close_y1))
-            return NC_HOVER_CARD_BASE + i * 4 + 1;
-        if (in_rect(x, y, hit->dismiss_x0, hit->dismiss_y0, hit->dismiss_x1, hit->dismiss_y1))
-            return NC_HOVER_CARD_BASE + i * 4 + 2;
-        if (hit->has_action &&
-            in_rect(x, y, hit->action_x0, hit->action_y0, hit->action_x1, hit->action_y1))
-            return NC_HOVER_CARD_BASE + i * 4 + 3;
+            return NC_HOVER_CARD_BASE + i * NC_HOVER_CARD_STRIDE + 1;
+        if (hit->has_dismiss &&
+            in_rect(x, y, hit->dismiss_x0, hit->dismiss_y0, hit->dismiss_x1, hit->dismiss_y1))
+            return NC_HOVER_CARD_BASE + i * NC_HOVER_CARD_STRIDE + 2;
+        for (int j = 0; j < hit->action_count; j++)
+            if (in_rect(x, y, hit->action_x0[j], hit->action_y0, hit->action_x1[j], hit->action_y1))
+                return NC_HOVER_CARD_BASE + i * NC_HOVER_CARD_STRIDE + 3 + j;
         if (in_rect(x, y, hit->card_x0, hit->card_y0, hit->card_x1, hit->card_y1))
-            return NC_HOVER_CARD_BASE + i * 4 + 0;
+            return NC_HOVER_CARD_BASE + i * NC_HOVER_CARD_STRIDE + 0;
     }
     return NC_HOVER_NONE;
 }
@@ -936,16 +970,19 @@ void dc_notif_center_handle_click(dc_notif_center *nc, double x, double y)
     for (int i = 0; i < nc->hit_count; i++) {
         nc_card_hit *hit = &nc->hits[i];
         if (in_rect(x, y, hit->close_x0, hit->close_y0, hit->close_x1, hit->close_y1) ||
-            in_rect(x, y, hit->dismiss_x0, hit->dismiss_y0, hit->dismiss_x1, hit->dismiss_y1)) {
+            (hit->has_dismiss &&
+             in_rect(x, y, hit->dismiss_x0, hit->dismiss_y0, hit->dismiss_x1, hit->dismiss_y1))) {
             dc_notifications_dismiss(nc->notifications, hit->id);
             nc_render(nc);
             return;
         }
-        if (hit->has_action &&
-            in_rect(x, y, hit->action_x0, hit->action_y0, hit->action_x1, hit->action_y1)) {
-            dc_notifications_invoke_action(nc->notifications, hit->id);
-            nc_render(nc);
-            return;
+        for (int j = 0; j < hit->action_count; j++) {
+            if (in_rect(x, y, hit->action_x0[j], hit->action_y0, hit->action_x1[j],
+                        hit->action_y1)) {
+                dc_notifications_invoke_action(nc->notifications, hit->id, j);
+                nc_render(nc);
+                return;
+            }
         }
     }
 }
