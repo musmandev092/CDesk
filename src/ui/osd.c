@@ -54,12 +54,11 @@ struct dc_osd {
 
     dc_anim anim;
     struct wl_callback *frame_cb;
+    bool closing;
 };
 
 static void osd_render(dc_osd *osd);
-
-static void osd_frame_done(void *data, struct wl_callback *cb, uint32_t time);
-static const struct wl_callback_listener osd_frame_listener = {.done = osd_frame_done};
+static void osd_hide(dc_osd *osd);
 
 static void osd_frame_done(void *data, struct wl_callback *cb, uint32_t time)
 {
@@ -67,9 +66,14 @@ static void osd_frame_done(void *data, struct wl_callback *cb, uint32_t time)
     DC_UNUSED(time);
     wl_callback_destroy(cb);
     osd->frame_cb = NULL;
-    if (osd->visible && dc_anim_active(&osd->anim))
+    if (!osd->visible)
+        return;
+    if (dc_anim_active(&osd->anim))
         osd_render(osd);
+    else if (osd->closing)
+        osd_hide(osd); /* exit fade finished */
 }
+static const struct wl_callback_listener osd_frame_listener = {.done = osd_frame_done};
 
 static void recompute_physical(dc_osd *osd)
 {
@@ -108,8 +112,10 @@ static void osd_render(dc_osd *osd)
 
     nvgBeginFrame(vg, w, h, (float)osd->scale120 / DC_SCALE_BASE);
 
-    /* Entrance: fade in + slide up from below (DMS OSD). */
+    /* Entrance/exit: fade + slide up from below (DMS OSD). Closing reverses. */
     float p = dc_anim_progress(&osd->anim);
+    if (osd->closing)
+        p = 1.0f - (p > 1.0f ? 1.0f : p);
     float ap = p > 1.0f ? 1.0f : p;
     nvgGlobalAlpha(vg, ap);
     nvgTranslate(vg, 0.0f, (1.0f - ap) * 16.0f);
@@ -162,7 +168,7 @@ static void osd_render(dc_osd *osd)
 
     nvgEndFrame(vg);
 
-    if (dc_anim_active(&osd->anim) && !osd->frame_cb) {
+    if ((dc_anim_active(&osd->anim) || osd->closing) && !osd->frame_cb) {
         osd->frame_cb = wl_surface_frame(osd->surface);
         wl_callback_add_listener(osd->frame_cb, &osd_frame_listener, osd);
     }
@@ -232,6 +238,21 @@ static void osd_hide(dc_osd *osd)
     osd->layer_surface = NULL;
     osd->surface = NULL;
     osd->visible = false;
+    osd->closing = false;
+}
+
+/* Begin the exit fade; teardown happens when it completes. */
+static void osd_begin_close(dc_osd *osd)
+{
+    if (!osd->visible || osd->closing)
+        return;
+    dc_anim_start(&osd->anim, DC_DUR_SHORT, DC_EASE_EMPHASIZED_ACCEL);
+    osd->closing = true;
+    if (!dc_anim_active(&osd->anim)) {
+        osd_hide(osd);
+        return;
+    }
+    osd_render(osd);
 }
 
 static void arm_timer(dc_osd *osd)
@@ -248,7 +269,7 @@ static void timer_cb(int fd, uint32_t revents, void *data)
     uint64_t expirations;
     if (read(fd, &expirations, sizeof(expirations)) < 0)
         return;
-    osd_hide((dc_osd *)data);
+    osd_begin_close((dc_osd *)data);
 }
 
 dc_osd *dc_osd_create(dc_wayland *wl, dc_egl *egl, dc_render *render)
@@ -277,6 +298,11 @@ void dc_osd_show_volume(dc_osd *osd, dc_output *output, int volume, bool muted)
     dc_debug("osd volume %d%s", volume, muted ? " (muted)" : "");
 
     if (osd->visible) {
+        /* A new change during the exit fade cancels it and re-shows. */
+        if (osd->closing) {
+            osd->closing = false;
+            dc_anim_start(&osd->anim, DC_DUR_SHORT, DC_EASE_EMPHASIZED_DECEL);
+        }
         osd_render(osd);
         arm_timer(osd);
         return;
