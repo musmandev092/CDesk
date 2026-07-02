@@ -2,7 +2,10 @@
  *
  * Watches the seat's selection and reads text/plain *and* image/{png,jpeg}
  * content (up to a size cap) into a small history list; can copy an entry
- * back, delete it, or pin it (pin state is in-memory only, not persisted).
+ * back, delete it, or pin it. Pinned *text* entries are persisted to
+ * ~/.local/state/dankc/clipboard_pins.json (cJSON) and reloaded on the next
+ * run; pinned *images* are not persisted (session-only -- re-pin after a
+ * restart if still on the clipboard/history).
  * Feeds the clipboard picker (bar clipboard icon), matching DMS's clipboard
  * history (docs/13-POPOUTS-SPEC.md sec.4). See docs/03-SERVICES.
  */
