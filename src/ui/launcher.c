@@ -1354,6 +1354,32 @@ void dc_launcher_handle_motion(dc_launcher *l, double x, double y)
     if (!l->visible || l->closing)
         return;
     launcher_layout lay = launcher_get_layout((float)l->logical_width, (float)l->logical_height);
+
+    /* Hover-select action rows while browsing the Actions= sub-list
+     * (docs/POLISH.md P4 item 3). */
+    if (l->action_mode) {
+        float ry0, list_h;
+        launcher_results_region(l, &lay, &ry0, &list_h);
+        if (y < (double)ry0 || y > (double)(ry0 + list_h) || !l->action_app)
+            return;
+        int idx = (int)((y - (double)ry0) / (double)DC_LAUNCHER_ROW_H);
+        if (idx < 0 || idx >= l->action_app->action_count || idx == l->action_selected)
+            return;
+        l->action_selected = idx;
+        launcher_render(l);
+        return;
+    }
+
+    /* Hovering the calc banner selects it (selected = -1), same as rows. */
+    if (l->calc_active && in_rect(x, y, lay.ix, lay.list_y0, lay.ix + lay.iw,
+                                  lay.list_y0 + DC_LAUNCHER_CALC_ROW_H)) {
+        if (l->selected != -1) {
+            l->selected = -1;
+            launcher_render(l);
+        }
+        return;
+    }
+
     int idx = launcher_row_at(l, &lay, x, y);
     if (idx < 0 || idx == l->selected)
         return;
@@ -1365,9 +1391,13 @@ void dc_launcher_handle_scroll(dc_launcher *l, int steps_v)
 {
     if (!l->visible || l->closing || steps_v == 0)
         return;
+    if (l->action_mode) /* action sub-lists are short (<= 8): nothing to scroll */
+        return;
     launcher_layout lay = launcher_get_layout((float)l->logical_width, (float)l->logical_height);
+    float ry0, list_h;
+    launcher_results_region(l, &lay, &ry0, &list_h);
     float content_h = launcher_content_height(l);
-    float scroll_max = content_h > lay.list_h ? content_h - lay.list_h : 0.0f;
+    float scroll_max = content_h > list_h ? content_h - list_h : 0.0f;
     float s = l->scroll + (float)steps_v * DC_LAUNCHER_SCROLL_STEP;
     if (s < 0.0f)
         s = 0.0f;
