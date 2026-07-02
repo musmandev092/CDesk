@@ -182,6 +182,19 @@ static void control_dispatch(const char *cmd, void *data)
         /* Full screen -> ~/Pictures + clipboard (needs grim + wl-copy). */
         run_sh("f=\"${XDG_PICTURES_DIR:-$HOME/Pictures}/screenshot-$(date +%Y%m%d-%H%M%S).png\"; "
                "mkdir -p \"$(dirname \"$f\")\"; grim \"$f\" && wl-copy --type image/png < \"$f\"");
+    else if (strcmp(cmd, "screenshot-region") == 0)
+        /* Interactive region -> file + clipboard (needs slurp). */
+        run_sh("f=\"${XDG_PICTURES_DIR:-$HOME/Pictures}/screenshot-$(date +%Y%m%d-%H%M%S).png\"; "
+               "mkdir -p \"$(dirname \"$f\")\"; g=$(slurp) || exit; grim -g \"$g\" \"$f\" && "
+               "wl-copy --type image/png < \"$f\"");
+    else if (strcmp(cmd, "color-picker") == 0)
+        /* Pick a pixel -> #rrggbb to clipboard (slurp point + grim PPM). */
+        run_sh("g=$(slurp -p) || exit; px=$(grim -g \"$g\" -t ppm - | tail -c3 | od -An -tu1); "
+               "set -- $px; printf '#%02x%02x%02x' \"$1\" \"$2\" \"$3\" | wl-copy");
+    else if (strcmp(cmd, "night") == 0)
+        /* Toggle a warm night filter (gammastep one-shot). */
+        run_sh("if pgrep -x gammastep >/dev/null; then pkill -x gammastep; "
+               "else gammastep -O 4000 >/dev/null 2>&1 & fi");
     else if (strcmp(cmd, "quit") == 0)
         dc_loop_stop(g_loop);
     else
@@ -209,7 +222,10 @@ static void print_keybinds(void)
            "    Mod+N            { spawn \"dankc\" \"ctl\" \"notifications\"; }\n"
            "    Mod+Shift+C      { spawn \"dankc\" \"ctl\" \"control-center\"; }\n"
            "    Mod+V            { spawn \"dankc\" \"ctl\" \"clipboard\"; }\n"
-           "    Print            { spawn \"dankc\" \"ctl\" \"screenshot\"; }\n");
+           "    Print            { spawn \"dankc\" \"ctl\" \"screenshot\"; }\n"
+           "    Mod+Print        { spawn \"dankc\" \"ctl\" \"screenshot-region\"; }\n"
+           "    Mod+Shift+P      { spawn \"dankc\" \"ctl\" \"color-picker\"; }\n"
+           "    Mod+Shift+N      { spawn \"dankc\" \"ctl\" \"night\"; }\n");
 }
 
 /* Route a left click: into the control-center popup if it's the target, else to
