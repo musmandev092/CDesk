@@ -24,9 +24,11 @@ Weather w/ 7-day forecast/Media w/ album art/Wallpapers; clock/music/weather chi
 Plus: full-Unicode fallback fonts + monochrome emoji; **Makefile now does header dep
 tracking (-MMD)** — stale-.o struct mismatches previously caused phantom "corruption";
 dc_render_icon now saves/restores nvg state (recurring garbled-text class killed).
-Remaining polish: power menu modal, tuned power-profile backend, marquee, Hourly forecast,
+Remaining polish: power menu modal, tuned power-profile backend, Hourly forecast,
 wallpaper browser, notif action-images, HarfBuzz shaping, P7 perf (damage tracking, poll
 reduction, font subsetting). Plugins (T29) still deferred.
+Media marquee DONE (wt/marquee): bar music title scrolls DMS-style (2s pause / 60ms-per-px
+bounce, playing+overflow gated, frame-callback driven, DANKC_MARQUEE_TEST=1 test hook).
 
 ## Previous status — bar parity DONE ✅ (S1–S6, 2026-07-02); panels parity next
 Bar now pixel-matches the user's live DMS bottom bar (docs/12-BAR-SPEC.md, commits
