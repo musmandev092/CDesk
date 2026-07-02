@@ -48,6 +48,152 @@ static void free_slot_image(dc_notification *slot)
     slot->image_w = slot->image_h = 0;
 }
 
+/* --- image-data hint decoding --------------------------------------------- */
+
+/* Box-downsample a tightly-packed RGBA8 buffer from (sw,sh) to (dw,dh) -- see
+ * DC_NOTIF_IMAGE_MAX_DIM's comment: called only when a decoded image-data
+ * payload exceeds the cap on either side. Each destination pixel is the
+ * average of its corresponding source block (smoother than nearest-neighbor
+ * and cheap enough at these tiny target sizes -- worst case is 128x128). */
+static void box_downscale_rgba(const unsigned char *src, int sw, int sh, unsigned char *dst, int dw,
+                               int dh)
+{
+    for (int y = 0; y < dh; y++) {
+        int sy0 = (int)((int64_t)y * sh / dh);
+        int sy1 = (int)((int64_t)(y + 1) * sh / dh);
+        if (sy1 <= sy0)
+            sy1 = sy0 + 1;
+        if (sy1 > sh)
+            sy1 = sh;
+        for (int x = 0; x < dw; x++) {
+            int sx0 = (int)((int64_t)x * sw / dw);
+            int sx1 = (int)((int64_t)(x + 1) * sw / dw);
+            if (sx1 <= sx0)
+                sx1 = sx0 + 1;
+            if (sx1 > sw)
+                sx1 = sw;
+            long sum[4] = {0, 0, 0, 0};
+            int cnt = 0;
+            for (int yy = sy0; yy < sy1; yy++) {
+                const unsigned char *row = src + (size_t)yy * sw * 4;
+                for (int xx = sx0; xx < sx1; xx++) {
+                    const unsigned char *px = row + (size_t)xx * 4;
+                    sum[0] += px[0];
+                    sum[1] += px[1];
+                    sum[2] += px[2];
+                    sum[3] += px[3];
+                    cnt++;
+                }
+            }
+            unsigned char *o = dst + ((size_t)y * dw + x) * 4;
+            o[0] = (unsigned char)(sum[0] / cnt);
+            o[1] = (unsigned char)(sum[1] / cnt);
+            o[2] = (unsigned char)(sum[2] / cnt);
+            o[3] = (unsigned char)(sum[3] / cnt);
+        }
+    }
+}
+
+/* Decode the Notify() "image-data"/"image_data"/"icon_data" hint (iiibiiay:
+ * width, height, rowstride, has_alpha, bits_per_sample, channels, pixel
+ * bytes) into a tightly-packed RGBA8 buffer, downscaled to fit
+ * DC_NOTIF_IMAGE_MAX_DIM on the long side if needed (see that macro's
+ * comment). Only 8-bit-per-sample RGB/RGBA payloads are supported -- what
+ * every real sender emits (GTK, libnotify, dunst's own tooling); anything
+ * else is rejected rather than guessed at. Returns false (leaving *out_pixels
+ * untouched) if the payload doesn't validate; most importantly if `data_len`
+ * is too small for the claimed geometry, since rowstride/width/height come
+ * straight off the bus and are the one thing standing between a
+ * malicious/buggy sender and an out-of-bounds read. */
+static bool decode_image_data(int32_t width, int32_t height, int32_t rowstride, bool has_alpha,
+                              int32_t bps, int32_t channels, const uint8_t *data, size_t data_len,
+                              unsigned char **out_pixels, int *out_w, int *out_h)
+{
+    if (width <= 0 || height <= 0 || width > 4096 || height > 4096 || !data)
+        return false;
+    if (bps != 8 || (channels != 3 && channels != 4))
+        return false;
+    if (has_alpha && channels != 4)
+        return false;
+    int64_t need_row = (int64_t)width * channels;
+    if (rowstride < need_row)
+        return false;
+    int64_t need_total = (int64_t)rowstride * (height - 1) + need_row;
+    if ((int64_t)data_len < need_total)
+        return false;
+
+    unsigned char *rgba = malloc((size_t)width * (size_t)height * 4);
+    if (!rgba)
+        return false;
+    for (int y = 0; y < height; y++) {
+        const uint8_t *row = data + (size_t)y * (size_t)rowstride;
+        unsigned char *orow = rgba + (size_t)y * (size_t)width * 4;
+        for (int x = 0; x < width; x++) {
+            const uint8_t *px = row + (size_t)x * (size_t)channels;
+            orow[x * 4 + 0] = px[0];
+            orow[x * 4 + 1] = px[1];
+            orow[x * 4 + 2] = px[2];
+            orow[x * 4 + 3] = channels == 4 ? px[3] : 255;
+        }
+    }
+
+    int dw = width, dh = height;
+    if (dw > DC_NOTIF_IMAGE_MAX_DIM || dh > DC_NOTIF_IMAGE_MAX_DIM) {
+        float scale = (float)DC_NOTIF_IMAGE_MAX_DIM / (float)(dw > dh ? dw : dh);
+        dw = (int)((float)dw * scale);
+        dh = (int)((float)dh * scale);
+        if (dw < 1)
+            dw = 1;
+        if (dh < 1)
+            dh = 1;
+        unsigned char *small = malloc((size_t)dw * (size_t)dh * 4);
+        if (!small) {
+            free(rgba);
+            return false;
+        }
+        box_downscale_rgba(rgba, width, height, small, dw, dh);
+        free(rgba);
+        rgba = small;
+    }
+
+    *out_pixels = rgba;
+    *out_w = dw;
+    *out_h = dh;
+    return true;
+}
+
+/* Memory bound for History (DC_NOTIF_HISTORY_IMAGE_KEEP): free decoded
+ * image-data pixels from every archived History entry except the N most
+ * recently-created ones. Run from notify_changed() so it self-heals after
+ * every state change regardless of which call path (dismiss/clear/tick) just
+ * moved something into History -- newest-first selection scan, same style as
+ * select_by_status() above (store is small so this is cheap). Current-tab and
+ * path/file-based images (image_path/app_icon, just strings) are never
+ * touched: only History entries holding decoded image-data pixels count
+ * against the cap. */
+static void enforce_history_image_cap(dc_notifications *n)
+{
+    dc_notification *keep[DC_NOTIF_MAX];
+    int count = 0;
+    int64_t last = INT64_MAX;
+    for (int picked = 0; picked < DC_NOTIF_MAX; picked++) {
+        dc_notification *best = NULL;
+        for (int i = 0; i < DC_NOTIF_MAX; i++) {
+            dc_notification *s = &n->store[i];
+            if (!s->active || s->status != DC_NOTIF_HISTORY || !s->image_pixels)
+                continue;
+            if (s->created_ms < last && (!best || s->created_ms > best->created_ms))
+                best = s;
+        }
+        if (!best)
+            break;
+        keep[count++] = best;
+        last = best->created_ms;
+    }
+    for (int i = DC_NOTIF_HISTORY_IMAGE_KEEP; i < count; i++)
+        free_slot_image(keep[i]);
+}
+
 static int64_t now_ms(void)
 {
     struct timespec ts;
@@ -152,10 +298,12 @@ static int method_notify(sd_bus_message *msg, void *userdata, sd_bus_error *err)
         return r;
 
     /* actions: as -- a flat [key1, label1, key2, label2, ...] array. The
-     * "default" action (invoked by clicking the toast body, not a button) is
-     * skipped; the first real action becomes the card's action button. */
-    char action_key[DC_NOTIF_ACTION] = {0};
-    char action_label[DC_NOTIF_ACTION] = {0};
+     * spec's reserved "default" key (invoked by clicking the card body, not a
+     * button -- see notifcenter.c/toasts.c click handling) is filtered out;
+     * everything else becomes a real button, capped at DC_NOTIF_ACTION_MAX
+     * (see that macro's comment). */
+    dc_notif_action parsed_actions[DC_NOTIF_ACTION_MAX];
+    int action_count = 0;
     r = sd_bus_message_enter_container(msg, 'a', "s");
     if (r >= 0) {
         const char *key = NULL, *label = NULL;
@@ -163,17 +311,29 @@ static int method_notify(sd_bus_message *msg, void *userdata, sd_bus_error *err)
             label = NULL;
             if (sd_bus_message_read_basic(msg, 's', &label) <= 0)
                 label = "";
-            if (!action_key[0] && key && strcmp(key, "default") != 0) {
-                snprintf(action_key, sizeof(action_key), "%s", key);
-                snprintf(action_label, sizeof(action_label), "%s", (label && label[0]) ? label : "Open");
+            if (key && strcmp(key, "default") == 0)
+                continue;
+            if (action_count < DC_NOTIF_ACTION_MAX) {
+                snprintf(parsed_actions[action_count].key, sizeof(parsed_actions[action_count].key),
+                        "%s", key ? key : "");
+                snprintf(parsed_actions[action_count].label,
+                        sizeof(parsed_actions[action_count].label), "%s",
+                        (label && label[0]) ? label : "Open");
+                action_count++;
             }
         }
         sd_bus_message_exit_container(msg);
     }
 
-    /* hints: a{sv} — pull out urgency (byte) and image-path/app-icon strings. */
+    /* hints: a{sv} — urgency, resident, image-path, image-data. */
     dc_urgency urgency = DC_URGENCY_NORMAL;
-    const char *hint_icon = NULL;
+    const char *hint_image_path = NULL;
+    bool resident = false;
+    int32_t img_w = 0, img_h = 0, img_stride = 0, img_bps = 0, img_channels = 0;
+    bool img_has_alpha = false;
+    const void *img_data = NULL;
+    size_t img_data_len = 0;
+
     r = sd_bus_message_enter_container(msg, 'a', "{sv}");
     if (r >= 0) {
         while (sd_bus_message_enter_container(msg, 'e', "sv") > 0) {
@@ -185,11 +345,38 @@ static int method_notify(sd_bus_message *msg, void *userdata, sd_bus_error *err)
                 sd_bus_message_read_basic(msg, 'y', &u);
                 sd_bus_message_exit_container(msg);
                 urgency = (u <= DC_URGENCY_CRITICAL) ? (dc_urgency)u : DC_URGENCY_NORMAL;
+            } else if (key && strcmp(key, "resident") == 0) {
+                int b = 0;
+                sd_bus_message_enter_container(msg, 'v', "b");
+                sd_bus_message_read_basic(msg, 'b', &b);
+                sd_bus_message_exit_container(msg);
+                resident = b != 0;
             } else if (key && (strcmp(key, "image-path") == 0 ||
                                strcmp(key, "image_path") == 0)) {
                 sd_bus_message_enter_container(msg, 'v', "s");
-                sd_bus_message_read_basic(msg, 's', &hint_icon);
+                sd_bus_message_read_basic(msg, 's', &hint_image_path);
                 sd_bus_message_exit_container(msg);
+            } else if (key && (strcmp(key, "image-data") == 0 || strcmp(key, "image_data") == 0 ||
+                               strcmp(key, "icon_data") == 0)) {
+                /* (iiibiiay): width,height,rowstride,has_alpha,bps,channels,data.
+                 * Falls through to the generic sd_bus_message_skip(msg, "v")
+                 * below if the sender's actual variant contents don't match
+                 * this signature (some senders' "icon_data" predates the
+                 * spec settling on this exact layout). */
+                if (sd_bus_message_enter_container(msg, 'v', "(iiibiiay)") >= 0) {
+                    if (sd_bus_message_enter_container(msg, 'r', "iiibiiay") >= 0) {
+                        int b = 0;
+                        sd_bus_message_read(msg, "iii", &img_w, &img_h, &img_stride);
+                        sd_bus_message_read_basic(msg, 'b', &b);
+                        img_has_alpha = b != 0;
+                        sd_bus_message_read(msg, "ii", &img_bps, &img_channels);
+                        sd_bus_message_read_array(msg, 'y', &img_data, &img_data_len);
+                        sd_bus_message_exit_container(msg); /* r */
+                    }
+                    sd_bus_message_exit_container(msg); /* v */
+                } else {
+                    sd_bus_message_skip(msg, "v");
+                }
             } else {
                 sd_bus_message_skip(msg, "v");
             }
@@ -200,11 +387,18 @@ static int method_notify(sd_bus_message *msg, void *userdata, sd_bus_error *err)
 
     sd_bus_message_read(msg, "i", &expire_timeout);
 
+    unsigned char *decoded_pixels = NULL;
+    int decoded_w = 0, decoded_h = 0;
+    if (img_data && img_w > 0 && img_h > 0)
+        decode_image_data(img_w, img_h, img_stride, img_has_alpha, img_bps, img_channels, img_data,
+                          img_data_len, &decoded_pixels, &decoded_w, &decoded_h);
+
     uint32_t id = replaces_id != 0 ? replaces_id : ++n->next_id;
     dc_notification *slot = acquire_slot(n, replaces_id);
     if (slot->active && slot->id != id) {
         emit_closed(n, slot->id, DC_NOTIF_REASON_CLOSED); /* evicted a different notification */
     }
+    free_slot_image(slot); /* release a reused slot's old pixels before memset drops the pointer */
 
     memset(slot, 0, sizeof(*slot));
     slot->id = id;
@@ -215,15 +409,22 @@ static int method_notify(sd_bus_message *msg, void *userdata, sd_bus_error *err)
     slot->popup = true;
     slot->active = true;
     slot->status = DC_NOTIF_CURRENT; /* arrival -> Current, even for a replace */
+    slot->resident = resident;
     snprintf(slot->app_name, sizeof(slot->app_name), "%s", app_name ? app_name : "");
     snprintf(slot->summary, sizeof(slot->summary), "%s", summary ? summary : "");
     snprintf(slot->body, sizeof(slot->body), "%s", body ? body : "");
-    snprintf(slot->app_icon, sizeof(slot->app_icon), "%s",
-             (app_icon && *app_icon) ? app_icon : (hint_icon ? hint_icon : ""));
-    snprintf(slot->action_key, sizeof(slot->action_key), "%s", action_key);
-    snprintf(slot->action_label, sizeof(slot->action_label), "%s", action_label);
+    snprintf(slot->app_icon, sizeof(slot->app_icon), "%s", app_icon ? app_icon : "");
+    snprintf(slot->image_path, sizeof(slot->image_path), "%s", hint_image_path ? hint_image_path : "");
+    slot->action_count = action_count;
+    for (int i = 0; i < action_count; i++)
+        slot->actions[i] = parsed_actions[i];
+    slot->image_pixels = decoded_pixels;
+    slot->image_w = decoded_w;
+    slot->image_h = decoded_h;
+    slot->image_version = decoded_pixels ? ++n->next_image_ver : 0;
 
-    dc_info("notify #%u [%s] %s", id, slot->app_name, slot->summary);
+    dc_info("notify #%u [%s] %s (%d action%s%s)", id, slot->app_name, slot->summary, action_count,
+            action_count == 1 ? "" : "s", decoded_pixels ? ", image" : "");
     n->has_unread = true;
     notify_changed(n);
 
@@ -255,7 +456,7 @@ static int method_get_capabilities(sd_bus_message *msg, void *userdata, sd_bus_e
 {
     (void)userdata;
     (void)err;
-    return sd_bus_reply_method_return(msg, "as", 3, "body", "body-markup", "persistence");
+    return sd_bus_reply_method_return(msg, "as", 4, "body", "body-markup", "persistence", "actions");
 }
 
 static int method_get_server_information(sd_bus_message *msg, void *userdata, sd_bus_error *err)
@@ -317,6 +518,8 @@ void dc_notifications_destroy(dc_notifications *n)
 {
     if (!n)
         return;
+    for (int i = 0; i < DC_NOTIF_MAX; i++)
+        free_slot_image(&n->store[i]); /* plain malloc'd pixels -- no GL context needed to free these */
     sd_bus_release_name(n->bus, DC_NOTIF_NAME);
     sd_bus_slot_unref(n->slot);
     free(n);
@@ -476,8 +679,10 @@ void dc_notifications_clear_history(dc_notifications *n)
         return;
     for (int i = 0; i < DC_NOTIF_MAX; i++) {
         dc_notification *s = &n->store[i];
-        if (s->active && s->status == DC_NOTIF_HISTORY)
+        if (s->active && s->status == DC_NOTIF_HISTORY) {
             s->active = false;
+            free_slot_image(s);
+        }
     }
     notify_changed(n);
 }
@@ -492,15 +697,17 @@ void dc_notifications_dismiss(dc_notifications *n, uint32_t id)
     resolve_dismiss(n, slot);
 }
 
-void dc_notifications_invoke_action(dc_notifications *n, uint32_t id)
+void dc_notifications_invoke_action(dc_notifications *n, uint32_t id, int action_index)
 {
     if (!n)
         return;
     dc_notification *slot = find_by_id(n, id);
-    if (!slot || !slot->action_key[0])
+    if (!slot || action_index < 0 || action_index >= slot->action_count)
         return;
     sd_bus_emit_signal(n->bus, DC_NOTIF_PATH, DC_NOTIF_IFACE, "ActionInvoked", "us", id,
-                       slot->action_key);
+                       slot->actions[action_index].key);
+    if (slot->resident)
+        return; /* spec: a resident notification isn't auto-removed after an action */
     resolve_dismiss(n, slot);
 }
 
@@ -528,30 +735,32 @@ void dc_notifications_seed_demo(dc_notifications *n)
         return;
 
     struct {
-        const char *app, *summary, *body, *action_key, *action_label;
+        const char *app, *summary, *body;
+        const char *action_key[2], *action_label[2]; /* up to 2 demo actions; "" = unused slot */
         int64_t age_ms;
         dc_notif_status status;
     } demo[] = {
-        {"notify-send", "DankC test", "Hello from notify-send", "", "", 5 * 60 * 1000,
+        {"notify-send", "DankC test", "Hello from notify-send", {"", ""}, {"", ""}, 5 * 60 * 1000,
          DC_NOTIF_CURRENT},
         {"DMS", "Screenshot captured", "Copied to clipboard\nscreenshot-2026-07-01-27-26.png",
-         "open", "Open", (int64_t)27 * 3600 * 1000, DC_NOTIF_CURRENT},
+         {"open", ""}, {"Open", ""}, (int64_t)27 * 3600 * 1000, DC_NOTIF_CURRENT},
         {"NetworkManager Applet", "Connection Established",
-         "You are now connected to the Wi-Fi network \"BAIHQ\".", "dont-show",
-         "Don't show this message again", (int64_t)32 * 3600 * 1000, DC_NOTIF_CURRENT},
-        {"Spotify", "Now Playing", "Currently Playing \xe2\x80\x94 Demo Artist", "", "",
+         "You are now connected to the Wi-Fi network \"BAIHQ\".", {"connect", "dont-show"},
+         {"Reconnect", "Don't show this message again"}, (int64_t)32 * 3600 * 1000,
+         DC_NOTIF_CURRENT},
+        {"Spotify", "Now Playing", "Currently Playing \xe2\x80\x94 Demo Artist", {"", ""}, {"", ""},
          2 * 3600 * 1000, DC_NOTIF_HISTORY},
-        {"Firefox", "Download complete", "installer.AppImage finished downloading (128 MB)", "",
-         "", (int64_t)26 * 3600 * 1000, DC_NOTIF_HISTORY},
+        {"Firefox", "Download complete", "installer.AppImage finished downloading (128 MB)",
+         {"", ""}, {"", ""}, (int64_t)26 * 3600 * 1000, DC_NOTIF_HISTORY},
         {"Slack", "New message from Alice",
          "Hey, are we still meeting today at 3pm to discuss the quarterly roadmap and budget "
          "planning for next sprint cycle? Let me know if that still works for you or if we need "
          "to reschedule.",
-         "", "", 3 * 3600 * 1000, DC_NOTIF_HISTORY},
-        {"systemd", "Update available", "A new system update is ready to install.", "", "",
-         (int64_t)3 * 24 * 3600 * 1000, DC_NOTIF_HISTORY},
-        {"Mail", "Inbox (3)", "You have 3 unread messages.", "open", "Open", 5 * 3600 * 1000,
-         DC_NOTIF_HISTORY},
+         {"reply", "mark-read"}, {"Reply", "Mark as read"}, 3 * 3600 * 1000, DC_NOTIF_HISTORY},
+        {"systemd", "Update available", "A new system update is ready to install.", {"", ""},
+         {"", ""}, (int64_t)3 * 24 * 3600 * 1000, DC_NOTIF_HISTORY},
+        {"Mail", "Inbox (3)", "You have 3 unread messages.", {"open", ""}, {"Open", ""},
+         5 * 3600 * 1000, DC_NOTIF_HISTORY},
     };
 
     int64_t mono = now_ms();
@@ -580,8 +789,13 @@ void dc_notifications_seed_demo(dc_notifications *n)
         snprintf(slot->app_name, sizeof(slot->app_name), "%s", demo[i].app);
         snprintf(slot->summary, sizeof(slot->summary), "%s", demo[i].summary);
         snprintf(slot->body, sizeof(slot->body), "%s", demo[i].body);
-        snprintf(slot->action_key, sizeof(slot->action_key), "%s", demo[i].action_key);
-        snprintf(slot->action_label, sizeof(slot->action_label), "%s", demo[i].action_label);
+        for (int a = 0; a < 2; a++) {
+            if (!demo[i].action_key[a][0])
+                continue;
+            dc_notif_action *act = &slot->actions[slot->action_count++];
+            snprintf(act->key, sizeof(act->key), "%s", demo[i].action_key[a]);
+            snprintf(act->label, sizeof(act->label), "%s", demo[i].action_label[a]);
+        }
     }
 
     n->has_unread = true;
