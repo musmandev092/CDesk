@@ -65,9 +65,12 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
   bar shows music-note + title left of clock while Playing (hidden otherwise), like DMS.
 - [x] **T11 battery** — DONE via sysfs: battery.c reads capacity + status; bar shows %, green fill when
   charging, red when low. UPower D-Bus (time-to-empty/full estimates) skipped — not shown on the bar.
-- [ ] **T16 StatusNotifier tray** — BLOCKED to verify: needs a tray-producing app (StatusNotifierItem) to
-  test the host/watcher end-to-end; deferred rather than ship unverifiable code.
-- [ ] **T17 logind** (idle/lid/sleep signals) — plumbing, not user-visible yet; deferred.
+- [x] **T16 StatusNotifier tray** — DONE: tray HOST reads the session watcher's items (works alongside a
+  running DMS) + IconName/Title, refresh on register/unregister; bar renders the icons (cached, dc_icon_
+  resolve; dot fallback). Verified reading nm_applet; fixed the resolver to search 22x22 icons. Click-to-
+  activate + IconPixmap-only items are later refinements.
+- [ ] **T17 logind** (idle/lid/sleep signals) — plumbing; mainly feeds the lock screen (T22), so parked
+  with it.
 
 ## Then — panels (M4+)
 - [x] **Pointer input** (prerequisite) — wl_seat + wl_pointer + bar click hit-testing (launcher/
@@ -118,6 +121,9 @@ compare to DMS → fix visual gaps → commit → check the box here → commit 
   (launcher/control-center/notifications/quit) + `dankc keybinds` niri snippet generator.
 - [x] **T28 meson build** — DONE (written, mirrors the Makefile; not executed — meson not installed here).
 - [x] **T30 packaging** — DONE: packaging/PKGBUILD + README (meson-based, cross-distro notes).
-- [ ] **T27 Settings UI** — not started (large GUI; config is file-driven for now via config.json).
+- [x] **T27 Settings UI** — DONE: mouse-driven overlay — 10-theme picker + toggles (clock24h/showDate/
+  animations/dynamic-color) + animation-speed slider; edits apply live and persist to config.json
+  (dc_config_save). Verified: renders (screenshot) + save/reload round-trips. Full 424-setting parity is
+  future work.
 - [ ] **T29 plugins (.so ABI)** — intentionally DEFERRED per locked project decision (native .so plugins
   are a post-v1 phase, not in the core shell).

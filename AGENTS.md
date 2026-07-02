@@ -43,10 +43,12 @@ niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
   theme/dynamic.cpp from wallpaper (config dynamicColor+wallpaper). **Clipboard** (T23): wlr-data-control
   history + picker (bar icon / Mod+V). **Screenshot** (T23): grim via `ctl screenshot` / Print.
   **Build**: meson.build (T28, verified) + packaging/ (T30).
-- **T23 fully done**: clipboard, full+region screenshot, color-picker (slurp+grim), night mode (gammastep).
-- **Remaining:** T27 settings GUI (not started, large; config is file-driven). T16 tray (needs a tray app
-  to verify). DEFERRED: T22 lock (PAM lockout risk — do with user awake), T29 plugins (by design),
-  T17 logind (plumbing). Polish: workspace-pill + per-card toast animation (need bar/per-card frame drive).
+- **T23 done**: clipboard, full+region screenshot, color-picker (slurp+grim), night mode (gammastep).
+- **T16 tray done**: SNI host reads the watcher's items + renders icons on the bar (resolver now finds
+  22x22). **T27 settings done**: theme picker + toggles + speed slider, live-apply + persist.
+- **Remaining (all deferred, not blocked-by-me):** T22 lock (PAM — do with user awake, lockout risk),
+  T17 logind (feeds lock; parked with it), T29 plugins (post-v1 by design). Polish: workspace-pill +
+  per-card toast animation, tray click-to-activate + pixmap icons, settings→full DMS parity.
 - **Whole UI visually verified via grim** (2026-07-02): bar, launcher, control center, clipboard picker all
   match DMS. Screenshots in the session scratchpad.
 - Vendored: nanovg (GLES3, `third_party/nanovg`), cJSON (`third_party/cjson`); Inter bundled
