@@ -40,9 +40,14 @@ typedef enum {
     DC_BAR_REGION_NOTIFICATIONS,
     DC_BAR_REGION_CLIPBOARD,
     DC_BAR_REGION_CLOCK,
+    DC_BAR_REGION_WORKSPACE,
 } dc_bar_region;
 
-/* Which region a surface-local logical coordinate falls in. */
-dc_bar_region dc_bar_hittest(dc_bar *bar, double x, double y);
+/* Which region a surface-local logical coordinate falls in, from the last
+ * render's per-widget hit-rect array (docs/12-BAR-SPEC.md sec.5). `out_payload`
+ * (may be NULL) receives region-specific extra data — currently only
+ * DC_BAR_REGION_WORKSPACE, which sets it to the clicked capsule's 1-based
+ * per-output workspace index. */
+dc_bar_region dc_bar_hittest(dc_bar *bar, double x, double y, int *out_payload);
 
 #endif /* DC_UI_BAR_BAR_H */

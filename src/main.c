@@ -294,7 +294,8 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
         dc_bar *bar = ctx->set->bars[i];
         if (dc_bar_surface(bar) != surface)
             continue;
-        dc_bar_region region = dc_bar_hittest(bar, x, y);
+        int payload = 0;
+        dc_bar_region region = dc_bar_hittest(bar, x, y, &payload);
         if (region == DC_BAR_REGION_LAUNCHER) {
             dc_launcher_toggle(ctx->launcher, dc_bar_output(bar));
         } else if (region == DC_BAR_REGION_NOTIFICATIONS) {
@@ -303,6 +304,8 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
             dc_clip_picker_toggle(ctx->clip_picker, dc_bar_output(bar));
         } else if (region == DC_BAR_REGION_CONTROL_CENTER) {
             dc_control_center_toggle(cc, dc_bar_output(bar));
+        } else if (region == DC_BAR_REGION_WORKSPACE) {
+            dc_niri_focus_workspace(payload);
         } else {
             if (dc_control_center_visible(cc))
                 dc_control_center_hide(cc);

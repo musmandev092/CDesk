@@ -6,6 +6,7 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -350,4 +351,17 @@ const dc_niri_window *dc_niri_focused_window(const dc_niri *niri)
         if (niri->windows[i].is_focused)
             return &niri->windows[i];
     return NULL;
+}
+
+void dc_niri_focus_workspace(int idx)
+{
+    char idx_str[16];
+    snprintf(idx_str, sizeof(idx_str), "%d", idx);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("niri", "niri", "msg", "action", "focus-workspace", idx_str, (char *)NULL);
+        _exit(127);
+    }
+    /* Parent: fire-and-forget, reaped by main's SIGCHLD = SIG_IGN. */
 }

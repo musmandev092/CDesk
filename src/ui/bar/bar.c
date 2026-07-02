@@ -14,6 +14,7 @@
 #include "services/net.h"
 #include "services/tray.h"
 #include "theme/theme.h"
+#include "ui/bar/bar_tokens.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
@@ -41,7 +42,7 @@
 #define DC_SCALE_BASE 120
 
 /* Bar container geometry, derived from config (docs/12-BAR-SPEC.md sec.1):
- *   widgetThickness       = max(20, 26 + innerPadding*0.6)
+ *   widgetThickness       = max(20, 26 + innerPadding*0.6)     (bar_tokens.h)
  *   effectiveBarThickness = max(widgetThickness + innerPadding + 4,
  *                                48 - 4 - (8 - innerPadding))
  *   windowHeight           = effectiveBarThickness + spacing (layer-surface
@@ -58,7 +59,7 @@ static dc_bar_geometry bar_compute_geometry(const dc_config *cfg)
 {
     float ip = (float)cfg->bar_inner_padding;
     dc_bar_geometry g;
-    g.widget_thickness = fmaxf(20.0f, 26.0f + ip * 0.6f);
+    g.widget_thickness = dc_bar_widget_thickness(cfg);
     g.effective_thickness = fmaxf(g.widget_thickness + ip + 4.0f, 48.0f - 4.0f - (8.0f - ip));
     g.window_height = (int)lroundf(g.effective_thickness) + cfg->bar_spacing;
     return g;
@@ -74,6 +75,26 @@ static inline NVGcolor tc_alpha(dc_color c, int alpha)
 {
     return nvgRGBA(c.r, c.g, c.b, (unsigned char)alpha);
 }
+
+/* A placed BasePill: every widget's container (docs/12-BAR-SPEC.md sec.3).
+ * `content_x0` is where the widget's own drawing starts; `cy` is the bar's
+ * vertical center, handed through so widgets never recompute it. */
+typedef struct {
+    float x, y, w, h;
+    float content_x0;
+    float cy;
+} dc_pill;
+
+/* One placed widget's click target, recorded by the layout pass and consumed
+ * by dc_bar_hittest() (docs/12-BAR-SPEC.md sec.5). `payload` is region-
+ * specific extra data (currently only the workspace index). */
+typedef struct {
+    float x0, y0, x1, y1;
+    dc_bar_region region;
+    int payload;
+} dc_bar_hit;
+
+#define DC_BAR_MAX_HITS 32
 
 struct dc_bar {
     dc_wayland *wl;
@@ -92,10 +113,6 @@ struct dc_bar {
     char icon_app_id[64];
     int icon_image; /* nanovg image handle, 0 = none */
 
-    /* Center x of the notification-bell + clipboard icons (dynamic; hit-test). */
-    float notif_cx;
-    float clip_cx;
-
     /* System tray (StatusNotifier) + a per-name nanovg image cache. */
     struct dc_tray *tray;
     struct {
@@ -103,6 +120,11 @@ struct dc_bar {
         int image;
     } tray_cache[DC_TRAY_MAX];
     int tray_cache_n;
+
+    /* Per-widget click targets from the most recent render (widget host
+     * layout pass; docs/12-BAR-SPEC.md sec.5). */
+    dc_bar_hit hits[DC_BAR_MAX_HITS];
+    int hit_count;
 
     int logical_width;  /* from the layer-surface configure */
     int logical_height;
@@ -164,65 +186,100 @@ static inline float bar_content_x1(const dc_bar *bar)
     return bar->rect_x + bar->rect_w - bar_content_inset();
 }
 
-/* Apps-grid launcher icon at the far left (like DMS). Returns the x past it. */
-static float draw_launcher(dc_bar *bar)
+/* --- BasePill ------------------------------------------------------------ */
+
+/* Compute (but don't draw) the pill for `content_w` px of content with its
+ * left edge at `x` (docs/12-BAR-SPEC.md sec.3): height = widgetThickness,
+ * width = content + 2*hpad, vertically centered in the bar rect. */
+static dc_pill pill_at(const dc_bar *bar, float x, float content_w)
 {
-    const float pad = bar_content_x0(bar) + 12.0f;
-    const float size = 22.0f;
-    dc_render_icon(bar->render, DC_ICON_APPS, pad, bar_cy(bar), size,
-                   dc_theme_current->surface_text, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
-    return pad + size + 10.0f;
+    const dc_config *cfg = dc_config_current;
+    float h = dc_bar_widget_thickness(cfg);
+    float hpad = dc_bar_hpad(cfg);
+    dc_pill p;
+    p.h = h;
+    p.w = content_w + 2.0f * hpad;
+    p.x = x;
+    p.y = bar_cy(bar) - h / 2.0f;
+    p.cy = bar_cy(bar);
+    p.content_x0 = x + hpad;
+    return p;
 }
 
-/* Workspace pills, filtered to this bar's output, starting at `start_x`.
- * Returns the x coordinate just past the last pill. */
-static float draw_workspaces(dc_bar *bar, float start_x)
+/* The stadium background: surfaceContainerHigh x widgetTransparency. Widgets
+ * that want a transparent chip (e.g. systemTray, for now) simply skip this
+ * call — see the widget table's `has_bg`. */
+static void pill_draw_bg(dc_bar *bar, const dc_pill *p)
 {
-    if (!bar->niri)
-        return start_x;
-
-    int count = 0;
-    const dc_niri_workspace *workspaces = dc_niri_workspaces(bar->niri, &count);
-    if (!workspaces)
-        return start_x;
-
     NVGcontext *vg = bar->render->vg;
-    const dc_theme *t = dc_theme_current;
-    const float cy = bar_cy(bar);
-    const float gap = 8.0f;
-    const float dot = 9.0f;         /* inactive workspace dot diameter */
-    const float pill_w = 30.0f;     /* focused workspace pill */
-    const float pill_h = 11.0f;
-    float x = start_x;
+    const dc_config *cfg = dc_config_current;
+    dc_color c = dc_theme_current->surface_container_high;
+    unsigned char a = (unsigned char)((c.a / 255.0f) * cfg->bar_widget_transparency * 255.0f);
 
-    /* DMS style: focused = wide primary pill, others = dots (brighter if the
-     * active/visible workspace on their output). */
-    for (int i = 0; i < count; i++) {
-        const dc_niri_workspace *ws = &workspaces[i];
-        if (bar->output->name && ws->output[0] && strcmp(ws->output, bar->output->name) != 0)
-            continue;
-
-        if (ws->is_focused) {
-            nvgBeginPath(vg);
-            nvgRoundedRect(vg, x, cy - pill_h / 2.0f, pill_w, pill_h, pill_h / 2.0f);
-            nvgFillColor(vg, tc(ws->is_urgent ? t->error : t->primary));
-            nvgFill(vg);
-            x += pill_w + gap;
-        } else {
-            nvgBeginPath(vg);
-            nvgCircle(vg, x + dot / 2.0f, cy, dot / 2.0f);
-            if (ws->is_urgent)
-                nvgFillColor(vg, tc(t->error));
-            else if (ws->is_active)
-                nvgFillColor(vg, tc(t->surface_variant_text));
-            else
-                nvgFillColor(vg, tc_alpha(t->outline, 150));
-            nvgFill(vg);
-            x += dot + gap;
-        }
-    }
-    return x;
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, p->x, p->y, p->w, p->h, p->h / 2.0f);
+    nvgFillColor(vg, nvgRGBA(c.r, c.g, c.b, a));
+    nvgFill(vg);
 }
+
+/* Record a click target for the current render (docs/12-BAR-SPEC.md sec.5).
+ * Silently dropped past DC_BAR_MAX_HITS (generous headroom for one bar). */
+static void bar_push_hit(dc_bar *bar, float x0, float x1, dc_bar_region region, int payload)
+{
+    if (bar->hit_count >= DC_BAR_MAX_HITS)
+        return;
+    dc_bar_hit *h = &bar->hits[bar->hit_count++];
+    h->x0 = x0;
+    h->x1 = x1;
+    h->y0 = bar->rect_y;
+    h->y1 = bar->rect_y + bar->rect_h;
+    h->region = region;
+    h->payload = payload;
+}
+
+/* --- launcherButton / clipboard / notificationButton: single centered icon */
+
+static void draw_icon_centered(dc_bar *bar, const dc_pill *p, int codepoint, dc_color color)
+{
+    const dc_config *cfg = dc_config_current;
+    dc_render_icon(bar->render, codepoint, p->x + p->w / 2.0f, p->cy, dc_bar_icon_size(cfg, -4),
+                  color, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+}
+
+static float measure_launcher(dc_bar *bar)
+{
+    DC_UNUSED(bar);
+    return dc_bar_icon_size(dc_config_current, -4);
+}
+
+static void draw_launcher_pill(dc_bar *bar, const dc_pill *p)
+{
+    draw_icon_centered(bar, p, DC_ICON_APPS, dc_theme_current->surface_text);
+}
+
+static float measure_clipboard(dc_bar *bar)
+{
+    DC_UNUSED(bar);
+    return dc_bar_icon_size(dc_config_current, -4);
+}
+
+static void draw_clipboard_pill(dc_bar *bar, const dc_pill *p)
+{
+    draw_icon_centered(bar, p, DC_ICON_CONTENT_PASTE, dc_theme_current->surface_text);
+}
+
+static float measure_notif(dc_bar *bar)
+{
+    DC_UNUSED(bar);
+    return dc_bar_icon_size(dc_config_current, -4);
+}
+
+static void draw_notif_pill(dc_bar *bar, const dc_pill *p)
+{
+    draw_icon_centered(bar, p, DC_ICON_NOTIFICATIONS, dc_theme_current->surface_text);
+}
+
+/* --- workspaceSwitcher ---------------------------------------------------- */
 
 /* True if the focused window lives on this bar's output. */
 static bool focused_window_on_output(dc_bar *bar, const dc_niri_window *win)
@@ -241,13 +298,88 @@ static bool focused_window_on_output(dc_bar *bar, const dc_niri_window *win)
     return false;
 }
 
-/* Focused-window title, drawn after the workspaces and clipped so it never
- * collides with the centered clock. */
-static void draw_focused_window(dc_bar *bar, float start_x)
+/* Workspace capsules, filtered to this bar's output, starting at `x0`. One
+ * function drives both measurement (`draw`=false, from x0=0) and painting
+ * (`draw`=true) so the two can never drift apart; painting also records each
+ * capsule's own hit rect (workspaceSwitcher owns finer-grained hits than the
+ * rest of the widget host — docs/12-BAR-SPEC.md sec.4/5). Returns the x just
+ * past the last capsule. */
+static float layout_workspaces(dc_bar *bar, float x0, bool draw)
+{
+    if (!bar->niri)
+        return x0;
+
+    int count = 0;
+    const dc_niri_workspace *workspaces = dc_niri_workspaces(bar->niri, &count);
+    if (!workspaces)
+        return x0;
+
+    NVGcontext *vg = bar->render->vg;
+    const dc_theme *t = dc_theme_current;
+    const float cy = bar_cy(bar);
+    const float gap = 8.0f;
+    const float dot = 9.0f;     /* inactive workspace dot diameter */
+    const float pill_w = 30.0f; /* focused workspace pill */
+    const float pill_h = 11.0f;
+    float x = x0;
+    bool any = false;
+
+    /* DMS style: focused = wide primary pill, others = dots (brighter if the
+     * active/visible workspace on their output). */
+    for (int i = 0; i < count; i++) {
+        const dc_niri_workspace *ws = &workspaces[i];
+        if (bar->output->name && ws->output[0] && strcmp(ws->output, bar->output->name) != 0)
+            continue;
+
+        float item_w = ws->is_focused ? pill_w : dot;
+        if (draw) {
+            if (ws->is_focused) {
+                nvgBeginPath(vg);
+                nvgRoundedRect(vg, x, cy - pill_h / 2.0f, pill_w, pill_h, pill_h / 2.0f);
+                nvgFillColor(vg, tc(ws->is_urgent ? t->error : t->primary));
+                nvgFill(vg);
+            } else {
+                nvgBeginPath(vg);
+                nvgCircle(vg, x + dot / 2.0f, cy, dot / 2.0f);
+                if (ws->is_urgent)
+                    nvgFillColor(vg, tc(t->error));
+                else if (ws->is_active)
+                    nvgFillColor(vg, tc(t->surface_variant_text));
+                else
+                    nvgFillColor(vg, tc_alpha(t->outline, 150));
+                nvgFill(vg);
+            }
+            bar_push_hit(bar, x, x + item_w, DC_BAR_REGION_WORKSPACE, ws->idx);
+        }
+        x += item_w + gap;
+        any = true;
+    }
+    if (any)
+        x -= gap; /* no trailing gap past the last capsule */
+    return x;
+}
+
+static float measure_workspaces(dc_bar *bar)
+{
+    return layout_workspaces(bar, 0.0f, false);
+}
+
+static void draw_workspaces_pill(dc_bar *bar, const dc_pill *p)
+{
+    layout_workspaces(bar, p->content_x0, true);
+}
+
+/* --- focusedWindow --------------------------------------------------------- */
+
+/* [app icon] "AppName · Title", clipped to a max content width of 456px
+ * (docs/12-BAR-SPEC.md sec.4). Shared measure/draw, like layout_workspaces()
+ * above. Returns 0 (the "absent this frame" sentinel — see find_widget()'s
+ * callers) when there is no focused window on this output. */
+static float layout_focused_window(dc_bar *bar, float x0, bool draw)
 {
     const dc_niri_window *win = dc_niri_focused_window(bar->niri);
     if (!win || !focused_window_on_output(bar, win))
-        return;
+        return 0.0f;
 
     /* Pretty app name from the app_id (last dotted component, capitalised),
      * then "AppName · Title" like DMS. */
@@ -267,13 +399,16 @@ static void draw_focused_window(dc_bar *bar, float start_x)
     else
         snprintf(label, sizeof(label), "%s", app_name);
     if (!label[0])
-        return;
+        return 0.0f;
 
     NVGcontext *vg = bar->render->vg;
+    const dc_config *cfg = dc_config_current;
     const float cy = bar_cy(bar);
-    float x = start_x + 8.0f;
+    float x = x0;
 
-    /* Refresh the cached app icon only when the focused app changes. */
+    /* Refresh the cached app icon only when the focused app changes; done on
+     * both the measure and draw pass (idempotent past the first) so the
+     * width computed by measure already reflects this frame's icon. */
     if (strcmp(win->app_id, bar->icon_app_id) != 0) {
         if (bar->icon_image > 0)
             nvgDeleteImage(vg, bar->icon_image);
@@ -286,120 +421,118 @@ static void draw_focused_window(dc_bar *bar, float start_x)
         snprintf(bar->icon_app_id, sizeof(bar->icon_app_id), "%s", win->app_id);
     }
 
+    const float isz = dc_bar_icon_size(cfg, -4);
     if (bar->icon_image > 0) {
-        const float isz = 20.0f;
-        NVGpaint pat =
-            nvgImagePattern(vg, x, cy - isz / 2.0f, isz, isz, 0.0f, bar->icon_image, 1.0f);
-        nvgBeginPath(vg);
-        nvgRect(vg, x, cy - isz / 2.0f, isz, isz);
-        nvgFillPaint(vg, pat);
-        nvgFill(vg);
+        if (draw) {
+            NVGpaint pat =
+                nvgImagePattern(vg, x, cy - isz / 2.0f, isz, isz, 0.0f, bar->icon_image, 1.0f);
+            nvgBeginPath(vg);
+            nvgRect(vg, x, cy - isz / 2.0f, isz, isz);
+            nvgFillPaint(vg, pat);
+            nvgFill(vg);
+        }
         x += isz + 8.0f;
     }
 
-    const float max_x = bar->logical_width / 2.0f - 48.0f; /* keep clear of the clock */
-    const float avail = max_x - x;
-    if (avail < 40.0f)
-        return;
-
-    nvgSave(vg);
-    nvgScissor(vg, x, bar->rect_y, avail, bar->rect_h);
     nvgFontFaceId(vg, bar->render->font_ui);
-    nvgFontSize(vg, 14.0f);
-    nvgFillColor(vg, tc(dc_theme_current->surface_text));
-    nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
-    nvgText(vg, x, cy, label, NULL);
-    nvgRestore(vg);
+    nvgFontSize(vg, DC_BAR_TEXT_SIZE);
+    float bounds[4];
+    nvgTextBounds(vg, 0.0f, 0.0f, label, NULL, bounds);
+    float text_w = bounds[2] - bounds[0];
+
+    const float max_total = 456.0f;
+    float avail = max_total - (x - x0);
+    if (avail < 20.0f)
+        avail = 20.0f;
+    if (text_w > avail)
+        text_w = avail; /* TODO(bar-s3): true ellipsis instead of a hard clip */
+
+    if (draw) {
+        nvgSave(vg);
+        nvgScissor(vg, x, bar->rect_y, text_w, bar->rect_h);
+        nvgFillColor(vg, tc(dc_theme_current->surface_text));
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        nvgText(vg, x, cy, label, NULL);
+        nvgRestore(vg);
+    }
+    x += text_w;
+    return x - x0;
 }
 
-/* Center cluster: "HH:MM  Www D", matching DMS (weather is a separate widget,
- * added once the weather service lands). Honours use24HourClock. Returns the x
- * of the group's left edge (so the media widget can sit to its left). */
-static float draw_clock(dc_bar *bar)
+static float measure_focused_window(dc_bar *bar)
+{
+    return layout_focused_window(bar, 0.0f, false);
+}
+
+static void draw_focused_window_pill(dc_bar *bar, const dc_pill *p)
+{
+    layout_focused_window(bar, p->content_x0, true);
+}
+
+/* --- clock ------------------------------------------------------------- */
+
+/* "HH:MM  Www D" (honours use24HourClock/showDate). Shared measure/draw. */
+static float layout_clock(dc_bar *bar, float x0, bool draw)
 {
     NVGcontext *vg = bar->render->vg;
     const dc_theme *t = dc_theme_current;
+    const dc_config *cfg = dc_config_current;
     const float cy = bar_cy(bar);
 
     time_t now = time(NULL);
     struct tm tm;
     localtime_r(&now, &tm);
 
-    const dc_config *cfg = dc_config_current;
     char time_str[16];
     char date_str[32];
     strftime(time_str, sizeof(time_str), cfg->clock_24h ? "%H:%M" : "%-I:%M %p", &tm);
     strftime(date_str, sizeof(date_str), "%a %-d", &tm); /* e.g. "Wed 1" */
 
     const float gap = 10.0f;
-    float bounds[4];
-
     nvgFontFaceId(vg, bar->render->font_ui);
-    nvgFontSize(vg, 14.0f);
+    nvgFontSize(vg, DC_BAR_TEXT_SIZE);
+    float bounds[4];
     nvgTextBounds(vg, 0.0f, 0.0f, time_str, NULL, bounds);
     const float time_w = bounds[2] - bounds[0];
     float date_w = 0.0f;
     if (cfg->show_date) {
-        nvgFontSize(vg, 13.0f);
         nvgTextBounds(vg, 0.0f, 0.0f, date_str, NULL, bounds);
         date_w = bounds[2] - bounds[0];
     }
-
     const float total = cfg->show_date ? time_w + gap + date_w : time_w;
-    const float x = bar->logical_width / 2.0f - total / 2.0f;
 
-    nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
-    nvgFontSize(vg, 14.0f);
-    nvgFillColor(vg, tc(t->surface_text));
-    nvgText(vg, x, cy, time_str, NULL);
-    if (cfg->show_date) {
-        nvgFontSize(vg, 13.0f);
-        nvgFillColor(vg, tc(t->surface_variant_text));
-        nvgText(vg, x + time_w + gap, cy, date_str, NULL);
+    if (draw) {
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        nvgFillColor(vg, tc(t->surface_text));
+        nvgText(vg, x0, cy, time_str, NULL);
+        if (cfg->show_date) {
+            nvgFillColor(vg, tc(t->surface_variant_text));
+            nvgText(vg, x0 + time_w + gap, cy, date_str, NULL);
+        }
     }
-    return x;
+    return total;
 }
 
-/* Now-playing media (music note + title), shown left of the clock only while a
- * player is actually playing — like DMS. */
-static void draw_media(dc_bar *bar, float right_x)
+static float measure_clock(dc_bar *bar)
 {
-    dc_mpris_info media;
-    if (!dc_mpris_read(&media) || !media.playing || !media.title[0])
-        return;
-
-    NVGcontext *vg = bar->render->vg;
-    const dc_theme *t = dc_theme_current;
-    const float cy = bar_cy(bar);
-
-    nvgFontFaceId(vg, bar->render->font_ui);
-    nvgFontSize(vg, 13.0f);
-    float bounds[4];
-    nvgTextBounds(vg, 0.0f, 0.0f, media.title, NULL, bounds);
-    float title_w = bounds[2] - bounds[0];
-    const float max_w = 240.0f;
-    if (title_w > max_w)
-        title_w = max_w;
-    const float title_x = right_x - title_w;
-
-    nvgSave(vg);
-    nvgScissor(vg, title_x, bar->rect_y, title_w, bar->rect_h);
-    nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
-    nvgFillColor(vg, tc(t->surface_text));
-    nvgText(vg, title_x, cy, media.title, NULL);
-    nvgRestore(vg);
-
-    dc_render_icon(bar->render, DC_ICON_MUSIC_NOTE, title_x - 8.0f, cy, 17.0f, t->primary,
-                   NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
+    return layout_clock(bar, 0.0f, false);
 }
 
-/* Battery indicator (vector pictograph + percentage) ending at `right_edge`.
- * Returns the x coordinate of its left edge. */
-static float draw_battery(dc_bar *bar, float right_edge)
+static void draw_clock_pill(dc_bar *bar, const dc_pill *p)
+{
+    layout_clock(bar, p->content_x0, true);
+}
+
+/* --- battery ------------------------------------------------------------ */
+
+/* Pictograph + "NN%", left-to-right. Shared measure/draw; returns 0 (absent)
+ * when there is no battery. Spec sec.4 wants a Material glyph instead of the
+ * hand-drawn pictograph — deferred to S3. */
+static float layout_battery(dc_bar *bar, float x0, bool draw)
 {
     dc_battery_info bat;
     if (!dc_battery_read(&bat) || !bat.present)
-        return right_edge;
+        return 0.0f;
 
     NVGcontext *vg = bar->render->vg;
     const dc_theme *t = dc_theme_current;
@@ -410,50 +543,61 @@ static float draw_battery(dc_bar *bar, float right_edge)
     const NVGcolor fill_color = bat.charging ? tc(t->success) : text_color;
     const NVGcolor outline = tc_alpha(t->outline, 180);
 
+    const float body_w = 22.0f, body_h = 11.0f, nub_w = 2.0f, nub_h = 5.0f, inset = 2.0f;
+    float x = x0;
+
+    if (draw) {
+        float by = cy - body_h / 2.0f;
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, x, by, body_w, body_h, 2.5f);
+        nvgStrokeColor(vg, outline);
+        nvgStrokeWidth(vg, 1.5f);
+        nvgStroke(vg);
+
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, x + body_w, cy - nub_h / 2.0f, nub_w, nub_h, 1.0f);
+        nvgFillColor(vg, outline);
+        nvgFill(vg);
+
+        float fill_w = (body_w - 2.0f * inset) * (bat.percent / 100.0f);
+        if (fill_w > 0.5f) {
+            nvgBeginPath(vg);
+            nvgRoundedRect(vg, x + inset, by + inset, fill_w, body_h - 2.0f * inset, 1.0f);
+            nvgFillColor(vg, fill_color);
+            nvgFill(vg);
+        }
+    }
+    x += body_w + nub_w + 6.0f;
+
     char label[8];
     snprintf(label, sizeof(label), "%d%%", bat.percent);
-
     nvgFontFaceId(vg, bar->render->font_ui);
-    nvgFontSize(vg, 14.0f);
-    nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
-    nvgFillColor(vg, text_color);
-    const float text_right = right_edge;
-    nvgText(vg, text_right, cy, label, NULL);
-
+    nvgFontSize(vg, DC_BAR_TEXT_SIZE);
     float bounds[4];
-    nvgTextBounds(vg, text_right, cy, label, NULL, bounds);
-    const float text_width = bounds[2] - bounds[0];
+    nvgTextBounds(vg, 0.0f, 0.0f, label, NULL, bounds);
+    float text_w = bounds[2] - bounds[0];
 
-    /* Pictograph: rounded body + terminal nub + proportional fill. */
-    const float body_w = 22.0f, body_h = 11.0f, nub_w = 2.0f, nub_h = 5.0f, inset = 2.0f;
-    const float bx = text_right - text_width - 8.0f - body_w;
-    const float by = cy - body_h / 2.0f;
-
-    nvgBeginPath(vg);
-    nvgRoundedRect(vg, bx, by, body_w, body_h, 2.5f);
-    nvgStrokeColor(vg, outline);
-    nvgStrokeWidth(vg, 1.5f);
-    nvgStroke(vg);
-
-    nvgBeginPath(vg);
-    nvgRoundedRect(vg, bx + body_w, cy - nub_h / 2.0f, nub_w, nub_h, 1.0f);
-    nvgFillColor(vg, outline);
-    nvgFill(vg);
-
-    const float fill_w = (body_w - 2.0f * inset) * (bat.percent / 100.0f);
-    if (fill_w > 0.5f) {
-        nvgBeginPath(vg);
-        nvgRoundedRect(vg, bx + inset, by + inset, fill_w, body_h - 2.0f * inset, 1.0f);
-        nvgFillColor(vg, fill_color);
-        nvgFill(vg);
+    if (draw) {
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        nvgFillColor(vg, text_color);
+        nvgText(vg, x, cy, label, NULL);
     }
-    return bx;
+    x += text_w;
+    return x - x0;
 }
 
-/* Full right status cluster in DMS order (right->left): volume, bluetooth,
- * wifi, battery+%, notifications, clipboard, signal. State is static until the
- * sd-bus services (M3) drive it; colours follow DMS (wifi/signal green,
- * bluetooth info-blue, battery green, rest surfaceText). */
+static float measure_battery(dc_bar *bar)
+{
+    return layout_battery(bar, 0.0f, false);
+}
+
+static void draw_battery_pill(dc_bar *bar, const dc_pill *p)
+{
+    layout_battery(bar, p->content_x0, true);
+}
+
+/* --- systemTray ----------------------------------------------------------- */
+
 /* Resolve+load a tray icon by name, cached per name (nanovg image handle). */
 static int get_tray_image(dc_bar *bar, const char *name)
 {
@@ -469,53 +613,83 @@ static int get_tray_image(dc_bar *bar, const char *name)
     }
     if (bar->tray_cache_n < DC_TRAY_MAX) {
         snprintf(bar->tray_cache[bar->tray_cache_n].name,
-                 sizeof(bar->tray_cache[bar->tray_cache_n].name), "%s", name);
+                sizeof(bar->tray_cache[bar->tray_cache_n].name), "%s", name);
         bar->tray_cache[bar->tray_cache_n].image = img;
         bar->tray_cache_n++;
     }
     return img;
 }
 
-/* Tray items, drawn to the left of the signal icon (x decreasing). */
-static void draw_tray(dc_bar *bar, float *x, float cy, float isize, float step)
+/* Per-icon step; the spec's own 21x21-chip-per-item styling is S3 work (this
+ * widget opts out of the BasePill background for now — see the widget
+ * table's `has_bg`). */
+#define DC_BAR_TRAY_STEP 26.0f
+#define DC_BAR_TRAY_ICON 19.0f
+
+static float measure_tray(dc_bar *bar)
+{
+    if (!bar->tray)
+        return 0.0f;
+    const dc_tray_item *items[DC_TRAY_MAX];
+    int n = dc_tray_items(bar->tray, items, DC_TRAY_MAX);
+    if (n <= 0)
+        return 0.0f;
+    return (float)n * DC_BAR_TRAY_STEP;
+}
+
+static void draw_tray_pill(dc_bar *bar, const dc_pill *p)
 {
     if (!bar->tray)
         return;
     const dc_tray_item *items[DC_TRAY_MAX];
     int n = dc_tray_items(bar->tray, items, DC_TRAY_MAX);
     NVGcontext *vg = bar->render->vg;
+    float x = p->content_x0;
+
     for (int i = 0; i < n; i++) {
-        *x -= step;
+        float cx = x + DC_BAR_TRAY_STEP / 2.0f;
         int img = items[i]->icon_name[0] ? get_tray_image(bar, items[i]->icon_name) : 0;
         if (img > 0) {
-            NVGpaint pat = nvgImagePattern(vg, *x - isize, cy - isize / 2.0f, isize, isize, 0.0f,
-                                           img, 1.0f);
+            NVGpaint pat = nvgImagePattern(vg, cx - DC_BAR_TRAY_ICON / 2.0f,
+                                           p->cy - DC_BAR_TRAY_ICON / 2.0f, DC_BAR_TRAY_ICON,
+                                           DC_BAR_TRAY_ICON, 0.0f, img, 1.0f);
             nvgBeginPath(vg);
-            nvgRect(vg, *x - isize, cy - isize / 2.0f, isize, isize);
+            nvgRect(vg, cx - DC_BAR_TRAY_ICON / 2.0f, p->cy - DC_BAR_TRAY_ICON / 2.0f,
+                   DC_BAR_TRAY_ICON, DC_BAR_TRAY_ICON);
             nvgFillPaint(vg, pat);
             nvgFill(vg);
         } else {
             /* Fallback: a small dot for pixmap-only / unresolved items. */
             nvgBeginPath(vg);
-            nvgCircle(vg, *x - isize / 2.0f, cy, 4.0f);
-            nvgFillColor(vg, nvgRGBA(dc_theme_current->surface_text.r,
-                                     dc_theme_current->surface_text.g,
-                                     dc_theme_current->surface_text.b, 200));
+            nvgCircle(vg, cx, p->cy, 4.0f);
+            nvgFillColor(vg, tc_alpha(dc_theme_current->surface_text, 200));
             nvgFill(vg);
         }
+        x += DC_BAR_TRAY_STEP;
     }
 }
 
-static void draw_right_cluster(dc_bar *bar)
-{
-    const dc_theme *t = dc_theme_current;
-    const float cy = bar_cy(bar);
-    const float pad = 12.0f;
-    const float isize = 19.0f;
-    const float step = 26.0f;
-    const int align = NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE;
+/* --- controlCenterButton (temporary stand-in) ----------------------------- */
 
-    float x = bar_content_x1(bar) - pad;
+/* DMS's compound pill (network/vpn/bluetooth/audio/screenSharing) is S4 work.
+ * For now this slot renders dankc's existing volume/bluetooth/wifi trio as a
+ * single pill so the right cluster isn't empty — docs/12-BAR-SPEC.md sec.4
+ * says this REPLACES the standalone icons entirely, which is why they no
+ * longer have their own top-level draw calls. */
+static float measure_cc_stub(dc_bar *bar)
+{
+    DC_UNUSED(bar);
+    float isz = dc_bar_icon_size(dc_config_current, -4);
+    return isz * 3.0f + DC_BAR_WIDGET_SPACING * 2.0f;
+}
+
+static void draw_cc_stub_pill(dc_bar *bar, const dc_pill *p)
+{
+    const dc_config *cfg = dc_config_current;
+    const dc_theme *t = dc_theme_current;
+    const float isz = dc_bar_icon_size(cfg, -4);
+    const int align = NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE;
+    float x = p->content_x0;
 
     /* Volume — live level + mute state from wpctl. */
     dc_audio_info audio;
@@ -526,8 +700,8 @@ static void draw_right_cluster(dc_bar *bar)
     else if (have_audio && audio.volume < 34)
         volume_icon = DC_ICON_VOLUME_DOWN;
     dc_color volume_color = (have_audio && audio.muted) ? t->outline : t->surface_text;
-    dc_render_icon(bar->render, volume_icon, x, cy, isize, volume_color, align);
-    x -= step;
+    dc_render_icon(bar->render, volume_icon, x, p->cy, isz, volume_color, align);
+    x += isz + DC_BAR_WIDGET_SPACING;
 
     /* Bluetooth — info-blue when a device is connected, mid when powered, dim off. */
     dc_bluez_info bt;
@@ -537,28 +711,157 @@ static void draw_right_cluster(dc_bar *bar)
         bt_color = t->info;
     else if (have_bt && bt.powered)
         bt_color = t->surface_variant_text;
-    dc_render_icon(bar->render, DC_ICON_BLUETOOTH, x, cy, isize, bt_color, align);
-    x -= step;
+    dc_render_icon(bar->render, DC_ICON_BLUETOOTH, x, p->cy, isz, bt_color, align);
+    x += isz + DC_BAR_WIDGET_SPACING;
 
     /* Wi-Fi — green when connected (sysfs), dim otherwise. */
     dc_net_info net;
     dc_net_wifi(&net);
     int wifi_icon = net.connected ? DC_ICON_WIFI : DC_ICON_NETWORK_WIFI;
     dc_color wifi_color = net.connected ? t->primary : t->outline;
-    dc_render_icon(bar->render, wifi_icon, x, cy, isize, wifi_color, align);
-    x -= step;
+    dc_render_icon(bar->render, wifi_icon, x, p->cy, isz, wifi_color, align);
+}
 
-    x = draw_battery(bar, x - 4.0f) - 10.0f;
+/* --- widget host: config-driven left/center/right sections --------------- */
 
-    dc_render_icon(bar->render, DC_ICON_NOTIFICATIONS, x, cy, isize, t->surface_text, align);
-    bar->notif_cx = x - isize / 2.0f; /* right-aligned icon spans [x-isize, x] */
-    x -= step;
-    dc_render_icon(bar->render, DC_ICON_CONTENT_PASTE, x, cy, isize, t->surface_text, align);
-    bar->clip_cx = x - isize / 2.0f;
-    x -= step;
-    dc_render_icon(bar->render, DC_ICON_SIGNAL_CELLULAR_ALT, x, cy, isize, t->primary, align);
+typedef struct {
+    const char *id;
+    float (*measure)(dc_bar *bar);
+    void (*draw)(dc_bar *bar, const dc_pill *p);
+    bool has_bg;      /* draw the BasePill background? (opt out: e.g. tray) */
+    bool custom_hit;  /* widget records its own hit rect(s); host skips the default */
+    dc_bar_region region; /* used when !custom_hit */
+} dc_bar_widget_def;
 
-    draw_tray(bar, &x, cy, isize, step);
+/* Table of widget ids this stage implements. Unknown/unimplemented ids
+ * (music, weather, cpuUsage, memUsage — arriving in S4) are skipped silently
+ * by find_widget() returning NULL; see docs/12-BAR-SPEC.md sec.7 S2/S4. */
+static const dc_bar_widget_def *find_widget(const char *id)
+{
+    static const dc_bar_widget_def table[] = {
+        {"launcherButton", measure_launcher, draw_launcher_pill, true, false,
+         DC_BAR_REGION_LAUNCHER},
+        {"workspaceSwitcher", measure_workspaces, draw_workspaces_pill, true, true,
+         DC_BAR_REGION_NONE},
+        {"focusedWindow", measure_focused_window, draw_focused_window_pill, true, false,
+         DC_BAR_REGION_NONE},
+        {"clock", measure_clock, draw_clock_pill, true, false, DC_BAR_REGION_CLOCK},
+        {"systemTray", measure_tray, draw_tray_pill, false, false, DC_BAR_REGION_NONE},
+        {"clipboard", measure_clipboard, draw_clipboard_pill, true, false,
+         DC_BAR_REGION_CLIPBOARD},
+        {"notificationButton", measure_notif, draw_notif_pill, true, false,
+         DC_BAR_REGION_NOTIFICATIONS},
+        /* battery -> control center for now (docs/12-BAR-SPEC.md sec.5: "battery→battery
+         * popout (phase 2: CC)"). */
+        {"battery", measure_battery, draw_battery_pill, true, false, DC_BAR_REGION_CONTROL_CENTER},
+        {"controlCenterButton", measure_cc_stub, draw_cc_stub_pill, true, false,
+         DC_BAR_REGION_CONTROL_CENTER},
+    };
+    for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++)
+        if (strcmp(table[i].id, id) == 0)
+            return &table[i];
+    return NULL;
+}
+
+/* Draw `def`'s pill at `x` for `content_w` px of content, then record its hit
+ * rect unless the widget manages its own (workspaceSwitcher). */
+static void place_widget(dc_bar *bar, const dc_bar_widget_def *def, float x, float content_w)
+{
+    dc_pill p = pill_at(bar, x, content_w);
+    if (def->has_bg)
+        pill_draw_bg(bar, &p);
+    def->draw(bar, &p);
+    if (!def->custom_hit)
+        bar_push_hit(bar, p.x, p.x + p.w, def->region, 0);
+}
+
+/* Left section: pinned to the content's left inset, widgets flow rightward. */
+static void layout_left(dc_bar *bar, const char ids[][DC_CONFIG_WIDGET_ID_MAX], int n)
+{
+    float x = bar_content_x0(bar);
+    bool first = true;
+    for (int i = 0; i < n; i++) {
+        const dc_bar_widget_def *def = find_widget(ids[i]);
+        if (!def)
+            continue;
+        float w = def->measure(bar);
+        if (w <= 0.0f)
+            continue; /* widget has nothing to show this frame */
+        if (!first)
+            x += DC_BAR_WIDGET_SPACING;
+        place_widget(bar, def, x, w);
+        x += pill_at(bar, 0.0f, w).w;
+        first = false;
+    }
+}
+
+/* Right section: pinned to the content's right inset, laid out right-to-left
+ * (array order left-to-right, so the last id ends up flush against the
+ * right edge — e.g. controlCenterButton). */
+static void layout_right(dc_bar *bar, const char ids[][DC_CONFIG_WIDGET_ID_MAX], int n)
+{
+    float x = bar_content_x1(bar);
+    bool first = true;
+    for (int i = n - 1; i >= 0; i--) {
+        const dc_bar_widget_def *def = find_widget(ids[i]);
+        if (!def)
+            continue;
+        float w = def->measure(bar);
+        if (w <= 0.0f)
+            continue;
+        float pill_w = pill_at(bar, 0.0f, w).w;
+        if (!first)
+            x -= DC_BAR_WIDGET_SPACING;
+        x -= pill_w;
+        place_widget(bar, def, x, w);
+        first = false;
+    }
+}
+
+/* Center section: "index centering" — the middle widget of the array is
+ * centered exactly on the bar rect, and the rest flow outward from it, so
+ * that widget's position never shifts as its neighbours resize
+ * (docs/12-BAR-SPEC.md sec.2). */
+static void layout_center(dc_bar *bar, const char ids[][DC_CONFIG_WIDGET_ID_MAX], int n)
+{
+    const dc_bar_widget_def *defs[DC_CONFIG_WIDGETS_MAX];
+    float widths[DC_CONFIG_WIDGETS_MAX];
+    float pill_widths[DC_CONFIG_WIDGETS_MAX];
+    int m = 0;
+
+    for (int i = 0; i < n && m < DC_CONFIG_WIDGETS_MAX; i++) {
+        const dc_bar_widget_def *def = find_widget(ids[i]);
+        if (!def)
+            continue;
+        float w = def->measure(bar);
+        if (w <= 0.0f)
+            continue;
+        defs[m] = def;
+        widths[m] = w;
+        pill_widths[m] = pill_at(bar, 0.0f, w).w;
+        m++;
+    }
+    if (m == 0)
+        return;
+
+    int mid = m / 2;
+    float cx = bar->rect_x + bar->rect_w / 2.0f;
+    float mid_x = cx - pill_widths[mid] / 2.0f;
+    place_widget(bar, defs[mid], mid_x, widths[mid]);
+
+    float x = mid_x;
+    for (int i = mid - 1; i >= 0; i--) {
+        x -= DC_BAR_WIDGET_SPACING;
+        x -= pill_widths[i];
+        place_widget(bar, defs[i], x, widths[i]);
+    }
+
+    x = mid_x + pill_widths[mid];
+    for (int i = mid + 1; i < m; i++) {
+        x += DC_BAR_WIDGET_SPACING;
+        place_widget(bar, defs[i], x, widths[i]);
+        x += pill_widths[i];
+    }
 }
 
 /* Elevation level-2 shadow under the floating rect: a tight "key" shadow
@@ -574,7 +877,7 @@ static void draw_bar_shadow(dc_bar *bar)
     struct {
         float blur, offset, alpha;
     } layers[2] = {
-        {14.0f, 0.0f, 0.125f},        /* ambient */
+        {14.0f, 0.0f, 0.125f},           /* ambient */
         {8.0f, 4.0f * outer_dir, 0.25f}, /* key */
     };
 
@@ -644,12 +947,13 @@ void dc_bar_render(dc_bar *bar)
     nvgBeginFrame(bar->render->vg, bar->logical_width, bar->logical_height, pixel_ratio);
     draw_bar_shadow(bar);
     draw_bar_background(bar);
-    float launcher_end = draw_launcher(bar);
-    float workspaces_end = draw_workspaces(bar, launcher_end);
-    draw_focused_window(bar, workspaces_end);
-    float clock_left = draw_clock(bar);
-    draw_media(bar, clock_left - 16.0f);
-    draw_right_cluster(bar);
+
+    bar->hit_count = 0;
+    const dc_config *cfg = dc_config_current;
+    layout_left(bar, cfg->bar_left_widgets, cfg->bar_left_widgets_n);
+    layout_center(bar, cfg->bar_center_widgets, cfg->bar_center_widgets_n);
+    layout_right(bar, cfg->bar_right_widgets, cfg->bar_right_widgets_n);
+
     nvgEndFrame(bar->render->vg);
 
     dc_egl_swap(bar->egl, &bar->egl_window);
@@ -773,28 +1077,23 @@ void dc_bar_set_tray(dc_bar *bar, struct dc_tray *tray)
     bar->tray = tray;
 }
 
-dc_bar_region dc_bar_hittest(dc_bar *bar, double x, double y)
+dc_bar_region dc_bar_hittest(dc_bar *bar, double x, double y, int *out_payload)
 {
-    /* The rect no longer fills the whole surface: the spacing-px gap toward
-     * the outer edge (and the 4px side insets) are transparent, so a click
-     * there hits nothing. */
-    if (y < (double)bar->rect_y || y > (double)(bar->rect_y + bar->rect_h))
-        return DC_BAR_REGION_NONE;
+    if (out_payload)
+        *out_payload = 0;
 
-    double content_x0 = (double)bar_content_x0(bar);
-    double content_x1 = (double)bar_content_x1(bar);
-
-    if (x < content_x0 + 44.0)
-        return DC_BAR_REGION_LAUNCHER;
-    /* Notification bell + clipboard (checked before the control-center cluster). */
-    if (bar->notif_cx > 0.0f && x >= bar->notif_cx - 14.0 && x <= bar->notif_cx + 14.0)
-        return DC_BAR_REGION_NOTIFICATIONS;
-    if (bar->clip_cx > 0.0f && x >= bar->clip_cx - 14.0 && x <= bar->clip_cx + 14.0)
-        return DC_BAR_REGION_CLIPBOARD;
-    if (x > content_x1 - 210.0)
-        return DC_BAR_REGION_CONTROL_CENTER;
-    if (x > bar->logical_width / 2.0 - 70.0 && x < bar->logical_width / 2.0 + 70.0)
-        return DC_BAR_REGION_CLOCK;
+    /* Reverse order: workspaceSwitcher's per-capsule hits are pushed after
+     * (inside) its section, but any widget's rect could in principle overlap
+     * a neighbour by a rounding pixel — last-drawn-wins matches what's on
+     * top visually. */
+    for (int i = bar->hit_count - 1; i >= 0; i--) {
+        const dc_bar_hit *h = &bar->hits[i];
+        if (x < (double)h->x0 || x > (double)h->x1 || y < (double)h->y0 || y > (double)h->y1)
+            continue;
+        if (out_payload)
+            *out_payload = h->payload;
+        return h->region;
+    }
     return DC_BAR_REGION_NONE;
 }
 

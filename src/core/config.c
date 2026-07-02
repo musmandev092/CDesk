@@ -25,6 +25,15 @@ static dc_config config = {
     .bar_widget_padding = 8,
     .bar_transparency = 1.0f,
     .bar_widget_transparency = 1.0f,
+
+    /* User's live DMS layout (docs/12-BAR-SPEC.md sec.0). */
+    .bar_left_widgets = {"launcherButton", "workspaceSwitcher", "focusedWindow"},
+    .bar_left_widgets_n = 3,
+    .bar_center_widgets = {"music", "clock", "weather"},
+    .bar_center_widgets_n = 3,
+    .bar_right_widgets = {"systemTray", "clipboard", "cpuUsage", "memUsage", "notificationButton",
+                          "battery", "controlCenterButton"},
+    .bar_right_widgets_n = 7,
 };
 
 const dc_config *dc_config_current = &config;
@@ -86,6 +95,39 @@ static void get_int(const cJSON *root, const char *key, int *out, int lo, int hi
             v = hi;
         *out = v;
     }
+}
+
+/* Parse a JSON array of strings into a fixed id[][] table; non-string entries
+ * are skipped, extra entries beyond `cap` are dropped. Leaves `arr`/`out_n`
+ * untouched if `key` is absent or not an array (defaults survive). */
+static void get_string_array(const cJSON *root, const char *key,
+                             char arr[][DC_CONFIG_WIDGET_ID_MAX], int cap, int *out_n)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!cJSON_IsArray(item))
+        return;
+
+    int n = 0;
+    const cJSON *entry;
+    cJSON_ArrayForEach(entry, item)
+    {
+        if (n >= cap)
+            break;
+        if (!cJSON_IsString(entry) || !entry->valuestring)
+            continue;
+        snprintf(arr[n], DC_CONFIG_WIDGET_ID_MAX, "%s", entry->valuestring);
+        n++;
+    }
+    *out_n = n;
+}
+
+static void add_string_array(cJSON *root, const char *key, char arr[][DC_CONFIG_WIDGET_ID_MAX],
+                             int n)
+{
+    cJSON *a = cJSON_CreateArray();
+    for (int i = 0; i < n; i++)
+        cJSON_AddItemToArray(a, cJSON_CreateString(arr[i]));
+    cJSON_AddItemToObject(root, key, a);
 }
 
 static void get_bar_position(const cJSON *root, const char *key, dc_bar_position *out)
@@ -167,6 +209,13 @@ void dc_config_load(void)
     get_int(root, "barWidgetPadding", &config.bar_widget_padding, 0, 64);
     get_float(root, "barTransparency", &config.bar_transparency, 0.0f, 1.0f);
     get_float(root, "barWidgetTransparency", &config.bar_widget_transparency, 0.0f, 1.0f);
+
+    get_string_array(root, "barLeftWidgets", config.bar_left_widgets, DC_CONFIG_WIDGETS_MAX,
+                     &config.bar_left_widgets_n);
+    get_string_array(root, "barCenterWidgets", config.bar_center_widgets, DC_CONFIG_WIDGETS_MAX,
+                     &config.bar_center_widgets_n);
+    get_string_array(root, "barRightWidgets", config.bar_right_widgets, DC_CONFIG_WIDGETS_MAX,
+                     &config.bar_right_widgets_n);
     cJSON_Delete(root);
 
     apply_theme();
@@ -229,6 +278,12 @@ void dc_config_save(void)
     cJSON_AddNumberToObject(root, "barWidgetPadding", config.bar_widget_padding);
     cJSON_AddNumberToObject(root, "barTransparency", (double)config.bar_transparency);
     cJSON_AddNumberToObject(root, "barWidgetTransparency", (double)config.bar_widget_transparency);
+
+    add_string_array(root, "barLeftWidgets", config.bar_left_widgets, config.bar_left_widgets_n);
+    add_string_array(root, "barCenterWidgets", config.bar_center_widgets,
+                     config.bar_center_widgets_n);
+    add_string_array(root, "barRightWidgets", config.bar_right_widgets,
+                     config.bar_right_widgets_n);
 
     char *text = cJSON_Print(root);
     cJSON_Delete(root);

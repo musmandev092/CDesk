@@ -52,4 +52,11 @@ const dc_niri_workspace *dc_niri_workspaces(const dc_niri *niri, int *count);
 /* The currently focused window, or NULL if none. */
 const dc_niri_window *dc_niri_focused_window(const dc_niri *niri);
 
+/* Ask niri to focus the workspace at 1-based per-output index `idx` (the bar's
+ * workspaceSwitcher capsules; docs/12-BAR-SPEC.md sec.4/5). Fire-and-forget:
+ * the live niri connection is pinned to the EventStream, so this spawns the
+ * `niri msg` CLI for a one-shot Action request instead of blocking the loop
+ * on a second IPC connection. */
+void dc_niri_focus_workspace(int idx);
+
 #endif /* DC_NIRI_NIRI_H */

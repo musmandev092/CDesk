@@ -12,6 +12,11 @@
 #define DC_CONFIG_THEME_MAX 32
 #define DC_CONFIG_PATH_MAX 512
 
+/* Bar widget host (docs/12-BAR-SPEC.md sec.0/7 stage S2): each section is a
+ * config-driven list of widget ids, e.g. "launcherButton", "clock". */
+#define DC_CONFIG_WIDGETS_MAX 12
+#define DC_CONFIG_WIDGET_ID_MAX 32
+
 typedef enum {
     DC_BAR_POSITION_TOP = 0,
     DC_BAR_POSITION_BOTTOM,
@@ -32,6 +37,15 @@ typedef struct dc_config {
     int bar_widget_padding;               /* horizontal padding inside each widget pill */
     float bar_transparency;               /* 0..1 alpha multiplier for the bar background */
     float bar_widget_transparency;        /* 0..1 alpha multiplier for widget pill backgrounds */
+
+    /* Left/center/right widget ids, in display order (left-to-right within
+     * each section; see dc_bar's layout pass for how each section anchors). */
+    char bar_left_widgets[DC_CONFIG_WIDGETS_MAX][DC_CONFIG_WIDGET_ID_MAX];
+    int bar_left_widgets_n;
+    char bar_center_widgets[DC_CONFIG_WIDGETS_MAX][DC_CONFIG_WIDGET_ID_MAX];
+    int bar_center_widgets_n;
+    char bar_right_widgets[DC_CONFIG_WIDGETS_MAX][DC_CONFIG_WIDGET_ID_MAX];
+    int bar_right_widgets_n;
 } dc_config;
 
 /* The active config. Read-only for the rest of the app. */
