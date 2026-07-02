@@ -61,3 +61,9 @@ const char *dc_theme_name_at(int index)
         return NULL;
     return dc_stock_themes[index].name;
 }
+
+void dc_theme_set_custom(const dc_theme *theme)
+{
+    if (theme)
+        active_theme = *theme;
+}

@@ -54,4 +54,8 @@ int dc_theme_count(void);
 const char *dc_theme_id_at(int index);
 const char *dc_theme_name_at(int index);
 
+/* Install a fully-specified palette (e.g. one generated from the wallpaper by
+ * the dynamic color engine). Copied into the active theme. */
+void dc_theme_set_custom(const dc_theme *theme);
+
 #endif /* DC_THEME_THEME_H */

@@ -3,6 +3,7 @@
 # installed. `make` produces ./bin/dankc.
 
 CC          ?= cc
+CXX         ?= c++
 PKG_CONFIG  ?= pkg-config
 WAYLAND_SCANNER ?= wayland-scanner
 
@@ -15,6 +16,11 @@ BASE_CFLAGS := -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE $(INCLUDES) 
 
 CFLAGS   ?= -O2 -g
 CFLAGS   += $(BASE_CFLAGS) $(WARNINGS)
+
+# C++ is used for exactly one module (theme/dynamic.cpp, Material colour math).
+CXXFLAGS ?= -O2 -g
+CXXFLAGS += -std=c++17 $(INCLUDES) $(shell $(PKG_CONFIG) --cflags $(PKGS)) -Wall -Wextra \
+	-Wno-unused-parameter
 
 # Vendored third-party code (nanovg, cJSON): compile with warnings suppressed so
 # our own -Wextra output stays meaningful.
@@ -31,6 +37,9 @@ SRC := $(wildcard src/*.c src/core/*.c src/wayland/*.c src/render/*.c src/ui/*.c
 	src/services/*.c src/niri/*.c src/theme/*.c src/ipc/*.c)
 OBJ := $(SRC:.c=.o)
 
+CXX_SRC := $(wildcard src/theme/*.cpp)
+CXX_OBJ := $(CXX_SRC:.cpp=.o)
+
 TP_SRC := third_party/nanovg/nanovg.c third_party/nanovg/nanovg_gl_impl.c \
 	third_party/nanosvg/nanosvg_impl.c third_party/cjson/cJSON.c
 TP_OBJ := $(TP_SRC:.c=.o)
@@ -39,9 +48,10 @@ BIN := bin/dankc
 
 all: $(BIN)
 
-$(BIN): $(OBJ) $(TP_OBJ) $(PROTO_O)
+# Link with the C++ driver so libstdc++ is pulled in for the one C++ module.
+$(BIN): $(OBJ) $(CXX_OBJ) $(TP_OBJ) $(PROTO_O)
 	@mkdir -p bin
-	$(CC) -o $@ $^ $(LDLIBS)
+	$(CXX) -o $@ $^ $(LDLIBS)
 
 # Generated Wayland protocol glue.
 protocol/generated/%-client-protocol.h: protocol/%.xml
@@ -54,6 +64,10 @@ protocol/generated/%-protocol.c: protocol/%.xml
 
 # All first-party translation units need the generated client headers first.
 $(OBJ): $(PROTO_H)
+$(CXX_OBJ): $(PROTO_H)
+
+src/theme/%.o: src/theme/%.cpp
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 # Vendored code: relaxed warnings.
 $(TP_OBJ): %.o: %.c
@@ -63,6 +77,6 @@ $(TP_OBJ): %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -rf bin protocol/generated $(OBJ) $(TP_OBJ) $(PROTO_O)
+	rm -rf bin protocol/generated $(OBJ) $(CXX_OBJ) $(TP_OBJ) $(PROTO_O)
 
 .PHONY: all clean

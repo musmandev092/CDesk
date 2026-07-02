@@ -1,6 +1,7 @@
 #include "core/config.h"
 
 #include "core/log.h"
+#include "theme/dynamic.h"
 #include "theme/theme.h"
 
 #include <stdio.h>
@@ -66,6 +67,22 @@ static void get_float(const cJSON *root, const char *key, float *out, float lo, 
     }
 }
 
+/* Apply the selected stock palette, then overlay a wallpaper-derived palette
+ * when dynamic color is enabled. */
+static void apply_theme(void)
+{
+    dc_theme_set(config.theme_id);
+    if (config.dynamic_color && config.wallpaper[0]) {
+        dc_theme generated;
+        if (dc_dynamic_from_image(config.wallpaper, &generated)) {
+            dc_theme_set_custom(&generated);
+            dc_info("dynamic color from %s", config.wallpaper);
+        } else {
+            dc_warn("dynamic color: could not read %s", config.wallpaper);
+        }
+    }
+}
+
 void dc_config_load(void)
 {
     const char *home = getenv("HOME");
@@ -77,14 +94,14 @@ void dc_config_load(void)
         snprintf(path, sizeof(path), "%.480s/.config/dankc/config.json", home);
     else {
         dc_info("no HOME; using default config");
-        dc_theme_set(config.theme_id);
+        apply_theme();
         return;
     }
 
     char *text = read_file(path);
     if (!text) {
         dc_info("no config at %s; using defaults (theme=%s)", path, config.theme_id);
-        dc_theme_set(config.theme_id);
+        apply_theme();
         return;
     }
 
@@ -92,7 +109,7 @@ void dc_config_load(void)
     free(text);
     if (!root) {
         dc_warn("config.json parse error; using defaults");
-        dc_theme_set(config.theme_id);
+        apply_theme();
         return;
     }
 
@@ -101,10 +118,12 @@ void dc_config_load(void)
     get_bool(root, "showDate", &config.show_date);
     get_bool(root, "animationsEnabled", &config.animations_enabled);
     get_float(root, "animationSpeed", &config.animation_speed, 0.25f, 4.0f);
+    get_bool(root, "dynamicColor", &config.dynamic_color);
+    get_string(root, "wallpaper", config.wallpaper, sizeof(config.wallpaper));
     cJSON_Delete(root);
 
-    if (!dc_theme_set(config.theme_id))
-        dc_warn("unknown theme '%s'; using default", config.theme_id);
-    dc_info("config loaded: theme=%s clock24h=%d anim=%d/%.2fx", config.theme_id, config.clock_24h,
-            config.animations_enabled, (double)config.animation_speed);
+    apply_theme();
+    dc_info("config loaded: theme=%s clock24h=%d anim=%d/%.2fx dynamic=%d", config.theme_id,
+            config.clock_24h, config.animations_enabled, (double)config.animation_speed,
+            config.dynamic_color);
 }
