@@ -17,6 +17,7 @@ static dc_config config = {
     .theme_id = "green",
     .clock_24h = true,
     .show_date = true,
+    .show_seconds = false,
     .animations_enabled = true,
     .animation_speed = 1.0f,
 
@@ -229,6 +230,7 @@ void dc_config_load(void)
     get_string(root, "theme", config.theme_id, sizeof(config.theme_id));
     get_bool(root, "clock24h", &config.clock_24h);
     get_bool(root, "showDate", &config.show_date);
+    get_bool(root, "showSeconds", &config.show_seconds);
     get_bool(root, "animationsEnabled", &config.animations_enabled);
     get_float(root, "animationSpeed", &config.animation_speed, 0.25f, 4.0f);
     get_bool(root, "dynamicColor", &config.dynamic_color);
@@ -271,6 +273,21 @@ void dc_config_reapply(void)
     apply_theme();
 }
 
+static void (*change_cb)(void *);
+static void *change_ud;
+
+void dc_config_set_change_cb(void (*cb)(void *ud), void *ud)
+{
+    change_cb = cb;
+    change_ud = ud;
+}
+
+void dc_config_notify_changed(void)
+{
+    if (change_cb)
+        change_cb(change_ud);
+}
+
 /* Create the parent directory of `path` (one level: ~/.config/dankc). */
 static void ensure_parent_dir(const char *path)
 {
@@ -301,6 +318,7 @@ void dc_config_save(void)
     cJSON_AddStringToObject(root, "theme", config.theme_id);
     cJSON_AddBoolToObject(root, "clock24h", config.clock_24h);
     cJSON_AddBoolToObject(root, "showDate", config.show_date);
+    cJSON_AddBoolToObject(root, "showSeconds", config.show_seconds);
     cJSON_AddBoolToObject(root, "animationsEnabled", config.animations_enabled);
     cJSON_AddNumberToObject(root, "animationSpeed", config.animation_speed);
     cJSON_AddBoolToObject(root, "dynamicColor", config.dynamic_color);
