@@ -625,6 +625,8 @@ void dc_clipboard_toggle_pin(dc_clipboard *c, uint64_t id)
     if (idx < 0)
         return;
     c->entries[idx].pinned = !c->entries[idx].pinned;
+    dc_debug("clipboard: entry id=%llu %s", (unsigned long long)id,
+            c->entries[idx].pinned ? "pinned" : "unpinned");
     if (c->entries[idx].kind == DC_CLIP_TEXT)
         save_pins(c);
     if (c->cb)

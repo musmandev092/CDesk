@@ -1178,6 +1178,16 @@ void dc_clip_picker_handle_scroll(dc_clip_picker *p, int steps_v)
     cp_render(p);
 }
 
+/* TEMP verification hook -- see clip_picker.h. Remove before merging. */
+void dc_clip_picker_debug_toggle_pin(dc_clip_picker *p, int index)
+{
+    if (!p->visible || p->closing || index < 0 || index >= p->result_count)
+        return;
+    dc_clipboard_toggle_pin(p->clipboard, p->results[index].id);
+    refresh_all(p);
+    cp_render(p);
+}
+
 void dc_clip_picker_destroy(dc_clip_picker *p)
 {
     if (!p)
