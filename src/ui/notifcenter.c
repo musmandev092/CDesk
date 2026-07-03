@@ -54,6 +54,18 @@
 #define DC_NC_CARD_GAP 10.0f
 #define DC_NC_MAX_CARDS DC_NOTIF_MAX
 
+/* Grouping (docs/14-COMPLETION-PLAN.md W1.4): notifications sharing the same
+ * app_name (case-insensitive) collapse under one header row with a count
+ * badge; a lone notification (no siblings) still renders as a plain card,
+ * no header. Worst case every notification is its own group (no header
+ * rows) or every notification shares one group (one header + N member
+ * cards when expanded) -- either way the number of *groups* is bounded by
+ * the notification count, and the number of *rows* (headers + member
+ * cards) by roughly 2x that. */
+#define DC_NC_GROUP_HEADER_H 52.0f
+#define DC_NC_MAX_GROUPS DC_NOTIF_MAX
+#define DC_NC_MAX_ROWS (DC_NC_MAX_CARDS * 2)
+
 #define DC_NC_SCROLL_STEP 48.0f
 
 typedef enum {
@@ -76,6 +88,18 @@ typedef struct {
     float action_y0, action_y1; /* shared row -- same for every action button */
 } nc_card_hit;
 
+/* One collapsed/expanded app-group header row (grouping, docs/14-COMPLETION-
+ * PLAN.md W1.4): notifications sharing the same app_name (case-insensitive)
+ * collapse under this header with a count badge; the whole row is one click
+ * target that toggles expansion (dc_notif_center's group_state[] persists
+ * which keys are expanded across renders/tab switches). Only emitted for
+ * groups with more than one member -- a lone notification renders as a
+ * normal draw_card() with no header at all. */
+typedef struct {
+    char key[DC_NOTIF_APP]; /* lowercased app_name -- matches group_state[].key */
+    float x0, y0, x1, y1;   /* whole header rect -- click/hover toggles expand */
+} nc_group_hit;
+
 /* Hover ids (docs/13-POPOUTS-SPEC.md sec.3: hover bg on cards, X, Dismiss/
  * action buttons, tabs, Clear). The fixed header elements get small named
  * ids; each card's sub-regions are packed as
@@ -89,6 +113,9 @@ typedef struct {
 #define NC_HOVER_SETTINGS 4
 #define NC_HOVER_CARD_BASE 10
 #define NC_HOVER_CARD_STRIDE (3 + DC_NOTIF_ACTION_MAX)
+/* One hover id per app-group header row (grouping); placed past the entire
+ * card-hit id space so the two ranges never collide. */
+#define NC_HOVER_GROUP_BASE (NC_HOVER_CARD_BASE + DC_NC_MAX_CARDS * NC_HOVER_CARD_STRIDE)
 
 struct dc_notif_center {
     dc_wayland *wl;
@@ -120,6 +147,21 @@ struct dc_notif_center {
 
     nc_card_hit hits[DC_NC_MAX_CARDS];
     int hit_count;
+
+    nc_group_hit group_hits[DC_NC_MAX_GROUPS];
+    int group_hit_count;
+
+    /* Persisted expand/collapse state per app-group key, across renders (and
+     * across tab switches -- DMS keeps one global expandedGroups map too).
+     * Absence of a key means collapsed (the default); entries are only
+     * appended on first toggle, same lazy-init idea as bar.c's per-widget
+     * hover maps. Bounded to DC_NC_MAX_GROUPS, which can never be exceeded
+     * since there can be at most one group per live notification. */
+    struct {
+        char key[DC_NOTIF_APP];
+        bool expanded;
+    } group_state[DC_NC_MAX_GROUPS];
+    int group_state_count;
 
     dc_anim anim;
     struct wl_callback *frame_cb;
@@ -186,6 +228,58 @@ static void nc_ellipsize(dc_render *render, char *buf, size_t bufsize, float max
     size_t cap = bufsize > sizeof(tmp) ? sizeof(tmp) : bufsize;
     dc_shape_ellipsize(render, buf, max_w, tmp, cap);
     memcpy(buf, tmp, cap);
+}
+
+/* Group key for grouping (docs/14-COMPLETION-PLAN.md W1.4): lowercased
+ * app_name, so senders that vary the case ("Firefox" vs "firefox") still
+ * collapse together. A notification with no app_name at all gets a unique
+ * "#<id>" key so it never groups with anything (matches the "no app name ->
+ * no group chrome" expectation instead of lumping every anonymous sender
+ * into one bucket). */
+static void nc_group_key(const dc_notification *n, char *out, size_t outsz)
+{
+    if (n->app_name[0]) {
+        size_t j = 0;
+        for (; n->app_name[j] && j + 1 < outsz; j++)
+            out[j] = (char)tolower((unsigned char)n->app_name[j]);
+        out[j] = '\0';
+    } else {
+        snprintf(out, outsz, "#%u", n->id);
+    }
+}
+
+static bool nc_group_is_expanded(dc_notif_center *nc, const char *key)
+{
+    for (int i = 0; i < nc->group_state_count; i++)
+        if (strcmp(nc->group_state[i].key, key) == 0)
+            return nc->group_state[i].expanded;
+    return false;
+}
+
+static void nc_group_toggle_expanded(dc_notif_center *nc, const char *key)
+{
+    /* Copy to a stack-local buffer first: callers pass `key` as a pointer
+     * into another array inside this same `nc` (e.g. nc->group_hits[g].key),
+     * so once this call inlines, GCC's -Wrestrict can't rule out `key`
+     * aliasing the group_state[] slot this function is about to write below
+     * (both are just offsets from the same `nc` base pointer to it). Going
+     * through a local that's provably disjoint from `nc` resolves the false
+     * positive without weakening the actual bounds-safety. */
+    char key_copy[DC_NOTIF_APP];
+    snprintf(key_copy, sizeof(key_copy), "%s", key);
+
+    for (int i = 0; i < nc->group_state_count; i++) {
+        if (strcmp(nc->group_state[i].key, key_copy) == 0) {
+            nc->group_state[i].expanded = !nc->group_state[i].expanded;
+            return;
+        }
+    }
+    if (nc->group_state_count < DC_NC_MAX_GROUPS) {
+        snprintf(nc->group_state[nc->group_state_count].key,
+                sizeof(nc->group_state[nc->group_state_count].key), "%s", key_copy);
+        nc->group_state[nc->group_state_count].expanded = true;
+        nc->group_state_count++;
+    }
 }
 
 /* "app-name • time" label per docs/13-POPOUTS-SPEC.md sec.3: same calendar
@@ -377,6 +471,107 @@ static void draw_card(dc_notif_center *nc, const dc_notification *n, float x, fl
     }
 }
 
+/* One app-group header row (grouping, docs/14-COMPLETION-PLAN.md W1.4):
+ * avatar (newest member's image/initial) + count badge, app name + "N
+ * notifications" subtitle, and an expand/collapse chevron. The whole row is
+ * one click target (see dc_notif_center_handle_click()) -- clicking
+ * anywhere toggles `expanded`. Appends the drawn hit rect to
+ * nc->group_hits[]. Only ever called for groups with more than one member;
+ * a lone notification draws as a plain draw_card() instead. */
+static void draw_group_header(dc_notif_center *nc, const char *key, const char *app_name,
+                              const dc_notification *latest, int count, bool expanded, float x,
+                              float y, float w)
+{
+    NVGcontext *vg = nc->render->vg;
+    const dc_theme *t = dc_theme_current;
+
+    if (nc->group_hit_count >= DC_NC_MAX_GROUPS)
+        return;
+    nc_group_hit *hit = &nc->group_hits[nc->group_hit_count++];
+    snprintf(hit->key, sizeof(hit->key), "%s", key);
+    hit->x0 = x;
+    hit->y0 = y;
+    hit->x1 = x + w;
+    hit->y1 = y + DC_NC_GROUP_HEADER_H;
+
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, x, y, w, DC_NC_GROUP_HEADER_H, 12.0f);
+    nvgFillColor(vg, tc(t->surface_container_high));
+    nvgFill(vg);
+
+    const float av_r = 16.0f;
+    const float av_cx = x + 16.0f + av_r;
+    const float av_cy = y + DC_NC_GROUP_HEADER_H / 2.0f;
+    int img_w = 0, img_h = 0;
+    int img = dc_notif_image_get(nc->render, latest, &img_w, &img_h);
+    nvgBeginPath(vg);
+    nvgCircle(vg, av_cx, av_cy, av_r);
+    if (img > 0 && img_w > 0 && img_h > 0) {
+        float scale = fmaxf((av_r * 2.0f) / (float)img_w, (av_r * 2.0f) / (float)img_h);
+        float iw = (float)img_w * scale, ih = (float)img_h * scale;
+        NVGpaint pat =
+            nvgImagePattern(vg, av_cx - iw / 2.0f, av_cy - ih / 2.0f, iw, ih, 0.0f, img, 1.0f);
+        nvgFillPaint(vg, pat);
+        nvgFill(vg);
+    } else {
+        nvgFillColor(vg, tc_alpha(t->primary, 150));
+        nvgFill(vg);
+        char initial[2] = {app_name[0] ? (char)toupper((unsigned char)app_name[0]) : '?', 0};
+        nvgFontFaceId(vg, nc->render->font_ui);
+        nvgFontSize(vg, 14.0f);
+        nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+        nvgFillColor(vg, tc(t->surface_container));
+        nvgText(vg, av_cx, av_cy + 1.0f, initial, NULL);
+    }
+
+    /* Count badge, top-right of the avatar -- DMS's NotificationCard.qml
+     * puts the same badge on the collapsed card's avatar. */
+    const float badge_r = 9.0f;
+    const float badge_cx = av_cx + av_r * 0.75f;
+    const float badge_cy = av_cy - av_r * 0.75f;
+    nvgBeginPath(vg);
+    nvgCircle(vg, badge_cx, badge_cy, badge_r);
+    nvgFillColor(vg, tc(t->primary));
+    nvgFill(vg);
+    char count_buf[16]; /* sized generously above "99" -- the actual on-screen
+                          * value is capped by the ternary below, but the
+                          * compiler's -Wformat-truncation can't see that from
+                          * a plain %d on an int, so the buffer itself must be
+                          * wide enough for any int's worst case. */
+    snprintf(count_buf, sizeof(count_buf), "%d", count > 99 ? 99 : count);
+    nvgFontFaceId(vg, nc->render->font_ui);
+    nvgFontSize(vg, 10.0f);
+    nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+    nvgFillColor(vg, tc(t->primary_text));
+    nvgText(vg, badge_cx, badge_cy + 0.5f, count_buf, NULL);
+
+    /* Expand/collapse chevron, right edge. */
+    const float chev_r = 12.0f;
+    const float chev_cx = x + w - 14.0f - chev_r;
+    const float chev_cy = av_cy;
+    dc_render_icon(nc->render, expanded ? DC_ICON_EXPAND_LESS : DC_ICON_EXPAND_MORE, chev_cx,
+                  chev_cy, 18.0f, t->surface_variant_text, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+
+    /* App name + "N notifications" subtitle, between avatar and chevron. */
+    const float tx = av_cx + av_r + 12.0f;
+    const float tw = (chev_cx - chev_r - 8.0f) - tx;
+
+    char name_buf[DC_NOTIF_APP];
+    snprintf(name_buf, sizeof(name_buf), "%s", app_name[0] ? app_name : "Unknown");
+    nvgFontFaceId(vg, nc->render->font_ui); /* the chevron icon draw above left the icon face active */
+    nvgFontSize(vg, 14.0f);
+    nc_ellipsize(nc->render, name_buf, sizeof(name_buf), tw);
+    nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_TOP);
+    nvgFillColor(vg, tc(t->surface_text));
+    dc_shape_draw_text(nc->render, tx, y + 10.0f, name_buf, NULL);
+
+    char sub_buf[32];
+    snprintf(sub_buf, sizeof(sub_buf), "%d notifications", count);
+    nvgFontSize(vg, 11.0f);
+    nvgFillColor(vg, tc_alpha(t->surface_text, 150));
+    dc_shape_draw_text(nc->render, tx, y + 28.0f, sub_buf, NULL);
+}
+
 /* Draw a "Current (N)"/"History (M)" pill tab and record its hit rect.
  * Active = solid primary pill with dark (primary_text) text; inactive = dim
  * surface_container_high pill (docs/13-POPOUTS-SPEC.md sec.3). */
@@ -445,6 +640,16 @@ static void draw_nc_hover(dc_notif_center *nc)
         x1 = nc->settings_x1;
         y1 = nc->settings_y1;
         radius = (y1 - y0) / 2.0f;
+    } else if (nc->hover_id >= NC_HOVER_GROUP_BASE) {
+        int gi = nc->hover_id - NC_HOVER_GROUP_BASE;
+        if (gi < 0 || gi >= nc->group_hit_count)
+            return;
+        const nc_group_hit *gh = &nc->group_hits[gi];
+        x0 = gh->x0;
+        y0 = gh->y0;
+        x1 = gh->x1;
+        y1 = gh->y1;
+        radius = 12.0f;
     } else if (nc->hover_id >= NC_HOVER_CARD_BASE) {
         int rel = nc->hover_id - NC_HOVER_CARD_BASE;
         int i = rel / NC_HOVER_CARD_STRIDE, kind = rel % NC_HOVER_CARD_STRIDE;
@@ -641,7 +846,13 @@ static void nc_render(dc_notif_center *nc)
     draw_tab(nc, 1, next_x, tabs_y, DC_NC_TABS_H, history_label, nc->tab == DC_NC_TAB_HISTORY,
             &tab_x1);
 
-    /* --- Card list, scrollable ------------------------------------------ */
+    /* --- Card list, scrollable, grouped by app ---------------------------
+     * Grouping (docs/14-COMPLETION-PLAN.md W1.4): entries sharing the same
+     * app_name (case-insensitive) collapse into one header row with a count
+     * badge; a lone notification (no siblings) still renders as a plain
+     * card, no header. Groups are built in first-seen order over `entries`
+     * (already newest-first), so a group's position tracks its most recent
+     * member with no separate sort needed. */
     const float list_y0 = tabs_y + DC_NC_TABS_H + DC_NC_LIST_GAP;
     const float list_y1 = h - pad - DC_NC_BOTTOM_PAD;
     const float list_h = list_y1 - list_y0;
@@ -651,8 +862,66 @@ static void nc_render(dc_notif_center *nc)
                    ? dc_notifications_current(nc->notifications, entries, DC_NC_MAX_CARDS)
                    : dc_notifications_history(nc->notifications, entries, DC_NC_MAX_CARDS);
 
-    float content_h = count > 0 ? (float)count * (DC_NC_CARD_H + DC_NC_CARD_GAP) - DC_NC_CARD_GAP
-                                : 0.0f;
+    typedef struct {
+        char key[DC_NOTIF_APP];
+        const dc_notification *members[DC_NC_MAX_CARDS];
+        int member_count;
+    } nc_group;
+    nc_group groups[DC_NC_MAX_GROUPS];
+    int group_count = 0;
+    for (int i = 0; i < count; i++) {
+        char key[DC_NOTIF_APP];
+        nc_group_key(entries[i], key, sizeof(key));
+        int found = -1;
+        for (int g = 0; g < group_count; g++) {
+            if (strcmp(groups[g].key, key) == 0) {
+                found = g;
+                break;
+            }
+        }
+        if (found < 0 && group_count < DC_NC_MAX_GROUPS) {
+            found = group_count++;
+            snprintf(groups[found].key, sizeof(groups[found].key), "%s", key);
+            groups[found].member_count = 0;
+        }
+        if (found >= 0 && groups[found].member_count < DC_NC_MAX_CARDS)
+            groups[found].members[groups[found].member_count++] = entries[i];
+    }
+
+    /* One row per header (group with >1 member) or standalone card (group
+     * with exactly 1 member); expanded groups also get one row per member. */
+    typedef struct {
+        int group_index;
+        int member_index; /* -1 for a header row */
+        float height;
+    } nc_row;
+    nc_row rows[DC_NC_MAX_ROWS];
+    int row_count = 0;
+    for (int gi = 0; gi < group_count && row_count < DC_NC_MAX_ROWS; gi++) {
+        if (groups[gi].member_count > 1) {
+            rows[row_count].group_index = gi;
+            rows[row_count].member_index = -1;
+            rows[row_count].height = DC_NC_GROUP_HEADER_H;
+            row_count++;
+            if (nc_group_is_expanded(nc, groups[gi].key)) {
+                for (int m = 0; m < groups[gi].member_count && row_count < DC_NC_MAX_ROWS; m++) {
+                    rows[row_count].group_index = gi;
+                    rows[row_count].member_index = m;
+                    rows[row_count].height = DC_NC_CARD_H;
+                    row_count++;
+                }
+            }
+        } else if (groups[gi].member_count == 1) {
+            rows[row_count].group_index = gi;
+            rows[row_count].member_index = 0;
+            rows[row_count].height = DC_NC_CARD_H;
+            row_count++;
+        }
+    }
+
+    float content_h = 0.0f;
+    for (int r = 0; r < row_count; r++)
+        content_h += rows[r].height + (r > 0 ? DC_NC_CARD_GAP : 0.0f);
     float scroll_max = content_h > list_h ? content_h - list_h : 0.0f;
     if (nc->scroll[nc->tab] < 0.0f)
         nc->scroll[nc->tab] = 0.0f;
@@ -662,6 +931,7 @@ static void nc_render(dc_notif_center *nc)
     float scroll = nc->scroll[nc->tab];
 
     nc->hit_count = 0;
+    nc->group_hit_count = 0;
 
     if (count == 0) {
         dc_color dim = t->surface_text;
@@ -677,11 +947,22 @@ static void nc_render(dc_notif_center *nc)
     } else {
         nvgSave(vg);
         nvgScissor(vg, ix, list_y0, iw, list_h);
-        for (int i = 0; i < count; i++) {
-            float y = list_y0 + (float)i * (DC_NC_CARD_H + DC_NC_CARD_GAP) - scroll;
-            if (y + DC_NC_CARD_H < list_y0 || y > list_y1)
+        float running_y = list_y0 - scroll;
+        for (int r = 0; r < row_count; r++) {
+            if (r > 0)
+                running_y += DC_NC_CARD_GAP;
+            float row_y = running_y;
+            float row_h = rows[r].height;
+            running_y += row_h;
+            if (row_y + row_h < list_y0 || row_y > list_y1)
                 continue; /* fully outside the viewport -- skip drawing + hit-test */
-            draw_card(nc, entries[i], ix, y, iw);
+            const nc_group *grp = &groups[rows[r].group_index];
+            if (rows[r].member_index < 0)
+                draw_group_header(nc, grp->key, grp->members[0]->app_name, grp->members[0],
+                                  grp->member_count, nc_group_is_expanded(nc, grp->key), ix, row_y,
+                                  iw);
+            else
+                draw_card(nc, grp->members[rows[r].member_index], ix, row_y, iw);
         }
         nvgRestore(vg);
 
@@ -899,6 +1180,12 @@ static int nc_hittest(dc_notif_center *nc, double x, double y)
     if (in_rect(x, y, nc->settings_x0, nc->settings_y0, nc->settings_x1, nc->settings_y1))
         return NC_HOVER_SETTINGS;
 
+    for (int g = 0; g < nc->group_hit_count; g++) {
+        nc_group_hit *gh = &nc->group_hits[g];
+        if (in_rect(x, y, gh->x0, gh->y0, gh->x1, gh->y1))
+            return NC_HOVER_GROUP_BASE + g;
+    }
+
     for (int i = 0; i < nc->hit_count; i++) {
         nc_card_hit *hit = &nc->hits[i];
         if (in_rect(x, y, hit->close_x0, hit->close_y0, hit->close_x1, hit->close_y1))
@@ -949,6 +1236,15 @@ void dc_notif_center_handle_click(dc_notif_center *nc, double x, double y)
          * here without a main.c dependency beyond this task's touch-scope. */
         dc_debug("notification center: settings gear clicked (no-op)");
         return;
+    }
+
+    for (int g = 0; g < nc->group_hit_count; g++) {
+        nc_group_hit *gh = &nc->group_hits[g];
+        if (in_rect(x, y, gh->x0, gh->y0, gh->x1, gh->y1)) {
+            nc_group_toggle_expanded(nc, gh->key);
+            nc_render(nc);
+            return;
+        }
     }
 
     for (int i = 0; i < nc->hit_count; i++) {
