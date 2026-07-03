@@ -375,3 +375,171 @@ void dc_display_set_vrr(const char *name, bool enabled)
     run_niri_output_cmd(argv, 6);
 }
 
+/* --- persist: ~/.config/niri/dankc-outputs.kdl ---------------------------
+ *
+ * Same managed-include shape as the Window Rules editor
+ * (src/ui/settings.c: g_wr_managed_path/wr_ensure_include()): a dankc-owned
+ * KDL file rewritten wholesale from the in-memory config list, plus a single
+ * backed-up `include` line appended to the user's real config.kdl the first
+ * time persistence is used. dankc never otherwise touches config.kdl.
+ */
+
+#define DC_DISPLAY_PATH_MAX 512
+#define DC_DISPLAY_MANAGED_FILENAME "dankc-outputs.kdl"
+#define DC_DISPLAY_INCLUDE_LINE "include \"" DC_DISPLAY_MANAGED_FILENAME "\""
+
+static bool resolve_config_dir(char *dir, size_t cap, const char *override_dir)
+{
+    if (override_dir && override_dir[0]) {
+        strncpy(dir, override_dir, cap - 1);
+        dir[cap - 1] = '\0';
+        return true;
+    }
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) {
+        dc_warn("display: $HOME unset, cannot locate niri config dir");
+        return false;
+    }
+    snprintf(dir, cap, "%s/.config/niri", home);
+    return true;
+}
+
+static char *read_whole_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return NULL;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    if (size < 0) {
+        fclose(f);
+        return NULL;
+    }
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc((size_t)size + 1);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    size_t got = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    buf[got] = '\0';
+    return buf;
+}
+
+static void serialize_output_block(FILE *f, const dc_display_persist_config *c)
+{
+    fprintf(f, "output \"%s\" {\n", c->name);
+    if (c->has_enabled && !c->enabled) {
+        fprintf(f, "    off\n");
+    }
+    if (c->has_mode) {
+        if (c->mode_auto) {
+            fprintf(f, "    mode \"auto\"\n");
+        } else if (c->refresh_mhz > 0) {
+            char refresh[16];
+            dc_display_format_refresh(c->refresh_mhz, refresh, sizeof(refresh));
+            fprintf(f, "    mode \"%dx%d@%s\"\n", c->width, c->height, refresh);
+        } else {
+            fprintf(f, "    mode \"%dx%d\"\n", c->width, c->height);
+        }
+    }
+    if (c->has_scale)
+        fprintf(f, "    scale %g\n", c->scale);
+    if (c->has_transform)
+        fprintf(f, "    transform \"%s\"\n", dc_display_transform_name(c->transform));
+    if (c->position_auto) {
+        fprintf(f, "    position \"auto\"\n");
+    } else if (c->has_position) {
+        fprintf(f, "    position x=%d y=%d\n", c->x, c->y);
+    }
+    if (c->has_vrr)
+        fprintf(f, "    variable-refresh-rate %s\n", c->vrr_enabled ? "true" : "false");
+    fprintf(f, "}\n\n");
+}
+
+static bool write_managed_file(const char *managed_path, const dc_display_persist_config configs[],
+        int count)
+{
+    FILE *f = fopen(managed_path, "w");
+    if (!f) {
+        dc_warn("display: could not write %s", managed_path);
+        return false;
+    }
+    fputs("// Managed by DankC's Settings > Displays tab.\n"
+          "// Hand edits are fine, but saving a display change through the UI rewrites this\n"
+          "// whole file from what dankc currently understands -- anything it can't parse\n"
+          "// beyond mode/scale/transform/position/on-off/variable-refresh-rate will be lost\n"
+          "// on the next Displays UI save.\n\n",
+            f);
+    for (int i = 0; i < count; i++)
+        serialize_output_block(f, &configs[i]);
+    fclose(f);
+    return true;
+}
+
+static bool ensure_include(const char *config_path, const char *managed_filename)
+{
+    char *text = read_whole_file(config_path);
+    if (!text) {
+        /* config.kdl not present yet -- create one containing just the
+         * include, nothing to back up. */
+        FILE *f = fopen(config_path, "w");
+        if (!f) {
+            dc_warn("display: could not create %s", config_path);
+            return false;
+        }
+        fprintf(f, "%s\n", DC_DISPLAY_INCLUDE_LINE);
+        fclose(f);
+        return true;
+    }
+    if (strstr(text, managed_filename)) {
+        free(text);
+        return true; /* include (or a reference to our managed file) already there */
+    }
+
+    char backup_path[DC_DISPLAY_PATH_MAX + 32];
+    snprintf(backup_path, sizeof(backup_path), "%s.bak-%ld", config_path, (long)time(NULL));
+    FILE *bf = fopen(backup_path, "w");
+    if (!bf) {
+        dc_warn("display: could not create backup %s; aborting include", backup_path);
+        free(text);
+        return false;
+    }
+    fputs(text, bf);
+    fclose(bf);
+    free(text);
+
+    FILE *f = fopen(config_path, "a");
+    if (!f) {
+        dc_warn("display: could not append to %s (backup at %s is safe to restore)", config_path,
+                backup_path);
+        return false;
+    }
+    fprintf(f, "\n// Added by DankC Settings > Displays (backup: %s):\n", backup_path);
+    fprintf(f, "%s\n", DC_DISPLAY_INCLUDE_LINE);
+    fclose(f);
+    dc_info("display: added include to %s (backup %s)", config_path, backup_path);
+    return true;
+}
+
+bool dc_display_persist(const dc_display_persist_config configs[], int count,
+        const char *config_dir_override)
+{
+    char dir[DC_DISPLAY_PATH_MAX];
+    if (!resolve_config_dir(dir, sizeof(dir), config_dir_override))
+        return false;
+
+    char managed_path[DC_DISPLAY_PATH_MAX];
+    char config_path[DC_DISPLAY_PATH_MAX];
+    snprintf(managed_path, sizeof(managed_path), "%s/" DC_DISPLAY_MANAGED_FILENAME, dir);
+    snprintf(config_path, sizeof(config_path), "%s/config.kdl", dir);
+
+    if (!write_managed_file(managed_path, configs, count))
+        return false;
+    if (!ensure_include(config_path, DC_DISPLAY_MANAGED_FILENAME))
+        return false;
+
+    dc_info("display: persisted %d output block(s) to %s", count, managed_path);
+    return true;
+}
