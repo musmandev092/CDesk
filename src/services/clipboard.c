@@ -81,6 +81,7 @@ struct transfer {
     size_t cap;
     size_t cap_limit;
     bool is_image;
+    bool overflowed; /* image offer exceeded cap_limit -- skip, don't store truncated data */
     char ext[8];
 };
 
@@ -323,7 +324,11 @@ static void transfer_finish(struct transfer *t)
 {
     dc_loop_remove_fd(t->c->loop, t->fd);
     close(t->fd);
-    if (t->buf) {
+    if (t->overflowed) {
+        dc_debug("clipboard: image offer exceeds %zu-byte cap, skipping (task: skip >8MB)",
+                t->cap_limit);
+        free(t->buf);
+    } else if (t->buf) {
         if (t->is_image) {
             store_image(t->c, (unsigned char *)t->buf, t->len, t->ext);
             t->buf = NULL; /* ownership moved into store_image() */
@@ -338,20 +343,40 @@ static void transfer_finish(struct transfer *t)
     free(t);
 }
 
-/* Pipe is readable: accumulate until EOF, then store. */
+/* Pipe is readable: accumulate until EOF, then store. Once the buffer has
+ * grown to cap_limit and still can't fit more, a naive "read() returned 0 ==
+ * EOF" check misfires: read() with a 0-byte request also returns 0, which
+ * would otherwise be mistaken for real EOF and silently store a
+ * truncated/corrupt blob for any offer bigger than the cap. Instead, probe
+ * with a real (1-byte) read to tell "exactly cap_limit bytes, true EOF" apart
+ * from "more data follows" -- for images the latter means the whole entry
+ * must be skipped (task: "skip >8MB"), not truncated; text keeps the older
+ * truncate-at-cap behavior since a partial paste is still usable. */
 static void transfer_read(int fd, uint32_t revents, void *data)
 {
     DC_UNUSED(revents);
     struct transfer *t = data;
     for (;;) {
-        if (t->len + 4096 > t->cap) {
+        size_t avail = (t->cap > t->len + 1) ? (t->cap - t->len - 1) : 0;
+        if (avail == 0) {
+            if (t->cap >= t->cap_limit) {
+                if (!t->is_image) { /* text: cap reached, truncate in place */
+                    transfer_finish(t);
+                    return;
+                }
+                char probe;
+                ssize_t pn = read(fd, &probe, 1);
+                if (pn > 0) {
+                    t->overflowed = true;
+                    transfer_finish(t);
+                } else if (pn == 0) { /* true EOF right at the cap */
+                    transfer_finish(t);
+                } /* else EAGAIN: wait for the next POLLIN and probe again */
+                return;
+            }
             size_t ncap = t->cap ? t->cap * 2 : 8192;
             if (ncap > t->cap_limit)
                 ncap = t->cap_limit;
-            if (ncap <= t->len) { /* entry too big -- stop reading */
-                transfer_finish(t);
-                return;
-            }
             char *nb = realloc(t->buf, ncap);
             if (!nb) {
                 transfer_finish(t);
@@ -359,8 +384,9 @@ static void transfer_read(int fd, uint32_t revents, void *data)
             }
             t->buf = nb;
             t->cap = ncap;
+            continue;
         }
-        ssize_t n = read(fd, t->buf + t->len, t->cap - t->len - 1);
+        ssize_t n = read(fd, t->buf + t->len, avail);
         if (n > 0) {
             t->len += (size_t)n;
             continue;
