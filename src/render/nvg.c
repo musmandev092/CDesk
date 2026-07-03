@@ -294,6 +294,7 @@ typedef enum {
     LAZY_CJK = 0,
     LAZY_DEVANAGARI,
     LAZY_THAI,
+    LAZY_TAMIL,
     LAZY_EMOJI,
     LAZY_GROUP_COUNT,
 } lazy_group;
@@ -331,6 +332,9 @@ static int lazy_group_for_cp(uint32_t cp)
         return LAZY_DEVANAGARI;
     if (cp >= 0x0E00 && cp <= 0x0E7F)
         return LAZY_THAI;
+    /* Tamil + Tamil Supplement. */
+    if ((cp >= 0x0B80 && cp <= 0x0BFF) || (cp >= 0x11FC0 && cp <= 0x11FFF))
+        return LAZY_TAMIL;
     /* Emoji: misc symbols/dingbats/transport used by monochrome emoji sets,
      * plus the main supplementary-plane emoji blocks (U+1F300 and up, per
      * the task spec). */
@@ -371,6 +375,7 @@ static const fallback_spec FALLBACK_SPECS[] = {
     {":lang=ko", 0xC548, "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", LAZY_CJK},
     {":lang=hi", 0x0928, NULL, LAZY_DEVANAGARI},
     {":lang=th", 0x0E2A, NULL, LAZY_THAI},
+    {":lang=ta", 0x0B85, NULL, LAZY_TAMIL}, /* probe: TAMIL LETTER A */
 };
 
 /* Vendored monochrome emoji font, appended after the fontconfig chain. */

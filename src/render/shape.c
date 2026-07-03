@@ -443,71 +443,174 @@ static shape_entry *shape_build(dc_render *render, const char *text, const char 
     int nglyphs = 0, cap = 0;
     float pen_x = 0.0f;
 
+    /* Font itemization scratch, reused per bidi run (sized to the whole
+     * string's MAX_CHARS cap, so it's always big enough for any one run). */
+    typedef struct {
+        int start, end; /* [start,end) index, relative to the run (0-based) */
+        int font_id;
+        const char *font_path;
+    } sub_run;
+    int run_font_id[MAX_CHARS];
+    const char *run_font_path[MAX_CHARS];
+    sub_run subs[MAX_CHARS];
+
     for (int r = 0; r < nruns; r++) {
         int rstart = runs[r].start_cp, rend = runs[r].end_cp;
         if (rstart >= rend)
             continue;
+        int rlen = rend - rstart;
 
-        /* Font for this run: first font (font_ui, then fallbacks, in
-         * registered priority order) that actually covers the run's first
-         * non-whitespace codepoint — matching fontstash's own resolution
-         * order for an unshaped draw of the same text. */
-        int font_id = -1;
-        const char *font_path = NULL;
-        for (int i = rstart; i < rend && font_id < 0; i++) {
-            if (cps[i] <= 0x20)
+        /* Itemize this bidi run further by font coverage: a single bidi
+         * run (one direction/level) can still mix scripts a single font
+         * doesn't cover — e.g. "日本語 中文 + हिन्दी" is one LTR run — and
+         * HarfBuzz shapes one font per buffer, so shaping the whole run
+         * against one font (previously: whichever font covered the run's
+         * *first* non-whitespace codepoint) left every glyph the chosen
+         * font lacked as .notdef/blank. Instead, resolve a font per
+         * codepoint here, then merge into maximal same-font sub-ranges
+         * below and shape each independently.
+         *
+         * Whitespace/control codepoints (<=0x20) and codepoints no loaded
+         * font covers are left unresolved (-1) and backfilled from the
+         * nearest resolved neighbor (previous, else next), so a bare space
+         * between two scripts doesn't force a spurious extra sub-run and
+         * an isolated uncovered codepoint doesn't derail the rest of the
+         * run — mirroring the old code's "skip whitespace while picking
+         * the run's font" behavior, just applied per sub-run instead of
+         * once for the whole run. */
+        for (int i = 0; i < rlen; i++) {
+            uint32_t cp = cps[rstart + i];
+            if (cp <= 0x20) {
+                run_font_id[i] = -1;
+                run_font_path[i] = NULL;
                 continue;
-            font_id = dc_render_font_for_codepoint(render, cps[i], &font_path);
-        }
-        if (font_id < 0) {
-            font_id = render->font_ui;
-            font_path = render->font_ui_path;
-        }
-        if (!font_path || !font_path[0])
-            continue;
-
-        hb_font_t *hbfont = hb_font_for_path(font_path);
-        if (!hbfont)
-            continue;
-
-        int byte_start = byte_off[rstart];
-        int byte_end = byte_off[rend];
-
-        hb_buffer_t *buf = hb_buffer_create();
-        hb_buffer_add_utf8(buf, text, (int)byte_len, (unsigned int)byte_start, byte_end - byte_start);
-        hb_buffer_set_direction(buf, runs[r].rtl ? HB_DIRECTION_RTL : HB_DIRECTION_LTR);
-        hb_buffer_guess_segment_properties(buf);
-        hb_shape(hbfont, buf, NULL, 0);
-
-        unsigned int raw_n = 0;
-        hb_glyph_info_t *info = hb_buffer_get_glyph_infos(buf, &raw_n);
-        hb_glyph_position_t *pos = hb_buffer_get_glyph_positions(buf, &raw_n);
-        int ninfo = (int)raw_n;
-        int upem = (int)hb_face_get_upem(hb_font_get_face(hbfont));
-        if (upem <= 0)
-            upem = 1000;
-        float unit_scale = font_size / (float)upem;
-
-        if (nglyphs + ninfo > cap) {
-            cap = (nglyphs + ninfo) * 2 + 8;
-            dc_shape_glyph *ng = realloc(glyphs, sizeof(*ng) * (size_t)cap);
-            if (!ng) {
-                hb_buffer_destroy(buf);
-                free(glyphs);
-                return NULL;
             }
-            glyphs = ng;
+            const char *path = NULL;
+            int fid = dc_render_font_for_codepoint(render, cp, &path);
+            if (fid < 0 || !path || !path[0]) {
+                run_font_id[i] = -1;
+                run_font_path[i] = NULL;
+            } else {
+                run_font_id[i] = fid;
+                run_font_path[i] = path;
+            }
         }
-        for (int i = 0; i < ninfo; i++) {
-            glyphs[nglyphs].gid = (int)info[i].codepoint;
-            glyphs[nglyphs].font_id = font_id;
-            glyphs[nglyphs].dx = pen_x + (float)pos[i].x_offset * unit_scale;
-            glyphs[nglyphs].dy = -(float)pos[i].y_offset * unit_scale; /* HB y-up, nvg y-down */
-            glyphs[nglyphs].adv = (float)pos[i].x_advance * unit_scale;
-            pen_x += glyphs[nglyphs].adv;
-            nglyphs++;
+        {
+            int last_id = -1;
+            const char *last_path = NULL;
+            for (int i = 0; i < rlen; i++) {
+                if (run_font_id[i] >= 0) {
+                    last_id = run_font_id[i];
+                    last_path = run_font_path[i];
+                } else if (last_id >= 0) {
+                    run_font_id[i] = last_id;
+                    run_font_path[i] = last_path;
+                }
+            }
+            /* Back-fill any still-unresolved leading span from the first
+             * resolved codepoint found later in the run. */
+            last_id = -1;
+            last_path = NULL;
+            for (int i = rlen - 1; i >= 0; i--) {
+                if (run_font_id[i] >= 0) {
+                    last_id = run_font_id[i];
+                    last_path = run_font_path[i];
+                } else if (last_id >= 0) {
+                    run_font_id[i] = last_id;
+                    run_font_path[i] = last_path;
+                }
+            }
+            /* Whole run never resolved (all-whitespace, or nothing in it is
+             * covered by any loaded font) — default to font_ui, matching
+             * the old whole-run fallback. */
+            for (int i = 0; i < rlen; i++) {
+                if (run_font_id[i] < 0) {
+                    run_font_id[i] = render->font_ui;
+                    run_font_path[i] = render->font_ui_path;
+                }
+            }
         }
-        hb_buffer_destroy(buf);
+
+        /* Merge into maximal same-font sub-ranges, still in logical
+         * (increasing-index) order within the run. */
+        int nsubs = 0;
+        {
+            int i = 0;
+            while (i < rlen) {
+                int j = i + 1;
+                while (j < rlen && run_font_id[j] == run_font_id[i])
+                    j++;
+                subs[nsubs].start = i;
+                subs[nsubs].end = j;
+                subs[nsubs].font_id = run_font_id[i];
+                subs[nsubs].font_path = run_font_path[i];
+                nsubs++;
+                i = j;
+            }
+        }
+
+        /* Visual (pen) order of the sub-ranges within this bidi run: for
+         * an LTR run, logical order already is left-to-right visual order.
+         * For an RTL run, a single hb_shape() call on the *whole* run
+         * would internally reverse the glyph order into left-to-right-
+         * drawable order for us — but splitting the run into several
+         * independently-shaped sub-runs means that reversal must now be
+         * done at the sub-run level ourselves: the sub-run that comes
+         * LAST logically (closest to the run's end, i.e. read last in an
+         * RTL sense) is the LEFTMOST one visually, so sub-runs are visited
+         * back-to-front. This mirrors the character-level reversal
+         * bidi_compute_runs() already does when recovering whole runs from
+         * FriBidi's visual reordering. */
+        for (int k = 0; k < nsubs; k++) {
+            int si = runs[r].rtl ? (nsubs - 1 - k) : k;
+            sub_run *sub = &subs[si];
+            int a = rstart + sub->start, b = rstart + sub->end;
+            if (a >= b || !sub->font_path || !sub->font_path[0])
+                continue;
+
+            hb_font_t *hbfont = hb_font_for_path(sub->font_path);
+            if (!hbfont)
+                continue;
+
+            int byte_start = byte_off[a];
+            int byte_end = byte_off[b];
+
+            hb_buffer_t *buf = hb_buffer_create();
+            hb_buffer_add_utf8(buf, text, (int)byte_len, (unsigned int)byte_start, byte_end - byte_start);
+            hb_buffer_set_direction(buf, runs[r].rtl ? HB_DIRECTION_RTL : HB_DIRECTION_LTR);
+            hb_buffer_guess_segment_properties(buf);
+            hb_shape(hbfont, buf, NULL, 0);
+
+            unsigned int raw_n = 0;
+            hb_glyph_info_t *info = hb_buffer_get_glyph_infos(buf, &raw_n);
+            hb_glyph_position_t *pos = hb_buffer_get_glyph_positions(buf, &raw_n);
+            int ninfo = (int)raw_n;
+            int upem = (int)hb_face_get_upem(hb_font_get_face(hbfont));
+            if (upem <= 0)
+                upem = 1000;
+            float unit_scale = font_size / (float)upem;
+
+            if (nglyphs + ninfo > cap) {
+                cap = (nglyphs + ninfo) * 2 + 8;
+                dc_shape_glyph *ng = realloc(glyphs, sizeof(*ng) * (size_t)cap);
+                if (!ng) {
+                    hb_buffer_destroy(buf);
+                    free(glyphs);
+                    return NULL;
+                }
+                glyphs = ng;
+            }
+            for (int gi = 0; gi < ninfo; gi++) {
+                glyphs[nglyphs].gid = (int)info[gi].codepoint;
+                glyphs[nglyphs].font_id = sub->font_id;
+                glyphs[nglyphs].dx = pen_x + (float)pos[gi].x_offset * unit_scale;
+                glyphs[nglyphs].dy = -(float)pos[gi].y_offset * unit_scale; /* HB y-up, nvg y-down */
+                glyphs[nglyphs].adv = (float)pos[gi].x_advance * unit_scale;
+                pen_x += glyphs[nglyphs].adv;
+                nglyphs++;
+            }
+            hb_buffer_destroy(buf);
+        }
     }
 
     shape_entry *ent = calloc(1, sizeof(*ent));
