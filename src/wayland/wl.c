@@ -164,13 +164,19 @@ static void pointer_handle_button(void *data, struct wl_pointer *pointer, uint32
     DC_UNUSED(pointer);
     DC_UNUSED(serial);
     DC_UNUSED(time);
-    if (button != BTN_LEFT)
+    /* Left/right/middle all reach click_cb now (docs/POLISH.md P4: tray
+     * right-click menu, middle-click SecondaryActivate) -- release_cb and
+     * button_down (button-held-motion drags, e.g. popout sliders) stay
+     * left-only since nothing else uses a right/middle drag gesture. */
+    if (button != BTN_LEFT && button != BTN_RIGHT && button != BTN_MIDDLE)
         return;
     if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
-        wl->button_down = true;
+        if (button == BTN_LEFT)
+            wl->button_down = true;
         if (wl->pointer_surface && wl->click_cb)
-            wl->click_cb(wl->pointer_surface, wl->pointer_x, wl->pointer_y, wl->click_data);
-    } else {
+            wl->click_cb(wl->pointer_surface, wl->pointer_x, wl->pointer_y, button,
+                        wl->click_data);
+    } else if (button == BTN_LEFT) {
         wl->button_down = false;
         if (wl->pointer_surface && wl->release_cb)
             wl->release_cb(wl->pointer_surface, wl->pointer_x, wl->pointer_y, wl->release_data);
