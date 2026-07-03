@@ -239,6 +239,7 @@ static bool nm_find_wifi_device(char *out, size_t out_sz)
 static sd_bus *g_net_bus;
 
 static void nm_eth_init(sd_bus *bus);
+static void net_run_test_hook(void);
 
 void dc_net_init(struct dc_dbus *dbus)
 {
@@ -267,6 +268,15 @@ void dc_net_init(struct dc_dbus *dbus)
     }
 
     nm_eth_init(bus);
+
+    /* DANKC_NETSVC_TEST=1 (debug-only, env-gated -- same convention as every
+     * other DANKC_*_TEST/DANKC_*_DEMO hook in the codebase): exercise every
+     * read function added by docs/18-WIFI-BT-PLAN.md once at startup and log
+     * the results, so the ethernet/saved-networks/hotspot paths can be
+     * verified without controlcenter.c/settings.c UI wiring (a separate,
+     * later change owned elsewhere). No-op when unset. */
+    if (getenv("DANKC_NETSVC_TEST"))
+        net_run_test_hook();
 }
 
 /* SSID/signal via `nmcli` (a fork+popen, same shell-out style already used by
@@ -1915,6 +1925,72 @@ void dc_net_hotspot_stop(void)
                     delerr.message ? delerr.message : strerror(-dr));
         sd_bus_error_free(&delerr);
         sd_bus_message_unref(delreply);
+    }
+}
+
+/* --- DANKC_NETSVC_TEST startup self-check (docs/18-WIFI-BT-PLAN.md) --------
+ *
+ * controlcenter.c/settings.c don't call any of the functions above yet (that
+ * UI wiring is a separate change, owned elsewhere) -- this is how the read
+ * paths get verified against a real machine's NetworkManager state without
+ * one. Exercises every new read function once and logs the results plainly;
+ * never touches a write path (those are exercised separately, manually,
+ * under DANKC_NET_DRYRUN). */
+static void net_run_test_hook(void)
+{
+    static const char *eth_state_names[] = {
+        "unavailable", "no-cable", "disconnected", "connecting", "connected",
+    };
+
+    dc_info("net: [DANKC_NETSVC_TEST] === ethernet ===");
+    dc_net_eth_info eth;
+    if (dc_net_ethernet(&eth)) {
+        dc_info("net: [DANKC_NETSVC_TEST] device=%s state=%s connection=\"%s\" mac=%s "
+                "speed=%uMb/s",
+                eth.device_name, eth_state_names[eth.state], eth.connection_name, eth.mac,
+                eth.link_speed_mbps);
+        if (eth.state == DC_NET_ETH_CONNECTED)
+            dc_info("net: [DANKC_NETSVC_TEST]   ipv4=%s/%u gateway=%s dns[0]=%s",
+                    eth.ipv4_address, eth.ipv4_prefix, eth.ipv4_gateway,
+                    eth.ipv4_dns_count > 0 ? eth.ipv4_dns[0] : "(none)");
+    } else {
+        dc_info("net: [DANKC_NETSVC_TEST] no wired device found");
+    }
+
+    dc_info("net: [DANKC_NETSVC_TEST] === saved wifi networks ===");
+    dc_net_saved_net saved[DC_NET_SAVED_MAX];
+    int n = dc_net_saved_list(saved, DC_NET_SAVED_MAX);
+    dc_info("net: [DANKC_NETSVC_TEST] %d saved 802-11-wireless connection(s)", n);
+    for (int i = 0; i < n; i++)
+        dc_info("net: [DANKC_NETSVC_TEST]   id=\"%s\" ssid=\"%s\" autoconnect=%s path=%s",
+                saved[i].id, saved[i].ssid, saved[i].autoconnect ? "yes" : "no", saved[i].path);
+
+    dc_info("net: [DANKC_NETSVC_TEST] === hotspot ===");
+    char hs_ssid[64];
+    if (dc_net_hotspot_active(hs_ssid, sizeof(hs_ssid)))
+        dc_info("net: [DANKC_NETSVC_TEST] hotspot active, ssid=\"%s\"", hs_ssid);
+    else
+        dc_info("net: [DANKC_NETSVC_TEST] no hotspot active");
+
+    /* Write-path verification: only when DANKC_NET_DRYRUN is *also* set, so
+     * this never issues a real D-Bus write -- dc_net_hotspot_start()/
+     * dc_net_saved_forget() see the dry-run gate before doing anything and
+     * just log what they would have sent (docs/18-WIFI-BT-PLAN.md's required
+     * verification scenario). */
+    if (net_dryrun()) {
+        dc_info("net: [DANKC_NETSVC_TEST] === write-path dry-run scenario ===");
+        dc_net_hotspot_start_result hr =
+            dc_net_hotspot_start("DankcTestHotspot", "testpassword123", "bg");
+        dc_info("net: [DANKC_NETSVC_TEST] dc_net_hotspot_start() -> %d", (int)hr);
+
+        if (n > 0) {
+            bool ok = dc_net_saved_forget(saved[0].path);
+            dc_info("net: [DANKC_NETSVC_TEST] dc_net_saved_forget(\"%s\") -> %s", saved[0].path,
+                    ok ? "ok" : "failed");
+        } else {
+            dc_info("net: [DANKC_NETSVC_TEST] no saved network to exercise "
+                    "dc_net_saved_forget() with");
+        }
     }
 }
 
