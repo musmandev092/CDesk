@@ -39,6 +39,7 @@
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
+#include <dirent.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -89,11 +90,79 @@ struct tick_ctx {
     dc_dashboard *dashboard;
     int last_volume;
     bool last_muted;
+    int last_brightness;
     bool have_last;
+    char brightness_path[300]; /* Cached sysfs path for brightness reading */
 };
 
+/* Cache the backlight device path on first call. */
+static void cache_brightness_path(struct tick_ctx *ctx)
+{
+    if (ctx->brightness_path[0] != '\0')
+        return; /* Already cached */
+
+    DIR *dir = opendir("/sys/class/backlight");
+    if (!dir)
+        return;
+
+    struct dirent *ent;
+    while ((ent = readdir(dir))) {
+        if (ent->d_name[0] == '.')
+            continue;
+        char path[300];
+        snprintf(path, sizeof(path), "/sys/class/backlight/%.200s/brightness", ent->d_name);
+        if (access(path, F_OK) == 0) {
+            snprintf(ctx->brightness_path, sizeof(ctx->brightness_path), "%s", path);
+            break;
+        }
+    }
+    closedir(dir);
+}
+
+/* Read current brightness as 0-100 percent, or -1 if unavailable. */
+static int read_brightness_percent(struct tick_ctx *ctx)
+{
+    if (ctx->brightness_path[0] == '\0')
+        return -1;
+
+    int cur = -1, max = -1;
+    FILE *f = fopen(ctx->brightness_path, "r");
+    if (f) {
+        if (fscanf(f, "%d", &cur) != 1)
+            cur = -1;
+        fclose(f);
+    }
+
+    if (cur < 0)
+        return -1;
+
+    /* Read max_brightness from the same device. */
+    char max_path[300];
+    snprintf(max_path, sizeof(max_path), "%s", ctx->brightness_path);
+    char *p = strrchr(max_path, '/');
+    if (p)
+        strcpy(p + 1, "max_brightness");
+
+    f = fopen(max_path, "r");
+    if (f) {
+        if (fscanf(f, "%d", &max) != 1)
+            max = -1;
+        fclose(f);
+    }
+
+    if (max <= 0)
+        return -1;
+
+    int percent = (cur * 100) / max;
+    if (percent > 100)
+        percent = 100;
+    if (percent < 0)
+        percent = 0;
+    return percent;
+}
+
 /* Called ~once per second by the loop: redraw the bars (clock) and pop the
- * volume OSD on a change. */
+ * volume/brightness OSD on a change. */
 static void clock_tick(void *data)
 {
     struct tick_ctx *ctx = data;
@@ -120,6 +189,21 @@ static void clock_tick(void *data)
         ctx->last_volume = audio.volume;
         ctx->last_muted = audio.muted;
         ctx->have_last = true;
+    }
+
+    /* Brightness OSD: detect changes via sysfs. Cache the path on first call. */
+    cache_brightness_path(ctx);
+    int brightness = read_brightness_percent(ctx);
+    if (brightness >= 0) {
+        if (ctx->have_last && brightness != ctx->last_brightness) {
+            dc_output *first = NULL;
+            wl_list_for_each(first, &ctx->wl->outputs, link) {
+                break;
+            }
+            if (first)
+                dc_osd_show_brightness(ctx->osd, first, brightness);
+        }
+        ctx->last_brightness = brightness;
     }
 }
 

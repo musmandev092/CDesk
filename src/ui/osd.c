@@ -36,6 +36,12 @@
 /* Extra visual gap above the bar, matching popout.c's DC_POPOUT_BAR_GAP. */
 #define DC_OSD_BAR_GAP 8
 
+/* OSD mode: either volume or brightness. */
+typedef enum {
+    DC_OSD_MODE_VOLUME,
+    DC_OSD_MODE_BRIGHTNESS,
+} dc_osd_mode;
+
 struct dc_osd {
     dc_wayland *wl;
     dc_egl *egl;
@@ -55,8 +61,13 @@ struct dc_osd {
     int phys_height;
 
     int timer_fd;
-    int volume;
-    bool muted;
+
+    /* Mode-specific state. */
+    dc_osd_mode mode;
+    int value;           /* 0-100 percent, applies to both volume and brightness */
+    int icon;            /* Material Symbols codepoint to display */
+    bool muted;          /* Volume only: whether muted */
+
     bool visible;
     bool configured;
     bool egl_ready;
@@ -145,30 +156,29 @@ static void osd_render(dc_osd *osd)
     nvgFill(vg);
 
     const float cy = h / 2.0f;
-    const int icon = osd->muted ? DC_ICON_VOLUME_OFF : DC_ICON_VOLUME_UP;
-    dc_render_icon(osd->render, icon, pad + 18.0f, cy, 22.0f, t->surface_text,
+    dc_render_icon(osd->render, osd->icon, pad + 18.0f, cy, 22.0f, t->surface_text,
                    NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
 
     const float tx = pad + 52.0f;
     const float tw = w - pad - 52.0f - 52.0f;
     const float th = 8.0f;
-    float value = osd->muted ? 0.0f : osd->volume / 100.0f;
-    if (value < 0.0f)
-        value = 0.0f;
-    if (value > 1.0f)
-        value = 1.0f;
+    float frac = osd->value / 100.0f;
+    if (frac < 0.0f)
+        frac = 0.0f;
+    if (frac > 1.0f)
+        frac = 1.0f;
 
     nvgBeginPath(vg);
     nvgRoundedRect(vg, tx, cy - th / 2.0f, tw, th, th / 2.0f);
     nvgFillColor(vg, nvgRGBA(t->outline.r, t->outline.g, t->outline.b, 90));
     nvgFill(vg);
     nvgBeginPath(vg);
-    nvgRoundedRect(vg, tx, cy - th / 2.0f, tw * value, th, th / 2.0f);
+    nvgRoundedRect(vg, tx, cy - th / 2.0f, tw * frac, th, th / 2.0f);
     nvgFillColor(vg, nvgRGBA(t->primary.r, t->primary.g, t->primary.b, 255));
     nvgFill(vg);
 
     char label[8];
-    snprintf(label, sizeof(label), "%d", osd->volume);
+    snprintf(label, sizeof(label), "%d", osd->value);
     nvgFontFaceId(vg, osd->render->font_ui);
     nvgFontSize(vg, 14.0f);
     nvgFillColor(vg, nvgRGBA(t->surface_text.r, t->surface_text.g, t->surface_text.b, 255));
@@ -300,11 +310,17 @@ void dc_osd_integrate(dc_osd *osd, struct dc_loop *loop)
         dc_loop_add_fd(loop, osd->timer_fd, POLLIN, timer_cb, osd);
 }
 
-void dc_osd_show_volume(dc_osd *osd, dc_output *output, int volume, bool muted)
+/* Generic OSD show: displays either volume or brightness with a custom icon. */
+static void osd_show_generic(dc_osd *osd, dc_output *output, dc_osd_mode mode, int value, int icon,
+                             bool muted)
 {
-    osd->volume = volume;
+    osd->mode = mode;
+    osd->value = value;
+    osd->icon = icon;
     osd->muted = muted;
-    dc_debug("osd volume %d%s", volume, muted ? " (muted)" : "");
+
+    const char *mode_name = (mode == DC_OSD_MODE_VOLUME) ? "volume" : "brightness";
+    dc_debug("osd %s %d%s", mode_name, value, (mode == DC_OSD_MODE_VOLUME && muted) ? " (muted)" : "");
 
     if (osd->visible) {
         /* A new change during the exit fade cancels it and re-shows. */
@@ -352,6 +368,17 @@ void dc_osd_show_volume(dc_osd *osd, dc_output *output, int volume, bool muted)
     wl_surface_commit(osd->surface);
     osd->visible = true;
     arm_timer(osd);
+}
+
+void dc_osd_show_volume(dc_osd *osd, dc_output *output, int volume, bool muted)
+{
+    int icon = muted ? DC_ICON_VOLUME_OFF : DC_ICON_VOLUME_UP;
+    osd_show_generic(osd, output, DC_OSD_MODE_VOLUME, volume, icon, muted);
+}
+
+void dc_osd_show_brightness(dc_osd *osd, dc_output *output, int brightness)
+{
+    osd_show_generic(osd, output, DC_OSD_MODE_BRIGHTNESS, brightness, DC_ICON_BRIGHTNESS_MEDIUM, false);
 }
 
 void dc_osd_destroy(dc_osd *osd)
