@@ -100,6 +100,17 @@ typedef enum {
     CC_HOVER_BT_AGENT_FIELD,
     CC_HOVER_BT_AGENT_NO,
     CC_HOVER_BT_AGENT_YES,
+    /* Adapter "Discoverable" toggle (W1 polish, docs/18-WIFI-BT-PLAN.md),
+     * beside the Discover/Scan button on the same header row. */
+    CC_HOVER_BT_DISCOVERABLE_BTN,
+    /* Per-row action icons, CC_MAX_EXPAND_ROWS consecutive ids each: Bluetooth
+     * Trust/Remove (paired devices only) and Wi-Fi Forget (saved networks
+     * only) -- geometry is fixed per row (right-aligned within the row rect),
+     * only whether they're active/drawn depends on that row's data (see
+     * cc_get_layout()'s net_row_saved/bt_row_paired params). */
+    CC_HOVER_BT_TRUST_BASE,
+    CC_HOVER_BT_REMOVE_BASE = CC_HOVER_BT_TRUST_BASE + CC_MAX_EXPAND_ROWS,
+    CC_HOVER_NET_FORGET_BASE = CC_HOVER_BT_REMOVE_BASE + CC_MAX_EXPAND_ROWS,
 } cc_hover_id;
 
 /* Max length of the inline Wi-Fi password buffer (nmcli/WPA itself caps PSKs
@@ -288,6 +299,21 @@ typedef struct {
      * row, only meaningful when expand_kind == 2. */
     float bt_scan_btn_x0, bt_scan_btn_x1, bt_scan_btn_y0, bt_scan_btn_h;
 
+    /* Adapter "Discoverable" toggle (W1 polish), same header row, just left
+     * of the Discover/Scan button. */
+    float bt_disc_btn_x0, bt_disc_btn_x1, bt_disc_btn_y0, bt_disc_btn_h;
+
+    /* Per-row action icons (W1/W2 polish): fixed geometry (same for every
+     * row, right-aligned within the row rect via cc_expand_row_y()'s y plus
+     * l->expand_row_h), only drawn/hit-testable for rows the caller flagged
+     * via cc_get_layout()'s net_row_saved/bt_row_paired params -- Wi-Fi
+     * "Forget" for saved networks, Bluetooth Trust + Remove for paired
+     * devices. */
+    bool net_row_saved[CC_MAX_EXPAND_ROWS];
+    float net_forget_cx, net_forget_r;
+    bool bt_row_paired[CC_MAX_EXPAND_ROWS];
+    float bt_trust_cx, bt_remove_cx, bt_action_r;
+
     /* Bluetooth pairing-agent panel (W3.1): appended after the device rows
      * (not tied to a particular row, unlike the Wi-Fi password panel above --
      * BlueZ's agent request isn't scoped to whichever row is currently
@@ -316,9 +342,14 @@ typedef struct {
  * currently open under (only meaningful when expand_kind == 1).
  * `bt_agent_kind`: DC_BLUEZ_AGENT_NONE, or which pairing-agent panel (W3.1)
  * to reserve room for below the bluetooth device rows (only meaningful when
- * expand_kind == 2). */
+ * expand_kind == 2). `net_row_saved`/`bt_row_paired`: NULL, or an array of
+ * CC_MAX_EXPAND_ROWS bools flagging which rows get the Forget / Trust+Remove
+ * action icons (W1/W2 polish) -- copied verbatim into the returned layout so
+ * cc_hittest()/draw_cc_hover() (which don't otherwise see per-row service
+ * data) can tell which rows have them. */
 static cc_layout cc_get_layout(float w, bool media_active, int expand_kind, int expand_rows,
-                               int pw_after_row, dc_bluez_agent_kind bt_agent_kind)
+                               int pw_after_row, dc_bluez_agent_kind bt_agent_kind,
+                               const bool *net_row_saved, const bool *bt_row_paired)
 {
     const float pad = 6.0f;   /* room for the drop shadow */
     const float margin = 16.0f; /* content inset from the card edge (~Theme.spacingL) */
@@ -328,6 +359,16 @@ static cc_layout cc_get_layout(float w, bool media_active, int expand_kind, int 
     memset(&l, 0, sizeof(l));
     l.ix = pad + margin;
     l.iw = w - 2.0f * l.ix;
+
+    if (net_row_saved)
+        memcpy(l.net_row_saved, net_row_saved, sizeof(l.net_row_saved));
+    if (bt_row_paired)
+        memcpy(l.bt_row_paired, bt_row_paired, sizeof(l.bt_row_paired));
+    l.net_forget_r = 9.0f;
+    l.net_forget_cx = l.ix + l.iw - l.net_forget_r - 4.0f;
+    l.bt_action_r = 9.0f;
+    l.bt_remove_cx = l.ix + l.iw - l.bt_action_r - 4.0f;
+    l.bt_trust_cx = l.bt_remove_cx - 2.0f * l.bt_action_r - 6.0f;
 
     l.header_y = pad + margin;
     l.header_h = 70.0f;
@@ -422,6 +463,12 @@ static cc_layout cc_get_layout(float w, bool media_active, int expand_kind, int 
             l.bt_scan_btn_y0 = l.expand_y0;
             l.bt_scan_btn_x1 = l.ix + l.iw;
             l.bt_scan_btn_x0 = l.bt_scan_btn_x1 - 64.0f;
+
+            /* Adapter Discoverable toggle, same row, just left of Discover. */
+            l.bt_disc_btn_h = l.bt_scan_btn_h;
+            l.bt_disc_btn_y0 = l.bt_scan_btn_y0;
+            l.bt_disc_btn_x1 = l.bt_scan_btn_x0 - 8.0f;
+            l.bt_disc_btn_x0 = l.bt_disc_btn_x1 - 64.0f;
 
             if (bt_agent_kind != DC_BLUEZ_AGENT_NONE) {
                 l.bt_agent_active = true;
@@ -562,12 +609,16 @@ static cc_hover_id cc_hittest(const cc_layout *l, double x, double y)
         }
     }
 
-    /* Bluetooth "Discover" toggle (W3.1) -- on the header row, above the
-     * device-row band, so this is safe to check before the row loop. */
+    /* Bluetooth "Discover"/"Discoverable" toggles (W3.1/W1) -- on the header
+     * row, above the device-row band, so this is safe to check before the
+     * row loop. */
     if (l->expand_kind == 2) {
         if (x >= (double)l->bt_scan_btn_x0 && x <= (double)l->bt_scan_btn_x1 &&
             y >= (double)l->bt_scan_btn_y0 && y <= (double)(l->bt_scan_btn_y0 + l->bt_scan_btn_h))
             return CC_HOVER_BT_SCAN_BTN;
+        if (x >= (double)l->bt_disc_btn_x0 && x <= (double)l->bt_disc_btn_x1 &&
+            y >= (double)l->bt_disc_btn_y0 && y <= (double)(l->bt_disc_btn_y0 + l->bt_disc_btn_h))
+            return CC_HOVER_BT_DISCOVERABLE_BTN;
     }
 
     if (l->expand_kind != 0 && l->expand_rows > 0) {
@@ -576,6 +627,24 @@ static cc_hover_id cc_hittest(const cc_layout *l, double x, double y)
             float ry = cc_expand_row_y(l, i);
             if (y < (double)ry || y > (double)(ry + l->expand_row_h))
                 continue;
+            float cy = ry + l->expand_row_h / 2.0f;
+
+            /* Per-row action icons (W1/W2 polish) -- checked before the
+             * generic full-row rect below so they take priority over the
+             * "tap a row to connect/pair" action they sit on top of. */
+            if (l->expand_kind == 1 && l->net_row_saved[i]) {
+                double dx = x - (double)l->net_forget_cx, dy = y - (double)cy;
+                if (dx * dx + dy * dy <= (double)(l->net_forget_r * l->net_forget_r))
+                    return (cc_hover_id)(CC_HOVER_NET_FORGET_BASE + i);
+            } else if (l->expand_kind == 2 && l->bt_row_paired[i]) {
+                double dx = x - (double)l->bt_trust_cx, dy = y - (double)cy;
+                if (dx * dx + dy * dy <= (double)(l->bt_action_r * l->bt_action_r))
+                    return (cc_hover_id)(CC_HOVER_BT_TRUST_BASE + i);
+                dx = x - (double)l->bt_remove_cx;
+                if (dx * dx + dy * dy <= (double)(l->bt_action_r * l->bt_action_r))
+                    return (cc_hover_id)(CC_HOVER_BT_REMOVE_BASE + i);
+            }
+
             if (x < (double)l->ix || x > (double)(l->ix + l->iw))
                 continue;
             return (cc_hover_id)(CC_HOVER_EXPAND_ROW_BASE + i);
@@ -899,8 +968,18 @@ typedef struct {
     dc_net_wifi_ap net_aps[CC_MAX_EXPAND_ROWS];
     dc_bluez_device bt_devs[CC_MAX_EXPAND_ROWS];
 
-    /* Bluetooth pairing (W3.1). */
+    /* Wi-Fi known/saved networks (W2, docs/18-WIFI-BT-PLAN.md sec.2.3):
+     * cross-referenced from dc_net_saved_list()/dc_net_saved_find_by_ssid()
+     * against this frame's scan rows, one entry per net_aps[i] -- lets the UI
+     * badge a saved SSID and forget it (Settings.Connection.Delete()) without
+     * a second D-Bus round trip per click. */
+    bool net_ap_saved[CC_MAX_EXPAND_ROWS];
+    char net_ap_saved_path[CC_MAX_EXPAND_ROWS][64];
+    bool net_ap_autoconnect[CC_MAX_EXPAND_ROWS];
+
+    /* Bluetooth pairing (W3.1) + adapter Discoverable (W1 polish). */
     bool bt_discovering;
+    bool bt_discoverable;
     dc_bluez_pair_state bt_pair_state;
     char bt_pair_mac[18];
     char bt_pair_err[96];
@@ -925,6 +1004,7 @@ static void cc_gather_state(dc_control_center *cc, cc_state *st)
             memcpy(st->bt_devs, bt.devices, (size_t)n * sizeof(bt.devices[0]));
         st->expand_kind = 2;
         st->expand_rows = n;
+        st->bt_discoverable = bt.discoverable;
 
         st->bt_discovering = dc_bluez_discovering();
         st->bt_pair_state = dc_bluez_pair_poll(st->bt_pair_mac, sizeof(st->bt_pair_mac),
@@ -936,6 +1016,26 @@ static void cc_gather_state(dc_control_center *cc, cc_state *st)
             snprintf(st->bt_agent_device, sizeof(st->bt_agent_device), "%s", areq.device_name);
             snprintf(st->bt_agent_passkey, sizeof(st->bt_agent_passkey), "%s", areq.passkey_str);
         }
+    }
+}
+
+/* Builds the two per-row action-icon flag arrays cc_get_layout() needs (W1/W2
+ * polish) from this frame's gathered state -- shared by every cc_get_layout()
+ * call site (render/click/motion) so they always agree on which rows show a
+ * Forget/Trust/Remove icon, same "one function feeds every layout consumer"
+ * discipline as cc_gather_state() itself. */
+static void cc_row_action_flags(const cc_state *st, bool net_saved[CC_MAX_EXPAND_ROWS],
+                                bool bt_paired[CC_MAX_EXPAND_ROWS])
+{
+    memset(net_saved, 0, CC_MAX_EXPAND_ROWS * sizeof(bool));
+    memset(bt_paired, 0, CC_MAX_EXPAND_ROWS * sizeof(bool));
+    int rows = st->expand_rows > CC_MAX_EXPAND_ROWS ? CC_MAX_EXPAND_ROWS : st->expand_rows;
+    if (st->expand_kind == 1) {
+        for (int i = 0; i < rows; i++)
+            net_saved[i] = st->net_ap_saved[i];
+    } else if (st->expand_kind == 2) {
+        for (int i = 0; i < rows; i++)
+            bt_paired[i] = st->bt_devs[i].paired;
     }
 }
 
@@ -1106,14 +1206,53 @@ static void draw_slider(dc_render *r, float x, float cy, float w, int icon, floa
     nvgText(vg, x + w, cy, pct, NULL);
 }
 
+/* Map org.bluez.Device1.Icon (dc_bluez_device.icon) onto dankc's own icon set
+ * (docs/18-WIFI-BT-PLAN.md W1 item 5) -- audio-headphones/audio-headset ->
+ * headphones, input-mouse -> mouse, input-keyboard -> keyboard, phone ->
+ * smartphone, else a generic bluetooth glyph (connected/plain per the
+ * existing connection-state cue) so a still-unpaired nearby device without a
+ * reported type keeps its "tap to pair" affordance. */
+static int cc_bt_device_icon(const dc_bluez_device *d)
+{
+    const char *ic = d->icon;
+    if (ic[0]) {
+        if (strstr(ic, "headphone") || strstr(ic, "headset"))
+            return DC_ICON_HEADPHONES;
+        if (strstr(ic, "mouse"))
+            return DC_ICON_MOUSE;
+        if (strstr(ic, "keyboard"))
+            return DC_ICON_KEYBOARD;
+        if (strstr(ic, "phone"))
+            return DC_ICON_SMARTPHONE;
+    }
+    if (!d->paired)
+        return DC_ICON_ADD; /* nearby, unpaired, unknown type -- "tap to pair" */
+    return d->connected ? DC_ICON_BLUETOOTH_CONNECTED : DC_ICON_BLUETOOTH;
+}
+
+/* Extra trailing width draw_expand_row() must leave clear of its own text so
+ * the per-row action icons (drawn separately by the caller, at cc_layout's
+ * fixed net_forget_cx/bt_trust_cx/bt_remove_cx positions -- see cc_render())
+ * never overlap the title/status text. A little more than the icons' own
+ * footprint (2*r, or 4*r plus the gap between two) so there's visible
+ * breathing room. */
+#define CC_ROW_FORGET_RESERVE_W 28.0f
+#define CC_ROW_BT_ACTIONS_RESERVE_W 52.0f
+
 /* One row of the network/bluetooth expand panel: small leading icon, title
- * (ellipsized), trailing status text (colored `status_primary` when it
- * should stand out -- "Connected"/in-use, or a warning tone for the
- * password hint). Deliberately flatter than draw_pill_tile() (no icon
- * chip/background) since these are dense list rows, not tiles. */
+ * (ellipsized), an optional small "extra" label (Bluetooth battery %,
+ * right-aligned just left of `status`), an optional small badge icon (Wi-Fi
+ * "saved network" pin, between the title and status/extra), trailing status
+ * text (colored `status_primary` when it should stand out -- "Connected"/
+ * in-use, or a warning tone for the password hint), and `trailing_reserve_w`
+ * px of clear space left of all of the above for the caller's own per-row
+ * action icons (see the #defines above). Deliberately flatter than
+ * draw_pill_tile() (no icon chip/background) since these are dense list rows,
+ * not tiles. */
 static void draw_expand_row(dc_render *r, float x, float y, float w, float h, int icon,
                             const char *title, const char *status, bool status_primary,
-                            bool status_warn)
+                            bool status_warn, const char *extra_label, int badge_icon,
+                            float trailing_reserve_w)
 {
     NVGcontext *vg = r->vg;
     const dc_theme *t = dc_theme_current;
@@ -1130,20 +1269,42 @@ static void draw_expand_row(dc_render *r, float x, float y, float w, float h, in
     nvgTextBounds(vg, 0, 0, status_buf, NULL, sbounds);
     float status_w = status_buf[0] ? (sbounds[2] - sbounds[0]) + 8.0f : 0.0f;
 
+    char extra_buf[16];
+    snprintf(extra_buf, sizeof(extra_buf), "%s", extra_label ? extra_label : "");
+    float extra_w = 0.0f;
+    if (extra_buf[0]) {
+        nvgTextBounds(vg, 0, 0, extra_buf, NULL, sbounds);
+        extra_w = (sbounds[2] - sbounds[0]) + 10.0f;
+    }
+    float badge_w = badge_icon != 0 ? 16.0f : 0.0f;
+
     char title_buf[96];
     snprintf(title_buf, sizeof(title_buf), "%s", title ? title : "");
     nvgFontSize(vg, 13.0f);
-    cc_ellipsize(r, title_buf, sizeof(title_buf), w - 30.0f - status_w);
+    cc_ellipsize(r, title_buf, sizeof(title_buf),
+                w - 30.0f - status_w - extra_w - badge_w - trailing_reserve_w);
     nvgFillColor(vg, tc(t->surface_text));
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
     dc_shape_draw_text(r, x + 30.0f, y + h / 2.0f, title_buf, NULL);
 
+    float cursor = x + w - 4.0f - trailing_reserve_w;
     if (status_buf[0]) {
         nvgFontSize(vg, 12.0f);
         nvgFillColor(vg, tc(status_warn ? t->warning : (status_primary ? t->primary : t->surface_variant_text)));
         nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
-        nvgText(vg, x + w - 4.0f, y + h / 2.0f, status_buf, NULL);
+        nvgText(vg, cursor, y + h / 2.0f, status_buf, NULL);
+        cursor -= status_w;
     }
+    if (extra_buf[0]) {
+        nvgFontSize(vg, 11.0f);
+        nvgFillColor(vg, tc(t->surface_variant_text));
+        nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
+        nvgText(vg, cursor, y + h / 2.0f, extra_buf, NULL);
+        cursor -= extra_w;
+    }
+    if (badge_icon != 0)
+        dc_render_icon(r, badge_icon, cursor - 6.0f, y + h / 2.0f, 12.0f, t->surface_variant_text,
+                      NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
 }
 
 /* Inline Wi-Fi password entry (W1.1): a masked text field (dot per
@@ -1458,11 +1619,14 @@ static void draw_cc_hover(dc_control_center *cc, const cc_layout *l)
         return;
     }
 
-    if (cc->hover_id == CC_HOVER_BT_SCAN_BTN) {
+    if (cc->hover_id == CC_HOVER_BT_SCAN_BTN || cc->hover_id == CC_HOVER_BT_DISCOVERABLE_BTN) {
+        bool is_scan = cc->hover_id == CC_HOVER_BT_SCAN_BTN;
+        float bx0 = is_scan ? l->bt_scan_btn_x0 : l->bt_disc_btn_x0;
+        float bx1 = is_scan ? l->bt_scan_btn_x1 : l->bt_disc_btn_x1;
+        float by0 = is_scan ? l->bt_scan_btn_y0 : l->bt_disc_btn_y0;
+        float bh = is_scan ? l->bt_scan_btn_h : l->bt_disc_btn_h;
         nvgBeginPath(vg);
-        nvgRoundedRect(vg, l->bt_scan_btn_x0, l->bt_scan_btn_y0,
-                      l->bt_scan_btn_x1 - l->bt_scan_btn_x0, l->bt_scan_btn_h,
-                      l->bt_scan_btn_h / 2.0f);
+        nvgRoundedRect(vg, bx0, by0, bx1 - bx0, bh, bh / 2.0f);
         nvgFillColor(vg, col);
         nvgFill(vg);
         return;
@@ -1475,6 +1639,27 @@ static void draw_cc_hover(dc_control_center *cc, const cc_layout *l)
         nvgBeginPath(vg);
         nvgRoundedRect(vg, bx0, l->bt_agent_btn_y0, bx1 - bx0, l->bt_agent_btn_h,
                       l->bt_agent_btn_h / 2.0f);
+        nvgFillColor(vg, col);
+        nvgFill(vg);
+        return;
+    }
+
+    if (cc->hover_id >= CC_HOVER_BT_TRUST_BASE && cc->hover_id < CC_HOVER_NET_FORGET_BASE + CC_MAX_EXPAND_ROWS) {
+        int idx;
+        float cx;
+        if (cc->hover_id < CC_HOVER_BT_REMOVE_BASE) {
+            idx = cc->hover_id - CC_HOVER_BT_TRUST_BASE;
+            cx = l->bt_trust_cx;
+        } else if (cc->hover_id < CC_HOVER_NET_FORGET_BASE) {
+            idx = cc->hover_id - CC_HOVER_BT_REMOVE_BASE;
+            cx = l->bt_remove_cx;
+        } else {
+            idx = cc->hover_id - CC_HOVER_NET_FORGET_BASE;
+            cx = l->net_forget_cx;
+        }
+        float ry = cc_expand_row_y(l, idx);
+        nvgBeginPath(vg);
+        nvgCircle(vg, cx, ry + l->expand_row_h / 2.0f, l->bt_action_r);
         nvgFillColor(vg, col);
         nvgFill(vg);
     }
@@ -1527,8 +1712,11 @@ static void cc_render(dc_control_center *cc)
         (st.bt_pair_state == DC_BLUEZ_PAIR_SUCCESS || st.bt_pair_state == DC_BLUEZ_PAIR_FAILED))
         cc->bt_pairing_active = false;
 
+    bool net_row_saved[CC_MAX_EXPAND_ROWS], bt_row_paired[CC_MAX_EXPAND_ROWS];
+    cc_row_action_flags(&st, net_row_saved, bt_row_paired);
     cc_layout l = cc_get_layout((float)cc->logical_width, st.media_active, st.expand_kind,
-                                st.expand_rows, cc_find_pw_row(cc, &st), st.bt_agent_kind);
+                                st.expand_rows, cc_find_pw_row(cc, &st), st.bt_agent_kind,
+                                net_row_saved, bt_row_paired);
 
     int desired_h = (int)ceilf(l.total_h);
     if (desired_h != cc->logical_height && cc->layer_surface) {
@@ -1800,7 +1988,9 @@ static void cc_render(dc_control_center *cc)
                NULL);
 
         /* "Discover" toggle (W3.1): starts/stops Adapter1 discovery so
-         * unpaired nearby devices show up in the list below. */
+         * unpaired nearby devices show up in the list below. "Discoverable"
+         * (W1 polish): makes *this machine* visible to other devices'
+         * scans -- independent of whether dankc itself is scanning. */
         if (l.expand_kind == 2) {
             bool discovering = st.bt_discovering;
             nvgBeginPath(vg);
@@ -1814,6 +2004,20 @@ static void cc_render(dc_control_center *cc)
             nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
             nvgText(vg, (l.bt_scan_btn_x0 + l.bt_scan_btn_x1) / 2.0f,
                    l.bt_scan_btn_y0 + l.bt_scan_btn_h / 2.0f, discovering ? "Stop" : "Discover",
+                   NULL);
+
+            bool discoverable = st.bt_discoverable;
+            nvgBeginPath(vg);
+            nvgRoundedRect(vg, l.bt_disc_btn_x0, l.bt_disc_btn_y0,
+                          l.bt_disc_btn_x1 - l.bt_disc_btn_x0, l.bt_disc_btn_h,
+                          l.bt_disc_btn_h / 2.0f);
+            nvgFillColor(vg, discoverable ? tc(t->primary) : tc(t->surface_container_high));
+            nvgFill(vg);
+            nvgFontSize(vg, 10.0f);
+            nvgFillColor(vg, tc(discoverable ? t->primary_text : t->surface_text));
+            nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+            nvgText(vg, (l.bt_disc_btn_x0 + l.bt_disc_btn_x1) / 2.0f,
+                   l.bt_disc_btn_y0 + l.bt_disc_btn_h / 2.0f, discoverable ? "Visible" : "Hidden",
                    NULL);
         }
 
@@ -1829,6 +2033,7 @@ static void cc_render(dc_control_center *cc)
 
         for (int i = 0; i < st.expand_rows && i < CC_MAX_EXPAND_ROWS; i++) {
             float ry = cc_expand_row_y(&l, i);
+            float cy = ry + l.expand_row_h / 2.0f;
             if (l.expand_kind == 1) {
                 const dc_net_wifi_ap *ap = &st.net_aps[i];
                 bool pw_open = i == l.pw_after_row;
@@ -1845,7 +2050,7 @@ static void cc_render(dc_control_center *cc)
                     snprintf(status, sizeof(status), "Open \xc2\xb7 %d%%", ap->signal_percent);
                 draw_expand_row(cc->render, l.ix, ry, l.iw, l.expand_row_h,
                                 ap->secured ? DC_ICON_LOCK : DC_ICON_WIFI, ap->ssid, status,
-                                ap->in_use, false);
+                                ap->in_use, false, NULL, 0, 0.0f);
                 if (pw_open)
                     draw_net_pw_panel(cc->render, &l, cc->net_pw_buf, cc->net_pw_connecting,
                                       cc->net_pw_err);
@@ -1853,9 +2058,7 @@ static void cc_render(dc_control_center *cc)
                 const dc_bluez_device *d = &st.bt_devs[i];
                 bool this_job = st.bt_pair_state != DC_BLUEZ_PAIR_IDLE &&
                                 strcmp(st.bt_pair_mac, d->mac) == 0;
-                int icon = d->connected  ? DC_ICON_BLUETOOTH_CONNECTED
-                          : d->paired    ? DC_ICON_BLUETOOTH
-                                         : DC_ICON_ADD;
+                int icon = cc_bt_device_icon(d);
                 char status[24];
                 bool status_primary = false, status_warn = false;
                 if (this_job && st.bt_pair_state == DC_BLUEZ_PAIR_IN_PROGRESS)
@@ -1874,8 +2077,22 @@ static void cc_render(dc_control_center *cc)
                 } else {
                     snprintf(status, sizeof(status), "Tap to pair");
                 }
+                char batt[8] = "";
+                if (d->battery_percent >= 0)
+                    snprintf(batt, sizeof(batt), "%d%%", d->battery_percent);
                 draw_expand_row(cc->render, l.ix, ry, l.iw, l.expand_row_h, icon, d->name, status,
-                                status_primary, status_warn);
+                                status_primary, status_warn, batt[0] ? batt : NULL, 0,
+                                d->paired ? CC_ROW_BT_ACTIONS_RESERVE_W : 0.0f);
+                if (d->paired) {
+                    /* Trust toggle: same STAR glyph, primary-tinted when
+                     * trusted (matches draw_toggle_tile()'s "one glyph, two
+                     * colors" active/inactive convention). Remove/unpair. */
+                    dc_render_icon(cc->render, DC_ICON_STAR, l.bt_trust_cx, cy, 14.0f,
+                                  d->trusted ? t->primary : t->surface_variant_text,
+                                  NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+                    dc_render_icon(cc->render, DC_ICON_CLOSE, l.bt_remove_cx, cy, 13.0f,
+                                  t->surface_variant_text, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+                }
             }
         }
 
@@ -2075,8 +2292,11 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
 
     cc_state st;
     cc_gather_state(cc, &st);
+    bool net_row_saved[CC_MAX_EXPAND_ROWS], bt_row_paired[CC_MAX_EXPAND_ROWS];
+    cc_row_action_flags(&st, net_row_saved, bt_row_paired);
     cc_layout l = cc_get_layout((float)cc->logical_width, st.media_active, st.expand_kind,
-                                st.expand_rows, cc_find_pw_row(cc, &st), st.bt_agent_kind);
+                                st.expand_rows, cc_find_pw_row(cc, &st), st.bt_agent_kind,
+                                net_row_saved, bt_row_paired);
 
     /* Header action buttons: lock, power, settings, edit. */
     for (int i = 0; i < 4; i++) {
@@ -2172,6 +2392,15 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
         return;
     }
 
+    /* Adapter "Discoverable" toggle (W1 polish) -- makes this machine visible
+     * to other devices' scans, independent of dc_bluez_discovering() above. */
+    if (l.expand_kind == 2 && x >= (double)l.bt_disc_btn_x0 && x <= (double)l.bt_disc_btn_x1 &&
+       y >= (double)l.bt_disc_btn_y0 && y <= (double)(l.bt_disc_btn_y0 + l.bt_disc_btn_h)) {
+        dc_bluez_set_discoverable(!st.bt_discoverable);
+        cc_render(cc);
+        return;
+    }
+
     /* Media transport row (docs/13-POPOUTS-SPEC.md sec.1 item 4). */
     if (l.media_active) {
         for (int i = 0; i < 3; i++) {
@@ -2234,6 +2463,27 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
             float ry = cc_expand_row_y(&l, i);
             if (y < (double)ry || y > (double)(ry + l.expand_row_h))
                 continue;
+
+            /* Per-row action icons (W1/W2 polish) -- checked (by circular hit
+             * test, independent of the row's x-bound check below) before the
+             * connect/pair/forget-target dispatch further down, same priority
+             * order as cc_hittest(). */
+            float cy = ry + l.expand_row_h / 2.0f;
+            if (l.expand_kind == 2 && st.bt_devs[i].paired) {
+                double dx = x - (double)l.bt_trust_cx, dy = y - (double)cy;
+                if (dx * dx + dy * dy <= (double)(l.bt_action_r * l.bt_action_r)) {
+                    dc_bluez_set_trusted(st.bt_devs[i].mac, !st.bt_devs[i].trusted);
+                    cc_render(cc);
+                    return;
+                }
+                dx = x - (double)l.bt_remove_cx;
+                if (dx * dx + dy * dy <= (double)(l.bt_action_r * l.bt_action_r)) {
+                    dc_bluez_remove(st.bt_devs[i].mac);
+                    cc_render(cc);
+                    return;
+                }
+            }
+
             if (x < (double)l.ix || x > (double)(l.ix + l.iw))
                 continue;
 
@@ -2344,8 +2594,11 @@ void dc_control_center_handle_motion(dc_control_center *cc, double x, double y)
 
     cc_state st;
     cc_gather_state(cc, &st);
+    bool net_row_saved[CC_MAX_EXPAND_ROWS], bt_row_paired[CC_MAX_EXPAND_ROWS];
+    cc_row_action_flags(&st, net_row_saved, bt_row_paired);
     cc_layout l = cc_get_layout((float)cc->logical_width, st.media_active, st.expand_kind,
-                                st.expand_rows, cc_find_pw_row(cc, &st), st.bt_agent_kind);
+                                st.expand_rows, cc_find_pw_row(cc, &st), st.bt_agent_kind,
+                                net_row_saved, bt_row_paired);
 
     if (cc->slider_dragging) {
         float frac = cc_slider_frac_at(&l, cc->slider_drag_slot, x);
