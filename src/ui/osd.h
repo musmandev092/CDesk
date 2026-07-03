@@ -1,7 +1,7 @@
-/* osd.h — transient on-screen display (volume), bottom-center, auto-hides.
+/* osd.h — transient on-screen display (volume/brightness), bottom-center, auto-hides.
  *
- * A short-lived wlr-layer-shell overlay shown when the volume changes, matching
- * DMS's VolumeOSD. See docs/04-FEATURES §4.
+ * A short-lived wlr-layer-shell overlay shown when volume or brightness changes,
+ * matching DMS's VolumeOSD. See docs/04-FEATURES §4 and docs/POLISH.md P5.
  */
 #ifndef DC_UI_OSD_H
 #define DC_UI_OSD_H
@@ -24,5 +24,9 @@ void dc_osd_integrate(dc_osd *osd, struct dc_loop *loop);
 
 /* Show the volume OSD on `output` and (re)start the auto-hide timer. */
 void dc_osd_show_volume(dc_osd *osd, struct dc_output *output, int volume, bool muted);
+
+/* Show the brightness OSD on `output` with the given brightness percent (0-100)
+ * and (re)start the auto-hide timer. */
+void dc_osd_show_brightness(dc_osd *osd, struct dc_output *output, int brightness);
 
 #endif /* DC_UI_OSD_H */
