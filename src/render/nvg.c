@@ -1,6 +1,7 @@
 #include "render/nvg.h"
 
 #include "core/log.h"
+#include "render/icons.h"
 
 #include <fontconfig/fontconfig.h>
 #include <GLES3/gl3.h>
@@ -543,8 +544,37 @@ void dc_render_icon(dc_render *render, int codepoint, float x, float y, float si
     nvgFontFaceId(render->vg, render->font_icons);
     nvgFontSize(render->vg, size);
     nvgFillColor(render->vg, nvgRGBA(color.r, color.g, color.b, color.a));
-    nvgTextAlign(render->vg, align_nvg);
-    nvgText(render->vg, x, y, glyph, NULL);
+
+    float draw_x = x;
+    float draw_y = y;
+
+    if (align_nvg & NVG_ALIGN_MIDDLE) {
+        /* NVG_ALIGN_MIDDLE centers on the font's (ascender+descender)/2,
+         * which is a text-layout metric, not the glyph's actual ink. For
+         * the Material Symbols icon font that metrics box sits well above
+         * a glyph's visual center, so every circular icon button (media
+         * play/pause, etc.) rendered its glyph noticeably high. Measure
+         * this glyph's real bounding box instead and center that. */
+        int halign = align_nvg & (NVG_ALIGN_LEFT | NVG_ALIGN_CENTER | NVG_ALIGN_RIGHT);
+        if (!halign)
+            halign = NVG_ALIGN_LEFT;
+        nvgTextAlign(render->vg, NVG_ALIGN_LEFT | NVG_ALIGN_BASELINE);
+        float bounds[4];
+        nvgTextBounds(render->vg, 0.0f, 0.0f, glyph, NULL, bounds);
+        draw_y = y - (bounds[1] + bounds[3]) / 2.0f;
+        nvgTextAlign(render->vg, halign | NVG_ALIGN_BASELINE);
+    } else {
+        nvgTextAlign(render->vg, align_nvg);
+    }
+
+    /* A play-triangle's ink centroid sits left of its bounding-box center
+     * (it's wider on the left, where its two acute corners are). Bounding-
+     * box centering alone therefore reads as very slightly left-heavy;
+     * nudge +1px right to match the optically-balanced DMS convention. */
+    if (codepoint == DC_ICON_PLAY_ARROW)
+        draw_x += 1.0f;
+
+    nvgText(render->vg, draw_x, draw_y, glyph, NULL);
     nvgRestore(render->vg);
 }
 

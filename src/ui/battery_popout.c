@@ -125,12 +125,53 @@ typedef struct {
     float stat_x[2];
 
     float profiles_y, profiles_h;
-    float seg_x[3], seg_w, seg_gap;
+    float seg_x[3], seg_w[3], seg_gap; /* content-sized, not equal thirds -- see bp_get_layout() */
 
     float caption_y, caption_h; /* raw backend profile name, e.g. "throughput-performance" */
 } bp_layout;
 
-static bp_layout bp_get_layout(float w)
+/* Power-profile chip sizing (docs/13-POPOUTS-SPEC.md sec.2 fix: the old
+ * equal-thirds split gave each chip (iw - 2*gap)/3 == 97px with zero slack,
+ * so the active chip's check-mark + label overflowed its pill and clipped
+ * at the card edge). DMS sizes each chip to its own label instead of
+ * splitting the row evenly -- match that: measure each label once and give
+ * it just enough padding, so only the (wider) active chip grows. */
+#define DC_BP_SEG_FONT 13.0f
+#define DC_BP_SEG_PAD 10.0f
+#define DC_BP_SEG_MIN_W 66.0f
+#define DC_BP_SEG_ICON_W 14.0f
+#define DC_BP_SEG_ICON_GAP 5.0f
+
+/* power_mode_labels[] are fixed, compile-time-known English strings and the
+ * card is a fixed width, so their glyph widths never change at runtime --
+ * measure once (first bp_render(), the only call site with a live nvg
+ * frame) and cache. bp_get_layout() also runs from handle_click() for hit-
+ * testing, with no frame active, so it can only ever read this cache, never
+ * measure. */
+static float g_seg_label_w[3] = {-1.0f, -1.0f, -1.0f};
+
+static void bp_ensure_label_widths(dc_render *r)
+{
+    if (g_seg_label_w[0] >= 0.0f)
+        return;
+    NVGcontext *vg = r->vg;
+    nvgSave(vg);
+    nvgFontFaceId(vg, r->font_ui);
+    nvgFontSize(vg, DC_BP_SEG_FONT);
+    for (int i = 0; i < 3; i++) {
+        float bounds[4];
+        nvgTextBounds(vg, 0.0f, 0.0f, power_mode_labels[i], NULL, bounds);
+        g_seg_label_w[i] = bounds[2] - bounds[0];
+    }
+    nvgRestore(vg);
+}
+
+/* `icon_mode` is the index (0-2) of the segment that will draw the
+ * check-mark this frame (docs/13-POPOUTS-SPEC.md sec.2's "active, enabled"
+ * segment), or -1 when none will (daemon unavailable). Only that segment's
+ * width reserves room for the icon, matching draw_profile_segment()'s own
+ * `active && !dimmed` gate for actually drawing it. */
+static bp_layout bp_get_layout(float w, int icon_mode)
 {
     const float pad = 6.0f;    /* room for the drop shadow */
     const float margin = 20.0f; /* content inset from the card edge */
@@ -158,11 +199,32 @@ static bp_layout bp_get_layout(float w)
     l.stat_x[1] = l.ix + l.stat_w + l.stat_gap;
 
     l.profiles_y = l.stats_y + l.stat_h + gap;
-    l.profiles_h = 48.0f;
-    l.seg_gap = 8.0f;
-    l.seg_w = (l.iw - 2.0f * l.seg_gap) / 3.0f;
-    for (int i = 0; i < 3; i++)
-        l.seg_x[i] = l.ix + (float)i * (l.seg_w + l.seg_gap);
+    l.profiles_h = 40.0f;
+    l.seg_gap = 6.0f;
+
+    float chip_w[3];
+    float total = 2.0f * l.seg_gap;
+    for (int i = 0; i < 3; i++) {
+        float lw = g_seg_label_w[i] >= 0.0f ? g_seg_label_w[i] : 60.0f; /* pre-cache fallback */
+        float content = lw + (i == icon_mode ? DC_BP_SEG_ICON_W + DC_BP_SEG_ICON_GAP : 0.0f);
+        chip_w[i] = content + 2.0f * DC_BP_SEG_PAD;
+        if (chip_w[i] < DC_BP_SEG_MIN_W)
+            chip_w[i] = DC_BP_SEG_MIN_W;
+        total += chip_w[i];
+    }
+
+    /* Centered as a group, like DMS's Row; clamp to the card's left inset
+     * in the (should-never-happen, but the 3 labels are fixed English
+     * strings so it's cheap insurance) case the row doesn't fit at all. */
+    float start_x = l.ix + (l.iw - total) / 2.0f;
+    if (start_x < l.ix)
+        start_x = l.ix;
+    float x = start_x;
+    for (int i = 0; i < 3; i++) {
+        l.seg_x[i] = x;
+        l.seg_w[i] = chip_w[i];
+        x += chip_w[i] + l.seg_gap;
+    }
 
     l.caption_y = l.profiles_y + l.profiles_h + 8.0f;
     l.caption_h = 18.0f;
@@ -175,13 +237,38 @@ static bp_layout bp_get_layout(float w)
  * duplication is cheaper than widening battery.h's touch-scope for this). */
 static int bp_battery_icon(bool charging, bool full, int percent)
 {
-    if (charging || full)
+    if (full)
         return DC_ICON_BATTERY_CHARGING_FULL;
-    if (percent <= 10)
-        return DC_ICON_BATTERY_ALERT;
-    if (percent <= 25)
-        return DC_ICON_BATTERY_0_BAR;
-    return DC_ICON_BATTERY_FULL;
+    if (charging) {
+        if (percent >= 90)
+            return DC_ICON_BATTERY_CHARGING_FULL;
+        if (percent >= 80)
+            return DC_ICON_BATTERY_CHARGING_90;
+        if (percent >= 60)
+            return DC_ICON_BATTERY_CHARGING_80;
+        if (percent >= 50)
+            return DC_ICON_BATTERY_CHARGING_60;
+        if (percent >= 30)
+            return DC_ICON_BATTERY_CHARGING_50;
+        if (percent >= 20)
+            return DC_ICON_BATTERY_CHARGING_30;
+        return DC_ICON_BATTERY_CHARGING_20;
+    }
+    if (percent >= 95)
+        return DC_ICON_BATTERY_FULL;
+    if (percent >= 85)
+        return DC_ICON_BATTERY_6_BAR;
+    if (percent >= 70)
+        return DC_ICON_BATTERY_5_BAR;
+    if (percent >= 55)
+        return DC_ICON_BATTERY_4_BAR;
+    if (percent >= 40)
+        return DC_ICON_BATTERY_3_BAR;
+    if (percent >= 25)
+        return DC_ICON_BATTERY_2_BAR;
+    if (percent >= 10)
+        return DC_ICON_BATTERY_1_BAR;
+    return DC_ICON_BATTERY_ALERT;
 }
 
 /* Health card value color, tiered by degradation (docs/13-POPOUTS-SPEC.md
@@ -200,6 +287,18 @@ static dc_color bp_health_color(const dc_theme *t, int health_percent)
         return coral;
     }
     return t->error;
+}
+
+/* The segment index that gets the check-mark this frame, or -1 when none
+ * does -- shared by bp_render() (draw) and handle_click() (hit-test) so the
+ * layout they each compute from it always agrees with what's on screen. */
+static int bp_icon_mode(bool pw_avail, const dc_power_info *pw)
+{
+    if (!pw_avail)
+        return -1;
+    if (pw->active_mode == DC_POWER_MODE_PERFORMANCE && !pw->has_performance_mode)
+        return -1;
+    return (int)pw->active_mode;
 }
 
 static void recompute_physical(dc_battery_popout *bp)
@@ -251,20 +350,22 @@ static void draw_profile_segment(dc_render *r, float x, float y, float w, float 
     dc_color text_fg = (active && !dimmed) ? t->primary_text : t->surface_text;
 
     nvgFontFaceId(vg, r->font_ui);
-    nvgFontSize(vg, 13.0f);
+    nvgFontSize(vg, DC_BP_SEG_FONT);
     if (active && !dimmed) {
-        /* Check icon + label, centered as a group (CompoundPill-ish). */
+        /* Check icon + label, centered as a group (CompoundPill-ish). Icon
+         * size/gap must match bp_get_layout()'s reservation exactly, or the
+         * chip is sized for one width and drawn at another. */
         float bounds[4];
         nvgTextBounds(vg, 0.0f, 0.0f, label, NULL, bounds);
         float text_w = bounds[2] - bounds[0];
-        float icon_w = 16.0f;
-        float total = icon_w + 4.0f + text_w;
+        float icon_w = DC_BP_SEG_ICON_W;
+        float total = icon_w + DC_BP_SEG_ICON_GAP + text_w;
         float start_x = cx - total / 2.0f;
         dc_render_icon(r, DC_ICON_DONE, start_x, cy, icon_w, text_fg,
                        NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(text_fg));
-        nvgText(vg, start_x + icon_w + 4.0f, cy, label, NULL);
+        nvgText(vg, start_x + icon_w + DC_BP_SEG_ICON_GAP, cy, label, NULL);
     } else {
         nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc_alpha(text_fg, text_alpha));
@@ -341,7 +442,10 @@ static void bp_render(dc_battery_popout *bp)
     nvgStrokeWidth(vg, 1.0f);
     nvgStroke(vg);
 
-    bp_layout l = bp_get_layout(w);
+    bp_ensure_label_widths(bp->render);
+    dc_power_info pw = {0};
+    bool pw_avail = dc_power_read(&pw);
+    bp_layout l = bp_get_layout(w, bp_icon_mode(pw_avail, &pw));
 
     dc_battery_info bat;
     bool have = dc_battery_read(&bat) && bat.present;
@@ -391,12 +495,10 @@ static void bp_render(dc_battery_popout *bp)
                   t->surface_text);
 
     /* --- Power profile segmented control --------------------------------- */
-    dc_power_info pw = {0};
-    bool pw_avail = dc_power_read(&pw);
     for (int i = 0; i < 3; i++) {
         bool seg_dimmed =
             !pw_avail || (i == DC_POWER_MODE_PERFORMANCE && !pw.has_performance_mode);
-        draw_profile_segment(bp->render, l.seg_x[i], l.profiles_y, l.seg_w, l.profiles_h,
+        draw_profile_segment(bp->render, l.seg_x[i], l.profiles_y, l.seg_w[i], l.profiles_h,
                              power_mode_labels[i], pw.active_mode == i, seg_dimmed);
     }
 
@@ -585,7 +687,9 @@ void dc_battery_popout_handle_click(dc_battery_popout *bp, double x, double y)
     if (!bp->visible || bp->closing)
         return;
 
-    bp_layout l = bp_get_layout((float)bp->logical_width);
+    dc_power_info pw = {0};
+    bool pw_avail = dc_power_read(&pw);
+    bp_layout l = bp_get_layout((float)bp->logical_width, bp_icon_mode(pw_avail, &pw));
 
     /* Close button. */
     double dx = x - (double)l.close_cx;
@@ -597,15 +701,14 @@ void dc_battery_popout_handle_click(dc_battery_popout *bp, double x, double y)
 
     /* Power profile segments. */
     if (y >= (double)l.profiles_y && y <= (double)(l.profiles_y + l.profiles_h)) {
-        dc_power_info pw = {0};
-        if (!dc_power_read(&pw)) {
+        if (!pw_avail) {
             /* No backend (power-profiles-daemon, tuned D-Bus, or tuned-adm)
              * found -- row stays dimmed and non-interactive. */
             dc_debug("battery popout: power profiles unavailable");
             return;
         }
         for (int i = 0; i < 3; i++) {
-            if (x < (double)l.seg_x[i] || x > (double)(l.seg_x[i] + l.seg_w))
+            if (x < (double)l.seg_x[i] || x > (double)(l.seg_x[i] + l.seg_w[i]))
                 continue;
             if (i == DC_POWER_MODE_PERFORMANCE && !pw.has_performance_mode)
                 return; /* dimmed segment, not selectable */
