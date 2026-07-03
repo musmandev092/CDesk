@@ -144,4 +144,9 @@
 #define DC_ICON_LOGOUT 0xe9ba
 #define DC_ICON_RESTART_ALT 0xf053
 
+/* Launcher polish (docs/POLISH.md P4): the calculator row and the "this app
+ * has extra actions" affordance. Values from DMS's own MaterialSymbolsRounded
+ * .codepoints file, same convention as the rest of this header. */
+#define DC_ICON_CALCULATE 0xea5f
+
 #endif /* DC_RENDER_ICONS_H */
