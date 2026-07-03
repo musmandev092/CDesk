@@ -14,18 +14,33 @@ A lightweight desktop shell for the **niri** Wayland compositor, written in C �
 DankMaterialShell's core (QML/Quickshell + Go) as one native binary. Full spec in `docs/` (00–11).
 niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
 
-## Current status — STRUCTURE COMPLETE + PERF PHASE 1 DONE ✅ (2026-07-03)
-Everything in docs/14 (structure) plus the docs/15-PERF-PLAN.md Wave 1 optimizations are done.
-Perf results (measured, idle bar, 2 outputs): font files now mmap'd read-only (T1.1) — dankc's
-Private memory ~40MB→~20MB (the real win, biggest single lever); installed binary stripped
-3.8M→911K (T1.3); wpctl volume poll cache 3s→10s = ~70% fewer audio forks (T2.3); Wi-Fi status
-now NetworkManager D-Bus event-driven = 0 background nmcli forks (T2.2). DISCARDED malloc-arena
-tune (only -12KB) as a no-op. Deep-dive (docs/15 addendum) VERDICT: dankc's true incremental cost
-is ~20MB Private / ~40-54MB Pss; the ~161-173MB RSS is ~87% SHARED Mesa/libLLVM pages niri holds
-resident regardless of dankc — NOT reclaimable from the app (Vulkan-rewrite/EGL-device-tricks/
-malloc-swap all tested and rejected: 0 or negative gain). Memory is at the practical floor for a
-Mesa-GLES nanovg client. vs DMS qs ~590MB Pss = ~11x lighter. Deferred by design: T29 plugins.
-Next perf frontier if pursued: idle CPU/wakeups (already ~0.1-0.3%) and startup time, NOT RAM.
+## Current status — STRUCTURE + PERFORMANCE + FONT/POLISH COMPLETE ✅ (2026-07-03, main @ HEAD)
+All of docs/14 (structure), docs/15 (memory perf), docs/16 (runtime perf), plus font/i18n +
+UI polish are done. Both `make`, `make release`, and `meson` build zero-warning; repo clean.
+
+PERFORMANCE (measured, idle 2-output):
+- Memory: font files mmap'd → Private ~40MB→~18MB (halved). Deep-dive verdict: RSS ~152MB is
+  ~87% SHARED Mesa/libLLVM niri holds regardless — Pss ~48MB is the real number, at the floor.
+- **Async wpctl audio**: eliminated a 35-40ms event-loop freeze that hit every ~10s (biggest
+  responsiveness win). NM D-Bus wifi + wider audio cache = ~90% fewer background forks.
+- **LTO + release flags**: dev binary 4.3MB → release 980KB stripped.
+- **Startup**: autostart deferred past first bar paint → warm 100ms→78ms. (EGL-threading tried,
+  dropped — within noise. -O3/LTO measured no startup effect. Idle CPU ~0.15%, frame pacing,
+  damage tracking, input latency all measured already-optimal — no work needed.)
+FONTS / i18n:
+- Comprehensive system fontconfig (packaging/fontconfig/49-dankc-fonts.conf, 24 scripts→Noto,
+  Urdu→Noto Arabic, CJK/Indic/Thai/Hebrew/emoji) + font deps (noto-fonts, noto-fonts-cjk,
+  ttf-dejavu; noto-fonts-emoji optdep). Bundled: Inter + Material Symbols subset + mono NotoEmoji.
+- Lazy load-on-first-use for CJK/Devanagari/Thai/Tamil/emoji (Urdu/Latin eager) → ~19ms warm.
+- **Mixed-script fix**: shape.c now itemizes each bidi run by per-codepoint font coverage
+  (was: one font per run → non-Arabic scripts blanked). Added missing Tamil fallback.
+POLISH:
+- Icon centering: added nvgTextInkBounds() (nanovg's nvgTextBounds discarded true ink-y for
+  line metrics) — icons now center on real ink; play triangle measured dead-center (0.00px).
+- **Default Apps**: 19-category manager (real .desktop MimeType=/Categories= parsing +
+  xdg-mime/xdg-settings writes, empty-state handling). apps.c dc_apps_find_by_mime/by_category.
+Deferred by design: T29 plugins. NOT-yet-done: alignment sweep only covered bar/dashboard/CC
+(clean); battery-popout/launcher/notif/clipboard/settings/powermenu/dock/keybinds not re-swept.
 ## Previous status — bar parity DONE ✅ (S1–S6, 2026-07-02); panels parity next
 Bar now pixel-matches the user's live DMS bottom bar (docs/12-BAR-SPEC.md, commits
 07831c7..c412bb6): floating rounded 40px container + elevation shadow + bottom position,
