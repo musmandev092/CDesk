@@ -207,4 +207,17 @@
 #define DC_ICON_UPDATE 0xe923        /* System Updater tab */
 #define DC_ICON_PRINT 0xe8ad         /* Printer tab */
 
+/* Control Center Bluetooth device-type icons (docs/18-WIFI-BT-PLAN.md W1):
+ * mapped from org.bluez.Device1.Icon strings (audio-headphones/headset,
+ * input-mouse, input-keyboard, phone), plus a trust indicator reused for both
+ * the trusted/untrusted state (same "one glyph, two colors" convention as
+ * draw_toggle_tile()'s active/inactive tiles). Values confirmed present (by
+ * glyph name, via fontTools) in the vendored assets/fonts/MaterialSymbolsRounded.ttf,
+ * same verification method as the rest of this header. */
+#define DC_ICON_HEADPHONES 0xe310
+#define DC_ICON_MOUSE 0xe323
+#define DC_ICON_KEYBOARD 0xe312
+#define DC_ICON_SMARTPHONE 0xe32c
+#define DC_ICON_STAR 0xe838
+
 #endif /* DC_RENDER_ICONS_H */
