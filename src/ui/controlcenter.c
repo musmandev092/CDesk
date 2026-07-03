@@ -31,6 +31,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <xkbcommon/xkbcommon-keysyms.h>
 
 #include "fractional-scale-v1-client-protocol.h"
 #include "nanovg.h"
@@ -50,6 +51,11 @@
 /* Inset from the screen's right edge when bar-adjacent (docs/13-POPOUTS-SPEC.md
  * sec.0/1: opens near the bar's right cluster, a few px in from the edge). */
 #define DC_CC_SIDE_MARGIN 12
+
+/* Max visible rows in the network/bluetooth expand panel -- defined ahead of
+ * cc_hover_id below so the enum can size CC_HOVER_EXPAND_ROW_BASE's reserved
+ * block of ids from it. */
+#define CC_MAX_EXPAND_ROWS 5
 
 /* Hover/hit ids for the tiles/buttons/sliders (docs/13-POPOUTS-SPEC.md sec.1:
  * hover bg on tiles + header action buttons, matching bar.c's per-widget hit
@@ -83,9 +89,30 @@ typedef enum {
      * plus cc->net_expanded/bt_expanded disambiguates which list a row hit
      * belongs to). */
     CC_HOVER_EXPAND_ROW_BASE,
+    /* Inline Wi-Fi password entry (W1.1), reserved right after the expand
+     * rows' block so the two never collide. */
+    CC_HOVER_NET_PW_FIELD = CC_HOVER_EXPAND_ROW_BASE + CC_MAX_EXPAND_ROWS,
+    CC_HOVER_NET_PW_CANCEL,
+    CC_HOVER_NET_PW_CONNECT,
 } cc_hover_id;
 
-#define CC_MAX_EXPAND_ROWS 5
+/* Max length of the inline Wi-Fi password buffer (nmcli/WPA itself caps PSKs
+ * at 63 chars; this leaves generous headroom for enterprise-style passwords
+ * too). */
+#define CC_NET_PW_MAX 128
+
+/* Inline Wi-Fi password entry geometry (W1.1) -- a masked text field, a
+ * one-line status slot (blank / "Connecting..." / an inline error), and a
+ * Cancel/Connect button row, inserted directly below the SSID row it
+ * belongs to (see cc_get_layout()'s pw_after_row handling and
+ * cc_expand_row_y()). */
+#define CC_NET_PW_GAP 8.0f
+#define CC_NET_PW_FIELD_H 32.0f
+#define CC_NET_PW_STATUS_H 16.0f
+#define CC_NET_PW_BTN_H 28.0f
+#define CC_NET_PW_PANEL_H                                                                       \
+    (CC_NET_PW_GAP + CC_NET_PW_FIELD_H + CC_NET_PW_GAP + CC_NET_PW_STATUS_H + CC_NET_PW_BTN_H + \
+     CC_NET_PW_GAP)
 
 struct dc_control_center {
     dc_wayland *wl;
@@ -138,11 +165,21 @@ struct dc_control_center {
     bool net_expanded;
     bool bt_expanded;
 
-    /* A secured, not-yet-known SSID was clicked: no inline password entry
-     * (TODO), so that row shows a "Needs Password" hint instead of
-     * connecting until the panel is collapsed or another row is picked. */
-    bool net_hint_active;
-    char net_hint_ssid[64];
+    /* Inline Wi-Fi password entry (W1.1): clicking a secured, not-yet-known
+     * SSID opens a masked password field + Connect/Cancel row directly below
+     * that SSID (see cc_find_pw_row()/CC_NET_PW_* layout) instead of the old
+     * dead-end "Needs Password" hint. `net_pw_connecting` is set for the
+     * duration of an in-flight dc_net_wifi_connect_psk() job -- while true,
+     * cc_render() keeps requesting frame callbacks purely to keep polling
+     * dc_net_wifi_connect_poll() until it resolves (see the `frame_cb`
+     * request at the end of cc_render()). `net_pw_err`, once non-empty,
+     * shows an inline "wrong password"-style message until the user edits
+     * the field again or cancels. */
+    bool net_pw_active;
+    bool net_pw_connecting;
+    char net_pw_ssid[64];
+    char net_pw_buf[CC_NET_PW_MAX];
+    char net_pw_err[96];
 
     bool visible;
     bool configured;
@@ -163,7 +200,7 @@ static void cc_frame_done(void *data, struct wl_callback *cb, uint32_t time)
     cc->frame_cb = NULL;
     if (!cc->visible)
         return;
-    if (dc_anim_active(&cc->anim))
+    if (dc_anim_active(&cc->anim) || cc->net_pw_connecting)
         cc_render(cc);
     else if (cc->closing)
         cc_teardown(cc);
@@ -217,6 +254,17 @@ typedef struct {
     float bt_chevron_cx, bt_chevron_cy;
     float chevron_r;
 
+    /* Inline Wi-Fi password entry (W1.1): -1 when not shown, else the
+     * 0-based expand-row index it's inserted directly below. Rows after it
+     * are pushed down by `pw_panel_h` -- see cc_expand_row_y(). */
+    int pw_after_row;
+    float pw_panel_h;
+    float pw_field_y, pw_field_h;
+    float pw_status_y;
+    float pw_btn_y0, pw_btn_h;
+    float pw_cancel_x0, pw_cancel_x1;
+    float pw_connect_x0, pw_connect_x1;
+
     /* Total content height (pad-to-pad, i.e. the card's own height) --
      * cc_render() resizes the layer-surface to this when it changes. */
     float total_h;
@@ -226,8 +274,11 @@ typedef struct {
  * `expand_kind`/`expand_rows`: 0/1/2 = none/network/bluetooth and how many
  * rows that panel is currently showing (0..CC_MAX_EXPAND_ROWS) -- both
  * gathered once per render/click/motion by cc_gather_state() so every
- * layout consumer agrees on the card's current size. */
-static cc_layout cc_get_layout(float w, bool media_active, int expand_kind, int expand_rows)
+ * layout consumer agrees on the card's current size. `pw_after_row`: -1, or
+ * the 0-based network-row index the inline password panel (W1.1) is
+ * currently open under (only meaningful when expand_kind == 1). */
+static cc_layout cc_get_layout(float w, bool media_active, int expand_kind, int expand_rows,
+                               int pw_after_row)
 {
     const float pad = 6.0f;   /* room for the drop shadow */
     const float margin = 16.0f; /* content inset from the card edge (~Theme.spacingL) */
@@ -298,6 +349,7 @@ static cc_layout cc_get_layout(float w, bool media_active, int expand_kind, int 
 
     l.expand_kind = expand_kind;
     l.expand_rows = expand_rows;
+    l.pw_after_row = -1;
     if (expand_kind != 0) {
         int rows = expand_rows > 0 ? expand_rows : 1; /* room for an empty-state line */
         if (rows > CC_MAX_EXPAND_ROWS)
@@ -306,7 +358,24 @@ static cc_layout cc_get_layout(float w, bool media_active, int expand_kind, int 
         l.expand_header_y = l.expand_y0 + 10.0f;
         l.expand_row_h = 28.0f;
         l.expand_row_y0 = l.expand_y0 + 22.0f;
-        l.expand_h = 22.0f + (float)rows * l.expand_row_h + 6.0f;
+
+        if (expand_kind == 1 && pw_after_row >= 0 && pw_after_row < rows) {
+            l.pw_after_row = pw_after_row;
+            l.pw_panel_h = CC_NET_PW_PANEL_H;
+            float pw_top = l.expand_row_y0 + (float)(pw_after_row + 1) * l.expand_row_h;
+            l.pw_field_y = pw_top + CC_NET_PW_GAP;
+            l.pw_field_h = CC_NET_PW_FIELD_H;
+            l.pw_status_y =
+                l.pw_field_y + l.pw_field_h + CC_NET_PW_GAP * 0.5f + CC_NET_PW_STATUS_H * 0.5f;
+            l.pw_btn_y0 = l.pw_field_y + l.pw_field_h + CC_NET_PW_GAP * 0.5f + CC_NET_PW_STATUS_H;
+            l.pw_btn_h = CC_NET_PW_BTN_H;
+            l.pw_connect_x1 = l.ix + l.iw;
+            l.pw_connect_x0 = l.pw_connect_x1 - 84.0f;
+            l.pw_cancel_x1 = l.pw_connect_x0 - 8.0f;
+            l.pw_cancel_x0 = l.pw_cancel_x1 - 72.0f;
+        }
+
+        l.expand_h = 22.0f + (float)rows * l.expand_row_h + l.pw_panel_h + 6.0f;
         l.total_h = l.expand_y0 + l.expand_h + margin + pad;
     } else {
         l.total_h = tiles_end + margin + pad;
@@ -327,10 +396,14 @@ static float cc_tile_y(const cc_layout *l, int row)
 
 /* Top y of expand-panel row `i` (0-based, within whichever of net/bt is
  * currently open) -- shared by draw + hittest + click, same convention as
- * cc_tile_x()/cc_tile_y(). */
+ * cc_tile_x()/cc_tile_y(). Rows below an open inline password panel (W1.1)
+ * are pushed down by its height. */
 static float cc_expand_row_y(const cc_layout *l, int i)
 {
-    return l->expand_row_y0 + (float)i * l->expand_row_h;
+    float y = l->expand_row_y0 + (float)i * l->expand_row_h;
+    if (l->pw_after_row >= 0 && i > l->pw_after_row)
+        y += l->pw_panel_h;
+    return y;
 }
 
 /* Reserved on the trailing edge of every slider track for its live "NN%"
@@ -424,6 +497,21 @@ static cc_hover_id cc_hittest(const cc_layout *l, double x, double y)
             if (x < (double)l->ix || x > (double)(l->ix + l->iw))
                 continue;
             return (cc_hover_id)(CC_HOVER_EXPAND_ROW_BASE + i);
+        }
+    }
+
+    /* Inline Wi-Fi password entry (W1.1): field + Cancel/Connect buttons,
+     * checked after the row loop above since the panel sits in the gap
+     * between two (possibly shifted) rows, not over any row's own rect. */
+    if (l->pw_after_row >= 0) {
+        if (x >= (double)l->ix && x <= (double)(l->ix + l->iw) && y >= (double)l->pw_field_y &&
+            y <= (double)(l->pw_field_y + l->pw_field_h))
+            return CC_HOVER_NET_PW_FIELD;
+        if (y >= (double)l->pw_btn_y0 && y <= (double)(l->pw_btn_y0 + l->pw_btn_h)) {
+            if (x >= (double)l->pw_cancel_x0 && x <= (double)l->pw_cancel_x1)
+                return CC_HOVER_NET_PW_CANCEL;
+            if (x >= (double)l->pw_connect_x0 && x <= (double)l->pw_connect_x1)
+                return CC_HOVER_NET_PW_CONNECT;
         }
     }
 
@@ -734,6 +822,40 @@ static void cc_gather_state(dc_control_center *cc, cc_state *st)
     }
 }
 
+/* Close the inline Wi-Fi password panel (W1.1), aborting any in-flight
+ * connect job -- shared by every place that dismisses it (collapsing the
+ * network section, switching to bluetooth, the Cancel button, Escape,
+ * teardown). */
+static void cc_close_net_pw(dc_control_center *cc)
+{
+    if (cc->net_pw_connecting)
+        dc_net_wifi_connect_reset();
+    cc->net_pw_active = false;
+    cc->net_pw_connecting = false;
+    cc->net_pw_buf[0] = '\0';
+    cc->net_pw_err[0] = '\0';
+}
+
+/* 0-based row index of `cc->net_pw_ssid` within `st->net_aps`, or -1 if the
+ * inline password panel isn't open or its SSID has scrolled out of the
+ * latest scan (a fresh nmcli scan can legitimately drop a weak/out-of-range
+ * AP -- the panel simply won't have anywhere to attach until it reappears,
+ * same tolerance the old "Needs Password" hint had for a stale SSID). Shared
+ * by cc_render()/handle_click()/handle_motion() so all three agree on where
+ * (or whether) the panel is drawn this frame -- same "one function drives
+ * measure+draw" discipline as cc_hittest(). */
+static int cc_find_pw_row(const dc_control_center *cc, const cc_state *st)
+{
+    if (!cc->net_pw_active || st->expand_kind != 1)
+        return -1;
+    int rows = st->expand_rows < CC_MAX_EXPAND_ROWS ? st->expand_rows : CC_MAX_EXPAND_ROWS;
+    for (int i = 0; i < rows; i++) {
+        if (strcmp(st->net_aps[i].ssid, cc->net_pw_ssid) == 0)
+            return i;
+    }
+    return -1;
+}
+
 /* CompoundPill-style tile (Widgets/CompoundPill.qml): pill background stays
  * constant, only the icon chip fills solid-primary when active; two stacked
  * text lines (title/subtitle) to the right. Used for wifi/bluetooth/
@@ -891,6 +1013,92 @@ static void draw_expand_row(dc_render *r, float x, float y, float w, float h, in
     }
 }
 
+/* Inline Wi-Fi password entry (W1.1): a masked text field (dot per
+ * character, matching DMS's WifiPasswordModal.qml `echoMode:
+ * TextInput.Password`) + a status slot (blank / "Connecting..." / an inline
+ * error) + Cancel/Connect buttons, drawn directly below the SSID row it
+ * belongs to (see cc_get_layout()'s pw_after_row geometry). Layout (box
+ * positions/sizes) is entirely owned by cc_get_layout()/cc_hittest() so this
+ * function only ever reads `l`, never computes its own coordinates -- same
+ * discipline as every other draw_*() helper in this file. */
+static void draw_net_pw_panel(dc_render *r, const cc_layout *l, const char *pw_buf,
+                              bool connecting, const char *err_msg)
+{
+    NVGcontext *vg = r->vg;
+    const dc_theme *t = dc_theme_current;
+
+    /* Password field: dot-masked, matches ui_textfield()'s box style
+     * (settings.c) -- rounded rect + a 2px primary border since this is the
+     * only text field the control center ever shows (no separate "focused"
+     * state needed). */
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, l->ix, l->pw_field_y, l->iw, l->pw_field_h, 8.0f);
+    nvgFillColor(vg, tc(t->surface_container_highest));
+    nvgFill(vg);
+    nvgStrokeWidth(vg, 2.0f);
+    nvgStrokeColor(vg, tc(t->primary));
+    nvgStroke(vg);
+
+    nvgFontFaceId(vg, r->font_ui);
+    nvgFontSize(vg, 13.0f);
+    nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+    size_t pw_len = pw_buf ? strlen(pw_buf) : 0;
+    if (pw_len == 0) {
+        nvgFillColor(vg, tc_alpha(t->surface_variant_text, 170));
+        nvgText(vg, l->ix + 10.0f, l->pw_field_y + l->pw_field_h / 2.0f, "Password", NULL);
+    } else {
+        /* Each bullet is the 3-byte UTF-8 sequence for U+2022, one per
+         * password character (capped so the buffer can't overflow even at
+         * CC_NET_PW_MAX length). */
+        char masked[3 * 64 + 1];
+        size_t shown = pw_len < 64 ? pw_len : 64;
+        for (size_t i = 0; i < shown; i++)
+            memcpy(masked + i * 3, "\xe2\x80\xa2", 3);
+        masked[shown * 3] = '\0';
+        nvgFillColor(vg, tc(t->surface_text));
+        nvgText(vg, l->ix + 10.0f, l->pw_field_y + l->pw_field_h / 2.0f, masked, NULL);
+    }
+
+    /* Status slot: blank, "Connecting...", or the last inline error. */
+    if (connecting) {
+        nvgFontSize(vg, 12.0f);
+        nvgFillColor(vg, tc(t->surface_variant_text));
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        nvgText(vg, l->ix, l->pw_status_y, "Connecting\xe2\x80\xa6", NULL);
+    } else if (err_msg && err_msg[0]) {
+        nvgFontSize(vg, 12.0f);
+        nvgFillColor(vg, tc(t->warning));
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        char buf[96];
+        snprintf(buf, sizeof(buf), "%s", err_msg);
+        nvgText(vg, l->ix, l->pw_status_y, buf, NULL);
+    }
+
+    /* Cancel button (outline). */
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, l->pw_cancel_x0, l->pw_btn_y0, l->pw_cancel_x1 - l->pw_cancel_x0,
+                  l->pw_btn_h, l->pw_btn_h / 2.0f);
+    nvgFillColor(vg, tc(t->surface_container_high));
+    nvgFill(vg);
+    nvgFontSize(vg, 12.0f);
+    nvgFillColor(vg, tc(t->surface_text));
+    nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+    nvgText(vg, (l->pw_cancel_x0 + l->pw_cancel_x1) / 2.0f, l->pw_btn_y0 + l->pw_btn_h / 2.0f,
+           "Cancel", NULL);
+
+    /* Connect button (filled primary; dimmed while connecting/empty -- pure
+     * visual feedback, the click handler already ignores both cases). */
+    bool disabled = connecting || pw_len == 0;
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, l->pw_connect_x0, l->pw_btn_y0, l->pw_connect_x1 - l->pw_connect_x0,
+                  l->pw_btn_h, l->pw_btn_h / 2.0f);
+    nvgFillColor(vg, disabled ? tc_alpha(t->primary, 130) : tc(t->primary));
+    nvgFill(vg);
+    nvgFillColor(vg, tc(t->primary_text));
+    nvgText(vg, (l->pw_connect_x0 + l->pw_connect_x1) / 2.0f, l->pw_btn_y0 + l->pw_btn_h / 2.0f,
+           connecting ? "Connecting\xe2\x80\xa6" : "Connect", NULL);
+}
+
 /* Media transport row (docs/13-POPOUTS-SPEC.md sec.1 item 4): art-circle
  * placeholder + title/artist + prev/play-pause/next, shown only while an
  * MPRIS player is active. Mirrors the bar's media widget colors (title
@@ -1011,11 +1219,22 @@ static void draw_cc_hover(dc_control_center *cc, const cc_layout *l)
         return;
     }
 
-    if (cc->hover_id >= CC_HOVER_EXPAND_ROW_BASE) {
+    if (cc->hover_id >= CC_HOVER_EXPAND_ROW_BASE && cc->hover_id < CC_HOVER_NET_PW_FIELD) {
         int i = cc->hover_id - CC_HOVER_EXPAND_ROW_BASE;
         float ry = cc_expand_row_y(l, i);
         nvgBeginPath(vg);
         nvgRoundedRect(vg, l->ix, ry, l->iw, l->expand_row_h, 8.0f);
+        nvgFillColor(vg, col);
+        nvgFill(vg);
+        return;
+    }
+
+    if (cc->hover_id == CC_HOVER_NET_PW_CANCEL || cc->hover_id == CC_HOVER_NET_PW_CONNECT) {
+        bool is_cancel = cc->hover_id == CC_HOVER_NET_PW_CANCEL;
+        float bx0 = is_cancel ? l->pw_cancel_x0 : l->pw_connect_x0;
+        float bx1 = is_cancel ? l->pw_cancel_x1 : l->pw_connect_x1;
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, bx0, l->pw_btn_y0, bx1 - bx0, l->pw_btn_h, l->pw_btn_h / 2.0f);
         nvgFillColor(vg, col);
         nvgFill(vg);
     }
@@ -1035,8 +1254,31 @@ static void cc_render(dc_control_center *cc)
      * sec.1 items 1/2/4). */
     cc_state st;
     cc_gather_state(cc, &st);
+
+    /* Progress the password-entry connect job (W1.1), if any, before this
+     * frame's layout so a just-resolved success/failure is reflected right
+     * away instead of flashing one extra "Connecting..." frame. */
+    if (cc->net_pw_connecting) {
+        char err[sizeof(cc->net_pw_err)] = "";
+        dc_net_connect_state cstate = dc_net_wifi_connect_poll(err, sizeof(err));
+        if (cstate == DC_NET_CONNECT_SUCCESS) {
+            cc->net_pw_active = false;
+            cc->net_pw_connecting = false;
+            cc->net_pw_buf[0] = '\0';
+            cc->net_pw_err[0] = '\0';
+            dc_net_wifi_connect_reset();
+        } else if (cstate == DC_NET_CONNECT_FAILED) {
+            cc->net_pw_connecting = false;
+            snprintf(cc->net_pw_err, sizeof(cc->net_pw_err), "%s",
+                    err[0] ? err : "Connection failed");
+            dc_net_wifi_connect_reset();
+        }
+        /* DC_NET_CONNECT_IN_PROGRESS: nothing to do yet -- still showing
+         * "Connecting..."; the frame_cb request below keeps polling. */
+    }
+
     cc_layout l = cc_get_layout((float)cc->logical_width, st.media_active, st.expand_kind,
-                                st.expand_rows);
+                                st.expand_rows, cc_find_pw_row(cc, &st));
 
     int desired_h = (int)ceilf(l.total_h);
     if (desired_h != cc->logical_height && cc->layer_surface) {
@@ -1318,13 +1560,12 @@ static void cc_render(dc_control_center *cc)
             float ry = cc_expand_row_y(&l, i);
             if (l.expand_kind == 1) {
                 const dc_net_wifi_ap *ap = &st.net_aps[i];
-                bool hinted =
-                    cc->net_hint_active && strcmp(cc->net_hint_ssid, ap->ssid) == 0;
+                bool pw_open = i == l.pw_after_row;
                 char status[24];
-                bool warn = false;
-                if (hinted) {
-                    snprintf(status, sizeof(status), "Needs Password");
-                    warn = true;
+                status[0] = '\0';
+                if (pw_open) {
+                    /* The panel drawn right below already shows
+                     * blank/"Connecting..."/error -- no need to repeat it. */
                 } else if (ap->in_use)
                     snprintf(status, sizeof(status), "Connected");
                 else if (ap->secured)
@@ -1333,7 +1574,10 @@ static void cc_render(dc_control_center *cc)
                     snprintf(status, sizeof(status), "Open \xc2\xb7 %d%%", ap->signal_percent);
                 draw_expand_row(cc->render, l.ix, ry, l.iw, l.expand_row_h,
                                 ap->secured ? DC_ICON_LOCK : DC_ICON_WIFI, ap->ssid, status,
-                                ap->in_use, warn);
+                                ap->in_use, false);
+                if (pw_open)
+                    draw_net_pw_panel(cc->render, &l, cc->net_pw_buf, cc->net_pw_connecting,
+                                      cc->net_pw_err);
             } else {
                 const dc_bluez_device *d = &st.bt_devs[i];
                 draw_expand_row(cc->render, l.ix, ry, l.iw, l.expand_row_h,
@@ -1348,7 +1592,11 @@ static void cc_render(dc_control_center *cc)
 
     nvgEndFrame(vg);
 
-    if ((dc_anim_active(&cc->anim) || cc->closing) && !cc->frame_cb) {
+    /* Keep requesting frame callbacks while a password-entry connect job is
+     * in flight, purely to keep polling dc_net_wifi_connect_poll() until it
+     * resolves -- otherwise the "Connecting..." row would only ever update
+     * on the next pointer click/motion (docs/13-POPOUTS-SPEC.md sec.1). */
+    if ((dc_anim_active(&cc->anim) || cc->closing || cc->net_pw_connecting) && !cc->frame_cb) {
         cc->frame_cb = wl_surface_frame(cc->surface);
         wl_callback_add_listener(cc->frame_cb, &cc_frame_listener, cc);
     }
@@ -1437,6 +1685,12 @@ static void cc_show(dc_control_center *cc, dc_output *output)
     zwlr_layer_surface_v1_set_margin(cc->layer_surface, pa.margin_top, pa.margin_right,
                                      pa.margin_bottom, pa.margin_left);
     zwlr_layer_surface_v1_set_exclusive_zone(cc->layer_surface, -1);
+    /* On-demand keyboard (W1.1) so the inline Wi-Fi password field can be
+     * typed into without permanently stealing focus from other apps while
+     * the panel is just sitting open for mouse use -- same rationale as
+     * settings.c's text fields. */
+    zwlr_layer_surface_v1_set_keyboard_interactivity(
+        cc->layer_surface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND);
     zwlr_layer_surface_v1_add_listener(cc->layer_surface, &layer_surface_listener, cc);
 
     wl_surface_commit(cc->surface);
@@ -1475,7 +1729,7 @@ static void cc_teardown(dc_control_center *cc)
      * matches every other popout's "closed == reset" convention. */
     cc->net_expanded = false;
     cc->bt_expanded = false;
-    cc->net_hint_active = false;
+    cc_close_net_pw(cc);
     dc_debug("control center hidden");
 }
 
@@ -1523,7 +1777,7 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
     cc_state st;
     cc_gather_state(cc, &st);
     cc_layout l = cc_get_layout((float)cc->logical_width, st.media_active, st.expand_kind,
-                                st.expand_rows);
+                                st.expand_rows, cc_find_pw_row(cc, &st));
 
     /* Header action buttons: lock, power, settings, edit. */
     for (int i = 0; i < 4; i++) {
@@ -1588,7 +1842,7 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
         if (dx * dx + dy * dy <= (double)(l.chevron_r * l.chevron_r)) {
             cc->net_expanded = !cc->net_expanded;
             cc->bt_expanded = false;
-            cc->net_hint_active = false;
+            cc_close_net_pw(cc);
             cc_render(cc);
             return;
         }
@@ -1597,7 +1851,7 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
         if (dx * dx + dy * dy <= (double)(l.chevron_r * l.chevron_r)) {
             cc->bt_expanded = !cc->bt_expanded;
             cc->net_expanded = false;
-            cc->net_hint_active = false;
+            cc_close_net_pw(cc);
             cc_render(cc);
             return;
         }
@@ -1656,9 +1910,9 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
     }
 
     /* Expand panel rows: connect/disconnect a bluetooth device, or connect
-     * to an open/known Wi-Fi network (secured+unknown SSIDs show a "needs
-     * password" hint instead -- no inline password entry yet, docs/13-
-     * POPOUTS-SPEC.md sec.1 item 1 TODO). */
+     * to an open/known Wi-Fi network (unchanged, one-click). A secured,
+     * not-yet-known SSID instead opens the inline password panel (W1.1)
+     * right below its row -- see draw_net_pw_panel()/cc_get_layout(). */
     if (l.expand_kind != 0 && st.expand_rows > 0) {
         int rows = st.expand_rows > CC_MAX_EXPAND_ROWS ? CC_MAX_EXPAND_ROWS : st.expand_rows;
         for (int i = 0; i < rows; i++) {
@@ -1673,11 +1927,15 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
                 if (ap->in_use) {
                     /* already connected -- nothing to do */
                 } else if (!ap->secured || ap->known) {
-                    cc->net_hint_active = false;
+                    cc_close_net_pw(cc);
                     dc_net_wifi_connect(ap->ssid);
-                } else {
-                    cc->net_hint_active = true;
-                    snprintf(cc->net_hint_ssid, sizeof(cc->net_hint_ssid), "%s", ap->ssid);
+                } else if (!cc->net_pw_active || strcmp(cc->net_pw_ssid, ap->ssid) != 0) {
+                    /* A different SSID's panel (or none) was open -- (re)open
+                     * it fresh for this one. Re-clicking the *same* SSID's
+                     * already-open row is a no-op (keeps whatever's typed). */
+                    cc_close_net_pw(cc);
+                    cc->net_pw_active = true;
+                    snprintf(cc->net_pw_ssid, sizeof(cc->net_pw_ssid), "%s", ap->ssid);
                 }
             } else {
                 const dc_bluez_device *d = &st.bt_devs[i];
@@ -1685,6 +1943,30 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
                     dc_bluez_disconnect(d->mac);
                 else
                     dc_bluez_connect(d->mac);
+            }
+            cc_render(cc);
+            return;
+        }
+    }
+
+    /* Inline Wi-Fi password entry (W1.1): field (no-op on click -- keyboard
+     * focus is implicit whenever net_pw_active is true) + Cancel/Connect. */
+    if (l.pw_after_row >= 0) {
+        bool in_field = x >= (double)l.ix && x <= (double)(l.ix + l.iw) &&
+                        y >= (double)l.pw_field_y && y <= (double)(l.pw_field_y + l.pw_field_h);
+        bool in_btn_row = y >= (double)l.pw_btn_y0 && y <= (double)(l.pw_btn_y0 + l.pw_btn_h);
+        if (in_field)
+            return;
+        if (in_btn_row && x >= (double)l.pw_cancel_x0 && x <= (double)l.pw_cancel_x1) {
+            cc_close_net_pw(cc);
+            cc_render(cc);
+            return;
+        }
+        if (in_btn_row && x >= (double)l.pw_connect_x0 && x <= (double)l.pw_connect_x1) {
+            if (!cc->net_pw_connecting && cc->net_pw_buf[0]) {
+                dc_net_wifi_connect_psk(cc->net_pw_ssid, cc->net_pw_buf);
+                cc->net_pw_connecting = true;
+                cc->net_pw_err[0] = '\0';
             }
             cc_render(cc);
             return;
@@ -1705,7 +1987,7 @@ void dc_control_center_handle_motion(dc_control_center *cc, double x, double y)
     cc_state st;
     cc_gather_state(cc, &st);
     cc_layout l = cc_get_layout((float)cc->logical_width, st.media_active, st.expand_kind,
-                                st.expand_rows);
+                                st.expand_rows, cc_find_pw_row(cc, &st));
 
     if (cc->slider_dragging) {
         float frac = cc_slider_frac_at(&l, cc->slider_drag_slot, x);
@@ -1749,6 +2031,56 @@ void dc_control_center_handle_leave(dc_control_center *cc)
     cc->hover_id = CC_HOVER_NONE;
     dc_wayland_set_cursor(cc->wl, DC_CURSOR_DEFAULT);
     cc_render(cc);
+}
+
+/* W1.1: only the inline Wi-Fi password field ever wants keyboard input --
+ * same "keyboard on demand" contract as dc_settings_wants_keyboard(). */
+bool dc_control_center_wants_keyboard(dc_control_center *cc)
+{
+    return cc->visible && !cc->closing && cc->net_pw_active;
+}
+
+void dc_control_center_handle_key(dc_control_center *cc, uint32_t keysym, const char *utf8)
+{
+    if (!cc->net_pw_active)
+        return;
+
+    switch (keysym) {
+    case XKB_KEY_Escape:
+        cc_close_net_pw(cc);
+        cc_render(cc);
+        return;
+    case XKB_KEY_Return:
+    case XKB_KEY_KP_Enter:
+        if (!cc->net_pw_connecting && cc->net_pw_buf[0]) {
+            dc_net_wifi_connect_psk(cc->net_pw_ssid, cc->net_pw_buf);
+            cc->net_pw_connecting = true;
+            cc->net_pw_err[0] = '\0';
+        }
+        cc_render(cc);
+        return;
+    case XKB_KEY_BackSpace: {
+        size_t n = strlen(cc->net_pw_buf);
+        if (n > 0)
+            cc->net_pw_buf[n - 1] = '\0';
+        cc_render(cc);
+        return;
+    }
+    default:
+        /* Append the whole UTF-8 sequence for the key, same control-char
+         * filter as launcher.c's query editing -- passwords may contain any
+         * printable character, not just ASCII. */
+        if (utf8 && utf8[0] && !((unsigned char)utf8[0] < 0x20) &&
+            (unsigned char)utf8[0] != 0x7f) {
+            size_t n = strlen(cc->net_pw_buf);
+            size_t add = strlen(utf8);
+            if (n + add < sizeof(cc->net_pw_buf)) {
+                memcpy(cc->net_pw_buf + n, utf8, add + 1);
+                cc_render(cc);
+            }
+        }
+        return;
+    }
 }
 
 void dc_control_center_destroy(dc_control_center *cc)
