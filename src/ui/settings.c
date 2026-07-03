@@ -3760,6 +3760,14 @@ static void layer_surface_handle_configure(void *data, struct zwlr_layer_surface
      * setup -- see the project's input-synthesis notes). */
     if (!s->test_clicks_done) {
         s->test_clicks_done = true;
+        /* Displays tab verification (docs/19 sec.3): its content is taller
+         * than one screen, so scripted clicks on rows below the fold need
+         * a pre-scroll -- DANKC_SETTINGS_SCROLL=<content pixels> sets
+         * s->scroll_y directly before the clicks below run, same one-shot
+         * gate as test_clicks_done. */
+        const char *scroll_spec = getenv("DANKC_SETTINGS_SCROLL");
+        if (scroll_spec)
+            s->scroll_y = (float)atof(scroll_spec);
         const char *spec = getenv("DANKC_SETTINGS_CLICK");
         while (spec && *spec) {
             double cx = 0, cy = 0;
