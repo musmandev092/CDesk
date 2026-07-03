@@ -12,13 +12,14 @@
  * every ~1Hz tick per bar just to check for a volume change, on top of the
  * 1Hz clock_tick's own OSD-change read and the control-center-pill's draw
  * read — so without a real cache window this would fork on nearly every tick
- * across 2+ bars. 3s (not libpipewire — out of scope for this pass) matches
- * bluez.c's/net.c's cache window; dc_audio_set_volume() below still
- * invalidates the cache immediately so a user's own slider drag/OSD reflects
- * instantly, and worst-case external-volume-change detection latency (e.g.
- * media keys, another app) becomes up to 3s instead of up to 1s — acceptable
+ * across 2+ bars. Widened to 10s per docs/15-PERF-PLAN.md T2.3 (was 3s).
+ * TRADEOFF: dc_audio_set_volume() below still invalidates the cache
+ * immediately (line 85), so a user's own slider drag/OSD reflects instantly.
+ * The longer window only affects external volume changes (media keys, another
+ * app) — detection latency is now up to ~10s instead of ~1s, but saves ~13
+ * forks/min (~20 → ~7). External volume changes on the bar are acceptable
  * per docs/POLISH.md P7 ("2-3s worst-case is fine"). */
-#define DC_AUDIO_CACHE_SECONDS 3
+#define DC_AUDIO_CACHE_SECONDS 10
 
 static dc_audio_info g_cache;
 static bool g_cache_ok = false;
