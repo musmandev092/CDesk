@@ -775,10 +775,16 @@ void dc_render_icon(dc_render *render, int codepoint, float x, float y, float si
 
     /* A play-triangle's ink centroid sits left of its bounding-box center
      * (it's wider on the left, where its two acute corners are). Bounding-
-     * box centering alone therefore reads as very slightly left-heavy;
-     * nudge +1px right to match the optically-balanced DMS convention. */
-    if (codepoint == DC_ICON_PLAY_ARROW)
-        draw_x += 1.0f;
+     * box centering alone therefore reads as very slightly left-heavy AND,
+     * because the pointed apex draws the eye upward, very slightly high;
+     * nudge right/down proportionally to the rendered size (not a flat
+     * pixel) so it stays optically balanced across the bar's 14px, CC's
+     * 16px, and the dashboard's ~19-25px transport glyph alike. Tuned by
+     * eye against zoomed screenshots at all three sizes. */
+    if (codepoint == DC_ICON_PLAY_ARROW) {
+        draw_x += size * 0.07f;
+        draw_y += size * 0.07f;
+    }
 
     nvgText(render->vg, draw_x, draw_y, glyph, NULL);
     nvgRestore(render->vg);
