@@ -71,6 +71,34 @@ void dc_render_finish(dc_render *render);
  * positively rule out. */
 bool dc_render_font_has(uint32_t codepoint);
 
+/* docs/16-PERF2-PLAN.md T2.1: CJK/Devanagari/Thai/emoji fallback fonts are
+ * loaded LAZILY (on first use) instead of at startup, to shave ~46ms of
+ * cmap-parse time off first-frame latency for the common case (English/Urdu
+ * user who never triggers those scripts). Latin (Inter/icons), general Sans
+ * (Cyrillic/Greek) and Arabic/Urdu are still loaded eagerly at startup — Urdu
+ * must never show tofu on frame 1 per this shell's configured user.
+ *
+ * Call this for every codepoint about to be measured/drawn (render/shape.c's
+ * dc_shape_needed() does, for every codepoint of every string routed through
+ * its dc_shape_draw_text/dc_shape_text_bounds/dc_shape_draw_textbox wrappers
+ * — i.e. every title/toast/notification string in the shell). If `codepoint`
+ * belongs to a script whose fallback isn't loaded yet, it flags that script
+ * for loading. The flag is serviced (font mmap'd + cmap parsed + registered
+ * via nvgAddFallbackFontId, and the shaped-text cache reset) at the START of
+ * `dc_render_ensure()`'s next call — which is BEFORE every single
+ * nvgBeginFrame() in this codebase (bar.c and every popout call
+ * dc_render_ensure() immediately before nvgBeginFrame()), never mid-frame.
+ * So this function itself only ever sets an in-memory bitmask — no
+ * nanovg/GL state touched — making it safe to call from inside an in-flight
+ * frame. The actual glyph draw may show a transient collapse-to-"..."
+ * (bar.c) or a one-frame miss (toasts/notifcenter, plain nvgText fallback-
+ * chain lookup) on the very first appearance of a new script; every surface
+ * in this shell either re-measures fresh each draw pass (bar.c) or is
+ * refreshed at least once per second regardless (toasts.h/notifcenter.h's
+ * 1 Hz tick refresh), so the correct glyphs land within a second at worst,
+ * usually the very same frame or the next. */
+void dc_render_note_codepoint(uint32_t codepoint);
+
 /* Which loaded font (font_ui first, then font_fallbacks[] in registered
  * order — the exact order/priority fontstash's own glyph-index fallback
  * search uses) actually has a glyph for `codepoint`. Returns the nvg font id

@@ -2,6 +2,7 @@
 
 #include "core/log.h"
 #include "render/icons.h"
+#include "render/shape.h"
 
 #include <fontconfig/fontconfig.h>
 #include <GLES3/gl3.h>
@@ -281,22 +282,90 @@ out:
  * stb_truetype cannot rasterise, so emoji intentionally render MONOCHROME.
  * Variation selectors/ZWJ are stripped by bar_sanitize_utf8(), so ZWJ
  * sequences decompose into their component emoji. */
+/* docs/16-PERF2-PLAN.md T2.1: lazy fallback-font loading. Scripts this
+ * shell's configured user (English UI + Urdu/Arabic, memory
+ * `language-urdu-in-english-out`) is unlikely to hit immediately (CJK,
+ * Devanagari, Thai, emoji — 46ms of the 108ms cold font-load time, per
+ * docs/16 sec.1.2) are deferred until a codepoint from that script is
+ * actually about to be rendered; general Sans (Cyrillic/Greek, cheap per
+ * docs/16) and Arabic/Urdu (this user's primary non-Latin case — must never
+ * tofu on frame 1) stay eager. See dc_render_note_codepoint() (nvg.h). */
+typedef enum {
+    LAZY_CJK = 0,
+    LAZY_DEVANAGARI,
+    LAZY_THAI,
+    LAZY_EMOJI,
+    LAZY_GROUP_COUNT,
+} lazy_group;
+
+/* Bit i set in g_lazy_loaded: that lazy group has been loaded (successfully
+ * or not — a failed attempt is not retried every frame, matching the
+ * best-effort philosophy of the rest of this file). Bit i set in
+ * g_lazy_pending (and NOT in g_lazy_loaded): a codepoint needing that group
+ * was seen and hasn't been serviced yet. Both are plain bitmasks — no
+ * nanovg/GL state — so they're safe to touch from anywhere, including
+ * mid-frame (see dc_render_note_codepoint()'s doc comment in nvg.h). Only
+ * `service_lazy_fallbacks()`, called from dc_render_ensure() strictly before
+ * every nvgBeginFrame() in this codebase, actually loads a font. */
+static unsigned g_lazy_loaded = 0;
+static unsigned g_lazy_pending = 0;
+
+/* Unicode block ranges -> which lazy group covers them. Deliberately
+ * generous (better to trigger a load a script's outlying codepoints didn't
+ * strictly need than to leave a codepoint permanently unrecognised). Returns
+ * -1 for anything not lazily managed (Latin/Cyrillic/Greek/Arabic, already
+ * eager; or a script this shell has no fallback for at all, unchanged from
+ * before this task — those still collapse to "..."/tofu exactly as today). */
+static int lazy_group_for_cp(uint32_t cp)
+{
+    /* CJK: Hiragana/Katakana, CJK Unified + Ext-A, compat ideographs, CJK
+     * punctuation, Hangul Jamo + syllables, and the supplementary-plane CJK
+     * extensions (Noto Sans CJK covers all of these from one .ttc). */
+    if ((cp >= 0x3000 && cp <= 0x303F) || (cp >= 0x3040 && cp <= 0x30FF) ||
+        (cp >= 0x3400 && cp <= 0x4DBF) || (cp >= 0x4E00 && cp <= 0x9FFF) ||
+        (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0x1100 && cp <= 0x11FF) ||
+        (cp >= 0xAC00 && cp <= 0xD7A3) || (cp >= 0x20000 && cp <= 0x2FFFF))
+        return LAZY_CJK;
+    /* Devanagari + Devanagari Extended. */
+    if ((cp >= 0x0900 && cp <= 0x097F) || (cp >= 0xA8E0 && cp <= 0xA8FF))
+        return LAZY_DEVANAGARI;
+    if (cp >= 0x0E00 && cp <= 0x0E7F)
+        return LAZY_THAI;
+    /* Emoji: misc symbols/dingbats/transport used by monochrome emoji sets,
+     * plus the main supplementary-plane emoji blocks (U+1F300 and up, per
+     * the task spec). */
+    if ((cp >= 0x2300 && cp <= 0x23FF) || (cp >= 0x2600 && cp <= 0x27BF) ||
+        (cp >= 0x2B00 && cp <= 0x2BFF) || (cp >= 0x1F000 && cp <= 0x1FFFF))
+        return LAZY_EMOJI;
+    return -1;
+}
+
+void dc_render_note_codepoint(uint32_t codepoint)
+{
+    int g = lazy_group_for_cp(codepoint);
+    if (g >= 0 && !(g_lazy_loaded & (1u << g)))
+        g_lazy_pending |= (1u << g);
+}
+
 typedef struct {
     const char *pattern;    /* fontconfig pattern, or NULL: `retry_path` only */
     uint32_t probe;         /* codepoint the matched font must cover; 0 = any */
     const char *retry_path; /* literal fallback path if the fc match fails */
+    int lazy_group;         /* -1 = loaded eagerly at startup; else a LAZY_* group */
 } fallback_spec;
 
 static const fallback_spec FALLBACK_SPECS[] = {
-    {"sans", 0x0410, NULL},          /* general: Cyrillic/Greek/... (Noto Sans) */
-    {"sans:lang=ur", 0x06C1, "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf"},
+    {"sans", 0x0410, NULL, -1},          /* general: Cyrillic/Greek/... (Noto Sans) */
+    {"sans:lang=ur", 0x06C1, "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf", -1},
     /* lang=ur (probe: heh-goal) — lang=ar can resolve to DejaVu, which lacks
-     * the Urdu-only letters (U+06C1/U+06D2); Urdu coverage implies Arabic. */
-    {":lang=zh-cn", 0x4F60, "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"},
-    {":lang=ja", 0x3053, "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"},
-    {":lang=ko", 0xC548, "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"},
-    {":lang=hi", 0x0928, NULL},      /* Devanagari */
-    {":lang=th", 0x0E2A, NULL},      /* Thai */
+     * the Urdu-only letters (U+06C1/U+06D2); Urdu coverage implies Arabic.
+     * Kept eager: this shell's user writes Urdu (memory
+     * `language-urdu-in-english-out`) — never tofu on frame 1. */
+    {":lang=zh-cn", 0x4F60, "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", LAZY_CJK},
+    {":lang=ja", 0x3053, "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", LAZY_CJK},
+    {":lang=ko", 0xC548, "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", LAZY_CJK},
+    {":lang=hi", 0x0928, NULL, LAZY_DEVANAGARI},
+    {":lang=th", 0x0E2A, NULL, LAZY_THAI},
 };
 
 /* Vendored monochrome emoji font, appended after the fontconfig chain. */
@@ -306,6 +375,13 @@ static const char *const EMOJI_FONT_CANDIDATES[] = {
 };
 
 #define DC_MAX_FALLBACK_FONTS DC_RENDER_MAX_FALLBACKS
+
+/* Dedupe list of every fallback font path accepted so far (zh-cn/ja/ko all
+ * resolve to the same CJK .ttc): process-lifetime, shared between the
+ * startup eager load and every later lazy load, so add_fallback_font()'s
+ * dedupe check keeps working across the two call sites. */
+static char g_loaded_paths[DC_MAX_FALLBACK_FONTS][256];
+static int g_n_loaded_paths = 0;
 
 /* One fc-match query. Caller brackets with FcInit()/FcFini(). Returns a
  * heap-allocated file path (caller frees) or NULL. */
@@ -418,38 +494,98 @@ static bool add_fallback_font(dc_render *render, const char *path, uint32_t prob
     return true;
 }
 
-/* Resolve and load the whole fallback chain (script fonts via fontconfig,
- * then the vendored emoji font). Every step is best-effort: a missing font
- * just leaves that script uncovered, and bar_sanitize_utf8() collapses it
- * to "…" instead of tofu. */
+/* Load only the EAGER fallback chain at startup: general Sans
+ * (Cyrillic/Greek) + Arabic/Urdu (fallback_spec.lazy_group == -1). CJK,
+ * Devanagari, Thai and emoji are deferred to service_lazy_fallbacks() (see
+ * dc_render_note_codepoint()) — docs/16-PERF2-PLAN.md T2.1. Every step here
+ * is still best-effort: a missing font just leaves that script uncovered,
+ * and bar_sanitize_utf8() collapses it to "…" instead of tofu. */
 static void load_fallback_fonts(dc_render *render)
 {
-    char loaded[DC_MAX_FALLBACK_FONTS][256];
-    int n_loaded = 0;
-
     if (!FcInit()) {
         dc_warn("fontconfig init failed; no non-Latin fallback fonts");
-    } else {
-        for (size_t i = 0; i < sizeof(FALLBACK_SPECS) / sizeof(FALLBACK_SPECS[0]); i++) {
-            const fallback_spec *spec = &FALLBACK_SPECS[i];
-            char *path = fc_match_path(spec->pattern);
-            bool ok = path && add_fallback_font(render, path, spec->probe, loaded, &n_loaded);
-            free(path);
-            if (!ok && spec->retry_path && access(spec->retry_path, R_OK) == 0)
-                add_fallback_font(render, spec->retry_path, spec->probe, loaded, &n_loaded);
-        }
-        FcFini();
+        return;
     }
-
-    for (size_t i = 0; i < sizeof(EMOJI_FONT_CANDIDATES) / sizeof(char *); i++) {
-        if (access(EMOJI_FONT_CANDIDATES[i], R_OK) != 0)
+    for (size_t i = 0; i < sizeof(FALLBACK_SPECS) / sizeof(FALLBACK_SPECS[0]); i++) {
+        const fallback_spec *spec = &FALLBACK_SPECS[i];
+        if (spec->lazy_group != -1)
             continue;
-        if (add_fallback_font(render, EMOJI_FONT_CANDIDATES[i], 0x1F600, loaded, &n_loaded))
-            break;
+        char *path = fc_match_path(spec->pattern);
+        bool ok = path && add_fallback_font(render, path, spec->probe, g_loaded_paths, &g_n_loaded_paths);
+        free(path);
+        if (!ok && spec->retry_path && access(spec->retry_path, R_OK) == 0)
+            add_fallback_font(render, spec->retry_path, spec->probe, g_loaded_paths, &g_n_loaded_paths);
     }
+    FcFini();
 
     if (render->font_fallback_count == 0)
-        dc_warn("no fallback fonts loaded; non-Latin text and emoji will be dropped");
+        dc_warn("no eager fallback fonts loaded; Latin-adjacent scripts will show tofu until"
+                " a lazy fallback loads (see service_lazy_fallbacks)");
+}
+
+/* Load exactly the fallback font(s) for one LAZY_* group (CJK/Devanagari/
+ * Thai via fontconfig, or the vendored emoji font), same best-effort rules
+ * as load_fallback_fonts() above. Caller (service_lazy_fallbacks()) brackets
+ * fontconfig-using groups with FcInit()/FcFini(); the emoji group needs
+ * neither. */
+static void load_one_lazy_group(dc_render *render, int group)
+{
+    if (group == LAZY_EMOJI) {
+        for (size_t i = 0; i < sizeof(EMOJI_FONT_CANDIDATES) / sizeof(char *); i++) {
+            if (access(EMOJI_FONT_CANDIDATES[i], R_OK) != 0)
+                continue;
+            if (add_fallback_font(render, EMOJI_FONT_CANDIDATES[i], 0x1F600, g_loaded_paths,
+                                  &g_n_loaded_paths))
+                break;
+        }
+        return;
+    }
+
+    for (size_t i = 0; i < sizeof(FALLBACK_SPECS) / sizeof(FALLBACK_SPECS[0]); i++) {
+        const fallback_spec *spec = &FALLBACK_SPECS[i];
+        if (spec->lazy_group != group)
+            continue;
+        char *path = fc_match_path(spec->pattern);
+        bool ok = path && add_fallback_font(render, path, spec->probe, g_loaded_paths, &g_n_loaded_paths);
+        free(path);
+        if (!ok && spec->retry_path && access(spec->retry_path, R_OK) == 0)
+            add_fallback_font(render, spec->retry_path, spec->probe, g_loaded_paths, &g_n_loaded_paths);
+    }
+}
+
+/* Service every lazy-load request flagged by dc_render_note_codepoint()
+ * since the last call. MUST only be called from dc_render_ensure(), which
+ * every render path in this codebase (bar.c + every popout) calls strictly
+ * before its nvgBeginFrame() — never mid-frame, so adding fonts to the
+ * shared NVGcontext here is exactly as safe as the original startup-time
+ * load_fallback_fonts() call was. If any font was actually added, resets
+ * render/shape.c's shaped-text cache (dc_shape_reset_cache()): otherwise a
+ * string shaped and cached BEFORE the new font existed (e.g. a CJK run that
+ * fell back to font_ui and cached its .notdef glyph ids) would keep
+ * rendering stale/wrong glyphs forever even after the real font loads,
+ * since the cache key (font_ui id + size + text bytes) doesn't change. */
+static void service_lazy_fallbacks(dc_render *render)
+{
+    unsigned todo = g_lazy_pending & ~g_lazy_loaded;
+    if (!todo)
+        return;
+
+    int before = render->font_fallback_count;
+    bool fc_ok = FcInit();
+    for (int g = 0; g < LAZY_GROUP_COUNT; g++) {
+        if (!(todo & (1u << g)))
+            continue;
+        if (g == LAZY_EMOJI || fc_ok)
+            load_one_lazy_group(render, g);
+        g_lazy_loaded |= (1u << g);
+        dc_info("lazily loaded fallback font group %d (docs/16-PERF2-PLAN.md T2.1)", g);
+    }
+    if (fc_ok)
+        FcFini();
+    g_lazy_pending &= ~todo;
+
+    if (render->font_fallback_count != before)
+        dc_shape_reset_cache();
 }
 
 static int load_font(NVGcontext *vg, const char *name, const char *const *candidates, size_t count,
@@ -509,8 +645,14 @@ bool dc_render_ensure(dc_render *render)
      * nvgBeginFrame() — the exact fault behind the dc_bar_render->nvgSave
      * startup SIGSEGV (NULL NVGcontext, fault at &ctx->nstates). Treat any
      * such state as not-ready and rebuild. */
-    if (render->ready && render->vg)
+    if (render->ready && render->vg) {
+        /* docs/16-PERF2-PLAN.md T2.1: service any lazy fallback-font load
+         * requests flagged since the last frame. Always strictly before
+         * this call's caller's nvgBeginFrame() — see service_lazy_fallbacks()
+         * and dc_render_note_codepoint()'s doc comments. */
+        service_lazy_fallbacks(render);
         return true;
+    }
     render->ready = false;
 
     render->vg = nvgCreateGLES3(NVG_ANTIALIAS | NVG_STENCIL_STROKES);
@@ -569,6 +711,7 @@ bool dc_render_ensure(dc_render *render)
 
 bool dc_render_font_has(uint32_t codepoint)
 {
+    dc_render_note_codepoint(codepoint);
     if (!g_cov.ui_valid)
         return true; /* fail open: no coverage data to rule anything out */
     if (codepoint >= COV_MAX_CP)
@@ -672,10 +815,21 @@ void dc_render_finish(dc_render *render)
     }
     render->font_fallback_count = 0;
     memset(&g_cov, 0, sizeof(g_cov));
+
+    /* Reset the lazy-loading bookkeeping too: a subsequent dc_render_ensure()
+     * rebuilds a brand-new NVGcontext with no fonts registered, so the
+     * dedupe list (g_loaded_paths) and per-group loaded/pending bitmasks must
+     * not carry over — otherwise add_fallback_font()'s dedupe check would
+     * see stale "already loaded" paths and skip re-registering them on the
+     * new context (docs/16-PERF2-PLAN.md T2.1). */
+    g_n_loaded_paths = 0;
+    g_lazy_loaded = 0;
+    g_lazy_pending = 0;
 }
 
 int dc_render_font_for_codepoint(dc_render *render, uint32_t codepoint, const char **out_path)
 {
+    dc_render_note_codepoint(codepoint);
     if (render->font_ui_cov && cov_get(render->font_ui_cov, codepoint)) {
         if (out_path)
             *out_path = render->font_ui_path;
