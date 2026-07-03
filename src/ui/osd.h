@@ -16,6 +16,16 @@ struct dc_loop;
 
 typedef struct dc_osd dc_osd;
 
+/* Screen position (docs/14-COMPLETION-PLAN.md W2.3, config.h's osd_position).
+ * Only the 4 corners/edges reachable with a plain layer-shell anchor (no
+ * extra horizontal-centering math) are implemented, vs. DMS's 8-way enum. */
+typedef enum {
+    DC_OSD_POS_BOTTOM_CENTER = 0, /* default, matches the old hardcoded behavior */
+    DC_OSD_POS_BOTTOM_LEFT,
+    DC_OSD_POS_BOTTOM_RIGHT,
+    DC_OSD_POS_TOP_CENTER,
+} dc_osd_position;
+
 dc_osd *dc_osd_create(struct dc_wayland *wl, struct dc_egl *egl, struct dc_render *render);
 void dc_osd_destroy(dc_osd *osd);
 
