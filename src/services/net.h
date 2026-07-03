@@ -172,5 +172,48 @@ void dc_net_eth_connect(void);
  * as dc_net_eth_connect(). */
 void dc_net_eth_disconnect(void);
 
+/* --- Wi-Fi known/saved networks --------------------------------------------
+ * docs/18-WIFI-BT-PLAN.md sec.2.3 -- org.freedesktop.NetworkManager.Settings,
+ * independent of any live scan (a saved network out of range still shows up
+ * here). */
+#define DC_NET_SAVED_MAX 32
+
+typedef struct dc_net_saved_net {
+    char path[64]; /* Settings/Connection object path -- stable id to pass to
+                    * dc_net_saved_forget()/dc_net_saved_set_autoconnect() */
+    char id[64];   /* connection.id, e.g. "BAIHQ" -- display name */
+    char ssid[64]; /* decoded 802-11-wireless.ssid */
+    bool autoconnect; /* connection.autoconnect (NM default is true when the
+                        * key is absent from GetSettings -- treated as true) */
+} dc_net_saved_net;
+
+/* List all saved 802-11-wireless connections (Settings.ListConnections +
+ * per-connection GetSettings, filtered to connection.type ==
+ * "802-11-wireless"). Synchronous -- a handful of small IPC round trips, no
+ * fork, cheap enough to call each time the "Saved Networks" panel is shown
+ * (same cost class as dc_net_ethernet(), not the scan list's fork+8s-cache
+ * shape). Returns the number of entries written to `out` (capped at `max`).
+ * Also refreshes the internal cache used by dc_net_saved_find_by_ssid(). */
+int dc_net_saved_list(dc_net_saved_net *out, int max);
+
+/* Delete a saved connection (Settings.Connection.Delete() on `path`, as
+ * returned in dc_net_saved_net.path). Returns true if the D-Bus call
+ * succeeded (or, under DANKC_NET_DRYRUN, was logged instead of sent). */
+bool dc_net_saved_forget(const char *path);
+
+/* Toggle connection.autoconnect on a saved connection (Settings.Connection.
+ * Update() with the full settings dict re-read via GetSettings and just the
+ * "autoconnect" key rewritten -- Update() replaces the whole connection, it
+ * doesn't merge). Returns true on success (or under DANKC_NET_DRYRUN). */
+bool dc_net_saved_set_autoconnect(const char *path, bool enable);
+
+/* Look up a saved connection by SSID in the cache populated by the most
+ * recent dc_net_saved_list() call (call that first). Returns a pointer into
+ * that cache -- valid only until the next dc_net_saved_list() call, do not
+ * retain across frames -- or NULL if no saved 802-11-wireless connection
+ * matches. Lets the UI answer "is this scanned SSID already saved?" without
+ * a second D-Bus round trip. */
+const dc_net_saved_net *dc_net_saved_find_by_ssid(const char *ssid);
+
 
 #endif /* DC_SERVICES_NET_H */

@@ -1270,3 +1270,349 @@ void dc_net_eth_disconnect(void)
     sd_bus_error_free(&derr);
     sd_bus_message_unref(dreply);
 }
+
+/* --- Wi-Fi known/saved networks — NetworkManager D-Bus (docs/18-WIFI-BT-PLAN.md
+ * sec.2.3) -------------------------------------------------------------------
+ *
+ * Unlike the scan list (services/weather.c-style fork+pipe, cached 8s),
+ * these are a handful of synchronous D-Bus round trips: ListConnections()
+ * returns object paths already resolved by NetworkManager, and each
+ * GetSettings() is a single small method call, no fork needed.
+ */
+
+/* Parse a Settings.Connection.GetSettings() a{sa{sv}} reply, pulling out
+ * connection.id/type/autoconnect and (if present) 802-11-wireless.ssid
+ * (an NM byte array, decoded here into a C string). Any out-param may be
+ * NULL if the caller doesn't need it. autoconnect defaults to true when the
+ * key is absent from the reply -- that's NM's own default, not just this
+ * function's. Returns false only if the GetSettings call itself failed. */
+static bool net_conn_read_settings(const char *conn_path, char *id_out, size_t id_len,
+                                   char *type_out, size_t type_len, bool *autoconnect_out,
+                                   char *ssid_out, size_t ssid_len)
+{
+    if (id_out && id_len)
+        id_out[0] = '\0';
+    if (type_out && type_len)
+        type_out[0] = '\0';
+    if (autoconnect_out)
+        *autoconnect_out = true;
+    if (ssid_out && ssid_len)
+        ssid_out[0] = '\0';
+
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = NULL;
+    int r = sd_bus_call_method(g_net_bus, DC_NM_DEST, conn_path, DC_NM_SETTINGS_CONN_IFACE,
+                               "GetSettings", &err, &reply, "");
+    sd_bus_error_free(&err);
+    if (r < 0)
+        return false;
+
+    if (sd_bus_message_enter_container(reply, 'a', "{sa{sv}}") > 0) {
+        while (sd_bus_message_enter_container(reply, 'e', "sa{sv}") > 0) {
+            const char *group = NULL;
+            sd_bus_message_read_basic(reply, 's', &group);
+            bool is_conn = group && strcmp(group, "connection") == 0;
+            bool is_wifi = group && strcmp(group, "802-11-wireless") == 0;
+
+            if ((is_conn || is_wifi) && sd_bus_message_enter_container(reply, 'a', "{sv}") > 0) {
+                while (sd_bus_message_enter_container(reply, 'e', "sv") > 0) {
+                    const char *key = NULL;
+                    sd_bus_message_read_basic(reply, 's', &key);
+                    if (is_conn && key && strcmp(key, "id") == 0 && id_out) {
+                        const char *v = NULL;
+                        sd_bus_message_enter_container(reply, 'v', "s");
+                        sd_bus_message_read_basic(reply, 's', &v);
+                        sd_bus_message_exit_container(reply);
+                        if (v)
+                            snprintf(id_out, id_len, "%s", v);
+                    } else if (is_conn && key && strcmp(key, "type") == 0 && type_out) {
+                        const char *v = NULL;
+                        sd_bus_message_enter_container(reply, 'v', "s");
+                        sd_bus_message_read_basic(reply, 's', &v);
+                        sd_bus_message_exit_container(reply);
+                        if (v)
+                            snprintf(type_out, type_len, "%s", v);
+                    } else if (is_conn && key && strcmp(key, "autoconnect") == 0 &&
+                              autoconnect_out) {
+                        int v = 1;
+                        sd_bus_message_enter_container(reply, 'v', "b");
+                        sd_bus_message_read_basic(reply, 'b', &v);
+                        sd_bus_message_exit_container(reply);
+                        *autoconnect_out = v != 0;
+                    } else if (is_wifi && key && strcmp(key, "ssid") == 0 && ssid_out) {
+                        const void *bytes = NULL;
+                        size_t n = 0;
+                        sd_bus_message_enter_container(reply, 'v', "ay");
+                        sd_bus_message_read_array(reply, 'y', &bytes, &n);
+                        sd_bus_message_exit_container(reply);
+                        if (bytes && n > 0) {
+                            size_t copy = n < ssid_len - 1 ? n : ssid_len - 1;
+                            memcpy(ssid_out, bytes, copy);
+                            ssid_out[copy] = '\0';
+                        }
+                    } else {
+                        sd_bus_message_skip(reply, "v");
+                    }
+                    sd_bus_message_exit_container(reply); /* e sv */
+                }
+                sd_bus_message_exit_container(reply); /* a{sv} */
+            } else if (!is_conn && !is_wifi) {
+                sd_bus_message_skip(reply, "a{sv}");
+            }
+            sd_bus_message_exit_container(reply); /* e sa{sv} */
+        }
+        sd_bus_message_exit_container(reply); /* a{sa{sv}} */
+    }
+    sd_bus_message_unref(reply);
+    return true;
+}
+
+/* Recursively duplicate the value at `src`'s current read position into the
+ * message being built at `dst`, generically for every D-Bus container type
+ * (array/struct/dict-entry/variant) plus all basic scalar types.
+ *
+ * Needed for dc_net_saved_set_autoconnect(): NetworkManager's
+ * Settings.Connection.Update() replaces the *entire* connection (there is no
+ * partial-merge API), so toggling one "connection.autoconnect" key means
+ * re-serializing every other group/key exactly as GetSettings() returned it.
+ * This is the generic "copy everything except the one key I'm patching"
+ * primitive that makes that safe without hand-writing a re-encoder for every
+ * settings group NetworkManager might have on a saved connection (802.1x,
+ * ipv6, proxy, bond/team/bridge sub-settings, ...). */
+static int net_copy_value(sd_bus_message *dst, sd_bus_message *src)
+{
+    char type = 0;
+    const char *contents = NULL;
+    int r = sd_bus_message_peek_type(src, &type, &contents);
+    if (r <= 0)
+        return r;
+
+    if (type == SD_BUS_TYPE_ARRAY || type == SD_BUS_TYPE_STRUCT ||
+        type == SD_BUS_TYPE_DICT_ENTRY || type == SD_BUS_TYPE_VARIANT) {
+        r = sd_bus_message_enter_container(src, type, contents);
+        if (r < 0)
+            return r;
+        r = sd_bus_message_open_container(dst, type, contents);
+        if (r < 0) {
+            sd_bus_message_exit_container(src);
+            return r;
+        }
+        while (sd_bus_message_at_end(src, false) == 0) {
+            r = net_copy_value(dst, src);
+            if (r < 0)
+                break;
+        }
+        sd_bus_message_exit_container(src);
+        sd_bus_message_close_container(dst);
+        return r;
+    }
+
+    /* Basic scalar type: read into a union big enough for any of them (the
+     * union's address is valid for every member since they share storage),
+     * then re-append with the same type code -- both calls dispatch on
+     * `type` internally, same as every other read_basic()/append() pair
+     * already used throughout this file. */
+    union {
+        uint8_t y;
+        int b;
+        int16_t n;
+        uint16_t q;
+        int32_t i;
+        uint32_t u;
+        int64_t x;
+        uint64_t t;
+        double d;
+        const char *s;
+    } val;
+    r = sd_bus_message_read_basic(src, type, &val);
+    if (r < 0)
+        return r;
+    return sd_bus_message_append_basic(dst, type, &val);
+}
+
+static struct {
+    dc_net_saved_net items[DC_NET_SAVED_MAX];
+    int count;
+} g_saved;
+
+int dc_net_saved_list(dc_net_saved_net *out, int max)
+{
+    g_saved.count = 0;
+
+    if (g_net_bus) {
+        sd_bus_error err = SD_BUS_ERROR_NULL;
+        sd_bus_message *reply = NULL;
+        int r = sd_bus_call_method(g_net_bus, DC_NM_DEST, DC_NM_SETTINGS_PATH, DC_NM_SETTINGS_IFACE,
+                                   "ListConnections", &err, &reply, "");
+        sd_bus_error_free(&err);
+
+        if (r >= 0 && sd_bus_message_enter_container(reply, 'a', "o") >= 0) {
+            const char *path = NULL;
+            while (g_saved.count < DC_NET_SAVED_MAX &&
+                  sd_bus_message_read_basic(reply, 'o', &path) > 0) {
+                char id[64], type[32], ssid[64];
+                bool autoconnect = true;
+                if (!net_conn_read_settings(path, id, sizeof(id), type, sizeof(type), &autoconnect,
+                                            ssid, sizeof(ssid)))
+                    continue;
+                if (strcmp(type, "802-11-wireless") != 0)
+                    continue;
+
+                dc_net_saved_net *s = &g_saved.items[g_saved.count++];
+                snprintf(s->path, sizeof(s->path), "%s", path);
+                snprintf(s->id, sizeof(s->id), "%s", id);
+                snprintf(s->ssid, sizeof(s->ssid), "%s", ssid);
+                s->autoconnect = autoconnect;
+            }
+            sd_bus_message_exit_container(reply);
+        }
+        sd_bus_message_unref(reply);
+    }
+
+    int n = g_saved.count < max ? g_saved.count : max;
+    if (n > 0 && out)
+        memcpy(out, g_saved.items, (size_t)n * sizeof(*out));
+    return n;
+}
+
+bool dc_net_saved_forget(const char *path)
+{
+    if (!path || !path[0] || !g_net_bus)
+        return false;
+
+    if (net_dryrun()) {
+        dc_info("net: [DANKC_NET_DRYRUN] would call %s %s %s.Delete()", DC_NM_DEST, path,
+                DC_NM_SETTINGS_CONN_IFACE);
+        return true;
+    }
+
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = NULL;
+    int r = sd_bus_call_method(g_net_bus, DC_NM_DEST, path, DC_NM_SETTINGS_CONN_IFACE, "Delete",
+                               &err, &reply, "");
+    if (r < 0)
+        dc_warn("net: Settings.Connection.Delete failed for %s: %s", path,
+                err.message ? err.message : strerror(-r));
+    sd_bus_error_free(&err);
+    sd_bus_message_unref(reply);
+    return r >= 0;
+}
+
+bool dc_net_saved_set_autoconnect(const char *path, bool enable)
+{
+    if (!path || !path[0] || !g_net_bus)
+        return false;
+
+    if (net_dryrun()) {
+        dc_info("net: [DANKC_NET_DRYRUN] would call %s %s %s.Update() with "
+                "connection.autoconnect=%s (all other settings preserved verbatim)",
+                DC_NM_DEST, path, DC_NM_SETTINGS_CONN_IFACE, enable ? "true" : "false");
+        return true;
+    }
+
+    sd_bus_error gerr = SD_BUS_ERROR_NULL;
+    sd_bus_message *greply = NULL;
+    int r = sd_bus_call_method(g_net_bus, DC_NM_DEST, path, DC_NM_SETTINGS_CONN_IFACE, "GetSettings",
+                               &gerr, &greply, "");
+    sd_bus_error_free(&gerr);
+    if (r < 0)
+        return false;
+
+    sd_bus_message *m = NULL;
+    r = sd_bus_message_new_method_call(g_net_bus, &m, DC_NM_DEST, path, DC_NM_SETTINGS_CONN_IFACE,
+                                       "Update");
+    if (r < 0) {
+        sd_bus_message_unref(greply);
+        return false;
+    }
+
+    bool ok = true;
+    if (sd_bus_message_enter_container(greply, 'a', "{sa{sv}}") > 0) {
+        sd_bus_message_open_container(m, 'a', "{sa{sv}}");
+
+        while (sd_bus_message_enter_container(greply, 'e', "sa{sv}") > 0) {
+            const char *group = NULL;
+            sd_bus_message_read_basic(greply, 's', &group);
+            bool is_conn = group && strcmp(group, "connection") == 0;
+
+            sd_bus_message_open_container(m, 'e', "sa{sv}");
+            sd_bus_message_append(m, "s", group);
+            sd_bus_message_open_container(m, 'a', "{sv}");
+
+            bool saw_autoconnect = false;
+            if (sd_bus_message_enter_container(greply, 'a', "{sv}") > 0) {
+                while (sd_bus_message_enter_container(greply, 'e', "sv") > 0) {
+                    const char *key = NULL;
+                    sd_bus_message_read_basic(greply, 's', &key);
+                    if (is_conn && key && strcmp(key, "autoconnect") == 0) {
+                        saw_autoconnect = true;
+                        sd_bus_message_skip(greply, "v"); /* discard the old value */
+                        sd_bus_message_open_container(m, 'e', "sv");
+                        sd_bus_message_append(m, "s", "autoconnect");
+                        sd_bus_message_open_container(m, 'v', "b");
+                        sd_bus_message_append(m, "b", enable ? 1 : 0);
+                        sd_bus_message_close_container(m);
+                        sd_bus_message_close_container(m);
+                    } else {
+                        sd_bus_message_open_container(m, 'e', "sv");
+                        sd_bus_message_append(m, "s", key);
+                        if (net_copy_value(m, greply) < 0)
+                            ok = false;
+                        sd_bus_message_close_container(m);
+                    }
+                    sd_bus_message_exit_container(greply); /* e sv */
+                }
+                sd_bus_message_exit_container(greply); /* a{sv} */
+            }
+
+            /* NM omits the "autoconnect" key entirely when it's at its
+             * default (true) -- add it explicitly if this connection didn't
+             * have it and it's being set to something (still just `enable`,
+             * writing true here is a no-op vs. NM's own default but keeps
+             * the round trip simple and explicit). */
+            if (is_conn && !saw_autoconnect) {
+                sd_bus_message_open_container(m, 'e', "sv");
+                sd_bus_message_append(m, "s", "autoconnect");
+                sd_bus_message_open_container(m, 'v', "b");
+                sd_bus_message_append(m, "b", enable ? 1 : 0);
+                sd_bus_message_close_container(m);
+                sd_bus_message_close_container(m);
+            }
+
+            sd_bus_message_close_container(m); /* a{sv} */
+            sd_bus_message_close_container(m); /* e sa{sv} */
+            sd_bus_message_exit_container(greply); /* e sa{sv} */
+        }
+
+        sd_bus_message_close_container(m); /* a{sa{sv}} */
+        sd_bus_message_exit_container(greply); /* a{sa{sv}} */
+    }
+    sd_bus_message_unref(greply);
+
+    if (!ok) {
+        sd_bus_message_unref(m);
+        return false;
+    }
+
+    sd_bus_error uerr = SD_BUS_ERROR_NULL;
+    sd_bus_message *ureply = NULL;
+    r = sd_bus_call(g_net_bus, m, 0, &uerr, &ureply);
+    sd_bus_message_unref(m);
+    if (r < 0)
+        dc_warn("net: Settings.Connection.Update (autoconnect) failed for %s: %s", path,
+                uerr.message ? uerr.message : strerror(-r));
+    sd_bus_error_free(&uerr);
+    sd_bus_message_unref(ureply);
+    return r >= 0;
+}
+
+const dc_net_saved_net *dc_net_saved_find_by_ssid(const char *ssid)
+{
+    if (!ssid || !ssid[0])
+        return NULL;
+    for (int i = 0; i < g_saved.count; i++)
+        if (strcmp(g_saved.items[i].ssid, ssid) == 0)
+            return &g_saved.items[i];
+    return NULL;
+}
+
