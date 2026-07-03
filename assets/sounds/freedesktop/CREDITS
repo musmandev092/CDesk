@@ -1,0 +1,14 @@
+Vendored from the freedesktop.org "sound-theme-freedesktop" project
+(https://framagit.org/GNOME/sound-theme-freedesktop), the same two files DMS
+ships as its own fallback theme -- kept here only as a last-resort default
+when the system doesn't have sound-theme-freedesktop installed (see
+src/services/sound.c's resolve_sound_file(), which always prefers
+/usr/share/sounds/freedesktop first).
+
+message.oga
+        Copyright: Ivica Bukvic
+        URL: http://gnome-look.org/content/show.php/%22Borealis%22+sound+theme?content=12584
+        License: CC-BY-SA
+
+message-new-instant.oga
+        License: sound-theme-freedesktop project (see upstream CREDITS)

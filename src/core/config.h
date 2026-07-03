@@ -69,6 +69,16 @@ typedef struct dc_config {
     int notif_timeout_critical_sec;
     bool dnd_enabled;
 
+    /* Notification sounds (docs/14-COMPLETION-PLAN.md W1.3, services/sound.c):
+     * master switch + per-event toggle + linear volume, matching DMS's
+     * SettingsData.soundsEnabled/soundNewNotification (SoundsTab.qml). Both
+     * default on, matching DMS. dnd_enabled above also suppresses sound
+     * (docs/14 explicitly asks for this; DMS itself only gates the toast, not
+     * the sound -- see sound.h's dc_sound_notify() comment). */
+    bool sounds_enabled;
+    bool notif_sound_enabled;
+    float sound_volume;
+
     /* launcher (docs/08-SETTINGS-UI.md DOCK & LAUNCHER): default view mode
      * used when the launcher (re)opens -- list (false) or grid (true). */
     bool launcher_grid_view;

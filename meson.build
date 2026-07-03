@@ -96,6 +96,7 @@ src = files(
   'src/services/clipboard.c', 'src/services/tray.c', 'src/services/auth.c', 'src/services/logind.c',
   'src/services/weather.c', 'src/services/sysmon.c', 'src/services/power.c',
   'src/services/autostart.c',
+  'src/services/sound.c',
   'src/niri/niri.c',
   'src/theme/theme.c',
   'src/ipc/control.c',
@@ -124,3 +125,10 @@ install_data('assets/fonts/InterVariable.ttf',
              'assets/fonts/MaterialSymbolsRounded.subset.ttf',
              'assets/fonts/NotoEmoji-Regular.ttf',
              install_dir: get_option('datadir') / 'dankc/fonts')
+
+# docs/14-COMPLETION-PLAN.md W1.3: vendored freedesktop notification sounds,
+# used only when no system sound-theme provides them (services/sound.c
+# resolve_sound_file() tries /usr/share/sounds/freedesktop first).
+install_data('assets/sounds/freedesktop/message.oga',
+             'assets/sounds/freedesktop/message-new-instant.oga',
+             install_dir: get_option('datadir') / 'dankc/sounds/freedesktop')

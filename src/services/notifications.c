@@ -3,6 +3,7 @@
 #include "core/config.h"
 #include "core/log.h"
 #include "services/dbus.h"
+#include "services/sound.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -424,6 +425,11 @@ static int method_notify(sd_bus_message *msg, void *userdata, sd_bus_error *err)
     dc_info("notify #%u [%s] %s (%d action%s%s)", id, slot->app_name, slot->summary, action_count,
             action_count == 1 ? "" : "s", decoded_pixels ? ", image" : "");
     n->has_unread = true;
+    /* docs/14-COMPLETION-PLAN.md W1.3: play a sound on arrival, gated by
+     * config (sounds_enabled/notif_sound_enabled/dnd_enabled) and
+     * self-debounced -- see services/sound.c. Fires for every arrival
+     * including replaces, matching DMS's onNotification. */
+    dc_sound_notify(urgency);
     notify_changed(n);
 
     return sd_bus_reply_method_return(msg, "u", id);
