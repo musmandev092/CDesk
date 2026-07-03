@@ -95,6 +95,7 @@ src = files(
   'src/services/icons.c', 'src/services/apps.c', 'src/services/notifications.c',
   'src/services/clipboard.c', 'src/services/tray.c', 'src/services/auth.c', 'src/services/logind.c',
   'src/services/weather.c', 'src/services/sysmon.c', 'src/services/power.c',
+  'src/services/autostart.c',
   'src/niri/niri.c',
   'src/theme/theme.c',
   'src/ipc/control.c',

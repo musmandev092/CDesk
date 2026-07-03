@@ -15,6 +15,7 @@
 #include "services/clipboard.h"
 #include "services/dbus.h"
 #include "services/audio.h"
+#include "services/autostart.h"
 #include "services/logind.h"
 #include "services/mpris.h"
 #include "services/notifications.h"
@@ -833,6 +834,12 @@ int main(int argc, char **argv)
     dc_power_init(dbus);
     dc_notifications *notifications = dc_notifications_create(dbus);
     dc_tray *tray = dc_tray_create(dbus);
+
+    /* XDG session autostart (docs/14-COMPLETION-PLAN.md W1.2): one-shot scan
+     * + detached spawn of ~/.config/autostart + /etc/xdg/autostart entries.
+     * Runs exactly once here, after Wayland + niri IPC are up, never from a
+     * render/tick path. */
+    dc_autostart_run();
 
     /* Bar weather widget (docs/12-BAR-SPEC.md sec.4): only arm the fetch loop
      * when enabled — dc_weather_get() just reports "no reading yet" (widget

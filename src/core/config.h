@@ -101,6 +101,15 @@ typedef struct dc_config {
      * ui/material_bg.c). Falls back to the flat fill when disabled or when
      * no wallpaper is configured/readable. */
     bool material_blur;
+
+    /* XDG autostart (docs/14-COMPLETION-PLAN.md W1.2, services/autostart.c):
+     * master switch for launching ~/.config/autostart + /etc/xdg/autostart
+     * entries at session start. DMS has no equivalent setting (it never
+     * spawns autostart entries itself, only manages the directory via
+     * AutoStartTab.qml) -- default true here since dankc is acting as the
+     * whole session/DE and a fresh install should behave like any other DE
+     * out of the box. */
+    bool autostart_enabled;
 } dc_config;
 
 /* The active config. Read-only for the rest of the app. */
