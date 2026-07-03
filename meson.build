@@ -24,9 +24,18 @@ libsystemd     = dependency('libsystemd')          # sd-bus (swap for elogind/ba
 pam            = cc.find_library('pam')             # lock-screen authentication
 m_dep          = cc.find_library('m', required: false)
 fontconfig     = dependency('fontconfig')          # non-Latin fallback font lookup (render/nvg.c)
+harfbuzz       = dependency('harfbuzz')            # complex text shaping, Arabic/Urdu joining (render/shape.c)
+# FriBidi (real UAX#9 BiDi reordering) is optional: if absent, render/shape.c
+# falls back to its documented "UBA-lite" approximation (contiguous RTL
+# segments reversed, numbers kept LTR) instead of failing the build.
+fribidi        = dependency('fribidi', required: false)
 # Protocol XML is vendored under protocol/; only wayland-scanner is needed.
 
-deps = [wayland_client, wayland_egl, egl, glesv2, xkbcommon, libsystemd, pam, m_dep, fontconfig]
+deps = [wayland_client, wayland_egl, egl, glesv2, xkbcommon, libsystemd, pam, m_dep, fontconfig, harfbuzz]
+if fribidi.found()
+  deps += fribidi
+  add_project_arguments('-DDC_HAVE_FRIBIDI=1', language: 'c')
+endif
 
 # --- wayland protocol generation -----------------------------------------
 wayland_scanner = find_program('wayland-scanner')
@@ -72,7 +81,7 @@ src = files(
   'src/core/log.c', 'src/core/loop.c', 'src/core/config.c', 'src/core/dms_import.c',
   'src/core/anim.c',
   'src/wayland/wl.c', 'src/wayland/egl.c',
-  'src/render/nvg.c',
+  'src/render/nvg.c', 'src/render/shape.c',
   'src/ui/bar/bar.c',
   'src/ui/popout.c', 'src/ui/hover.c',
   'src/ui/controlcenter.c', 'src/ui/battery_popout.c', 'src/ui/osd.c', 'src/ui/toasts.c',

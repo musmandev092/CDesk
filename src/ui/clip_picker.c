@@ -6,6 +6,7 @@
 #include "dc.h"
 #include "render/icons.h"
 #include "render/nvg.h"
+#include "render/shape.h"
 #include "services/clipboard.h"
 #include "theme/theme.h"
 #include "ui/hover.h"
@@ -588,7 +589,7 @@ static void draw_row(dc_clip_picker *p, const dc_clip_entry *e, int display_inde
     nvgFontSize(vg, 13.0f);
     nvgFillColor(vg, tc(t->surface_text));
     nvgTextLineHeight(vg, 1.2f);
-    nvgTextBox(vg, text_x, y + 27.0f, text_w, body, NULL);
+    dc_shape_draw_textbox(p->render, text_x, y + 27.0f, text_w, body, NULL);
 
     nvgRestore(vg);
 }
@@ -773,7 +774,7 @@ static void cp_render(dc_clip_picker *p)
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
     if (p->query[0]) {
         nvgFillColor(vg, tc(t->surface_text));
-        nvgText(vg, sx, scy, p->query, NULL);
+        dc_shape_draw_text(p->render, sx, scy, p->query, NULL);
     } else {
         nvgFillColor(vg, tc_alpha(t->surface_text, 110));
         nvgText(vg, sx, scy, "Search clipboard\xe2\x80\xa6", NULL);

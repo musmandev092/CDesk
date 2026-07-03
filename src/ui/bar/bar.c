@@ -7,6 +7,7 @@
 #include "niri/niri.h"
 #include "render/icons.h"
 #include "render/nvg.h"
+#include "render/shape.h"
 #include "services/audio.h"
 #include "services/battery.h"
 #include "services/bluez.h"
@@ -707,30 +708,21 @@ static void bar_truncate_bytes(char *s, size_t max_bytes)
  * clipping"). No-op if it already fits. `tmp` is sized identically to `buf`
  * (not just bufsize+headroom) so the compiler can prove the final copy never
  * truncates, rather than tripping -Wformat-truncation. */
-static void bar_ellipsize(NVGcontext *vg, char buf[DC_NIRI_TITLE_MAX], float max_w)
+/* Delegates to render/shape.c's dc_shape_ellipsize(), which goes through the
+ * BiDi+HarfBuzz shaped measurement path for Arabic/Urdu/Hebrew text (so an
+ * RTL title truncates and gets its ellipsis on the visually correct side)
+ * and falls back to the identical plain-nvgTextBounds algorithm this
+ * function used to implement inline for everything else — zero behavior
+ * change for Latin titles. `render` (not just `vg`) is needed so the shaped
+ * path can pick a font per codepoint the same way nvg's own fallback chain
+ * would. Reads and writes the same `buf` safely because dc_shape_ellipsize()
+ * only ever reads its `text` argument into a *separate* scratch buffer
+ * before writing `out` — see its own doc comment. */
+static void bar_ellipsize(dc_render *render, char buf[DC_NIRI_TITLE_MAX], float max_w)
 {
-    float bounds[4];
-    nvgTextBounds(vg, 0.0f, 0.0f, buf, NULL, bounds);
-    if (bounds[2] - bounds[0] <= max_w)
-        return;
-
-    size_t len = strlen(buf);
-    if (len > DC_NIRI_TITLE_MAX - 4)
-        len = DC_NIRI_TITLE_MAX - 4; /* leave room for the 3-byte ellipsis + NUL */
-
     char tmp[DC_NIRI_TITLE_MAX];
-    while (len > 0) {
-        len--;
-        while (len > 0 && ((unsigned char)buf[len] & 0xC0) == 0x80)
-            len--; /* don't split a multi-byte UTF-8 codepoint */
-        snprintf(tmp, sizeof(tmp), "%.*s\xe2\x80\xa6", (int)len, buf);
-        nvgTextBounds(vg, 0.0f, 0.0f, tmp, NULL, bounds);
-        if (bounds[2] - bounds[0] <= max_w || len == 0) {
-            memcpy(buf, tmp, sizeof(tmp));
-            return;
-        }
-    }
-    snprintf(buf, DC_NIRI_TITLE_MAX, "\xe2\x80\xa6");
+    dc_shape_ellipsize(render, buf, max_w, tmp, sizeof(tmp));
+    memcpy(buf, tmp, sizeof(tmp));
 }
 
 /* "AppName • Title", text-only (no app icon in the horizontal bar — DMS's
@@ -799,7 +791,7 @@ static float layout_focused_window(dc_bar *bar, float x0, bool draw)
     float bounds[4];
     float app_w = 0.0f, sep_w = 0.0f;
     if (app_name[0]) {
-        nvgTextBounds(vg, 0.0f, 0.0f, app_name, NULL, bounds);
+        dc_shape_text_bounds(bar->render, 0.0f, 0.0f, app_name, NULL, bounds);
         app_w = bounds[2] - bounds[0];
     }
     if (have_both) {
@@ -812,11 +804,11 @@ static float layout_focused_window(dc_bar *bar, float x0, bool draw)
     if (title_avail < 20.0f)
         title_avail = 20.0f;
     if (title[0])
-        bar_ellipsize(vg, title, title_avail);
+        bar_ellipsize(bar->render, title, title_avail);
 
     float title_w = 0.0f;
     if (title[0]) {
-        nvgTextBounds(vg, 0.0f, 0.0f, title, NULL, bounds);
+        dc_shape_text_bounds(bar->render, 0.0f, 0.0f, title, NULL, bounds);
         title_w = bounds[2] - bounds[0];
     }
 
@@ -829,7 +821,7 @@ static float layout_focused_window(dc_bar *bar, float x0, bool draw)
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         if (app_name[0]) {
             nvgFillColor(vg, tc(t->surface_text));
-            nvgText(vg, x, cy, app_name, NULL);
+            dc_shape_draw_text(bar->render, x, cy, app_name, NULL);
             x += app_w;
         }
         if (have_both) {
@@ -840,7 +832,7 @@ static float layout_focused_window(dc_bar *bar, float x0, bool draw)
         }
         if (title[0]) {
             nvgFillColor(vg, tc(t->surface_text));
-            nvgText(vg, x, cy, title, NULL);
+            dc_shape_draw_text(bar->render, x, cy, title, NULL);
         }
     }
     return total;
@@ -1084,7 +1076,7 @@ static float layout_media(dc_bar *bar, float x0, bool draw)
     nvgFontFaceId(vg, bar->render->font_ui);
     nvgFontSize(vg, DC_BAR_TEXT_SIZE);
     float bounds[4];
-    nvgTextBounds(vg, 0.0f, 0.0f, label, NULL, bounds);
+    dc_shape_text_bounds(bar->render, 0.0f, 0.0f, label, NULL, bounds);
     float raw_w = bounds[2] - bounds[0];
 
     /* DMS: needsScrolling = implicitWidth > textContainer.width — the
@@ -1110,8 +1102,8 @@ static float layout_media(dc_bar *bar, float x0, bool draw)
         if (draw)
             bar_reset_marquee(bar);
         if (overflow)
-            bar_ellipsize(vg, label, text_max);
-        nvgTextBounds(vg, 0.0f, 0.0f, label, NULL, bounds);
+            bar_ellipsize(bar->render, label, text_max);
+        dc_shape_text_bounds(bar->render, 0.0f, 0.0f, label, NULL, bounds);
         label_w = bounds[2] - bounds[0];
     }
 
@@ -1136,10 +1128,10 @@ static float layout_media(dc_bar *bar, float x0, bool draw)
              * line. */
             nvgSave(vg);
             nvgScissor(vg, x, cy - DC_BAR_TEXT_SIZE, label_w, DC_BAR_TEXT_SIZE * 2.0f);
-            nvgText(vg, x - marquee_offset, cy, label, NULL);
+            dc_shape_draw_text(bar->render, x - marquee_offset, cy, label, NULL);
             nvgRestore(vg);
         } else {
-            nvgText(vg, x, cy, label, NULL);
+            dc_shape_draw_text(bar->render, x, cy, label, NULL);
         }
     }
     x += label_w + gap;

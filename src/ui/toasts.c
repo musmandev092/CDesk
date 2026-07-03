@@ -5,6 +5,7 @@
 #include "dc.h"
 #include "render/icons.h"
 #include "render/nvg.h"
+#include "render/shape.h"
 #include "services/notifications.h"
 #include "theme/theme.h"
 #include "ui/notif_image.h"
@@ -183,10 +184,11 @@ static void draw_card(dc_toasts *t, const dc_notification *n, float x, float y, 
     const float tx = av_cx + av_r + 14.0f;
     const float tw = x + w - tx - 14.0f;
 
+    nvgFontFaceId(vg, t->render->font_ui);
     nvgFontSize(vg, 12.0f);
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_TOP);
     nvgFillColor(vg, nvgRGBA(th->primary.r, th->primary.g, th->primary.b, 255));
-    nvgText(vg, tx, y + 14.0f, n->app_name, NULL);
+    dc_shape_draw_text(t->render, tx, y + 14.0f, n->app_name, NULL);
 
     nvgFontSize(vg, 14.0f);
     nvgFillColor(vg, nvgRGBA(th->surface_text.r, th->surface_text.g, th->surface_text.b, 255));
@@ -194,7 +196,7 @@ static void draw_card(dc_toasts *t, const dc_notification *n, float x, float y, 
     /* Single-line summary, ellipsised by clipping. */
     nvgSave(vg);
     nvgScissor(vg, tx, y + 30.0f, tw, 18.0f);
-    nvgText(vg, tx, y + 31.0f, n->summary, NULL);
+    dc_shape_draw_text(t->render, tx, y + 31.0f, n->summary, NULL);
     nvgRestore(vg);
 
     /* Body text yields its bottom rows to a pill-button row when the
@@ -208,7 +210,7 @@ static void draw_card(dc_toasts *t, const dc_notification *n, float x, float y, 
         nvgSave(vg);
         nvgScissor(vg, tx, y + 50.0f, tw, body_h);
         nvgTextLineHeight(vg, 1.1f);
-        nvgTextBox(vg, tx, y + 51.0f, tw, n->body, NULL);
+        dc_shape_draw_textbox(t->render, tx, y + 51.0f, tw, n->body, NULL);
         nvgRestore(vg);
     }
 

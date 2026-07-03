@@ -61,10 +61,16 @@ static const char *const ICON_FONT_CANDIDATES[] = {
 #define COV_MAX_CP 0x110000u
 #define COV_BYTES (COV_MAX_CP / 8) /* 136 KiB */
 
-typedef struct {
+/* Definition of the opaque dc_font_coverage forward-declared in nvg.h — kept
+ * alive (not freed after the startup merge into g_cov) so
+ * dc_render_font_for_codepoint() can answer per-font "does THIS specific
+ * font cover this codepoint" queries later, for render/shape.c's HarfBuzz
+ * font selection. */
+struct dc_font_coverage {
     unsigned char bits[COV_BYTES];
     bool valid;
-} font_coverage;
+};
+typedef struct dc_font_coverage font_coverage;
 
 /* Union of every successfully parsed loaded font. `ui_valid` records whether
  * the primary UI font's cmap parsed: if it didn't, dc_render_font_has() fails
@@ -279,7 +285,9 @@ typedef struct {
 
 static const fallback_spec FALLBACK_SPECS[] = {
     {"sans", 0x0410, NULL},          /* general: Cyrillic/Greek/... (Noto Sans) */
-    {"sans:lang=ar", 0x0627, NULL},  /* Arabic/Urdu (existing behavior) */
+    {"sans:lang=ur", 0x06C1, "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf"},
+    /* lang=ur (probe: heh-goal) — lang=ar can resolve to DejaVu, which lacks
+     * the Urdu-only letters (U+06C1/U+06D2); Urdu coverage implies Arabic. */
     {":lang=zh-cn", 0x4F60, "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"},
     {":lang=ja", 0x3053, "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"},
     {":lang=ko", 0xC548, "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"},
@@ -352,7 +360,12 @@ static bool add_fallback_font(dc_render *render, const char *path, uint32_t prob
     }
 
     cov_merge(cov);
-    free(cov);
+    /* Retained (not freed): render/shape.c's dc_render_font_for_codepoint()
+     * needs per-font coverage, not just the merged union, to pick which
+     * fallback font to hand HarfBuzz for a given run. */
+    int idx = render->font_fallback_count;
+    render->font_fallback_cov[idx] = cov;
+    snprintf(render->font_fallback_paths[idx], sizeof(render->font_fallback_paths[idx]), "%s", path);
     render->font_fallbacks[render->font_fallback_count++] = fb;
     snprintf(loaded[(*n_loaded)++], 256, "%s", path);
     dc_info("fallback font %d: %s", render->font_fallback_count, path);
@@ -464,6 +477,8 @@ bool dc_render_ensure(dc_render *render)
         render->vg = NULL;
         return false;
     }
+    render->font_ui_path[0] = '\0';
+    render->font_ui_cov = NULL;
     if (ui_path) {
         font_coverage *cov = malloc(sizeof(*cov));
         if (cov) {
@@ -471,8 +486,13 @@ bool dc_render_ensure(dc_render *render)
             if (cov->valid) {
                 cov_merge(cov);
                 g_cov.ui_valid = true;
+                /* Retained (not freed) for dc_render_font_for_codepoint() —
+                 * see the matching comment in add_fallback_font(). */
+                render->font_ui_cov = cov;
+                snprintf(render->font_ui_path, sizeof(render->font_ui_path), "%s", ui_path);
+            } else {
+                free(cov);
             }
-            free(cov);
         }
     }
     if (!g_cov.ui_valid)
@@ -488,6 +508,7 @@ bool dc_render_ensure(dc_render *render)
      * lacks — Inter's own Latin glyphs are always used first, so this can't
      * change how Latin text renders. */
     render->font_fallback_count = 0;
+    memset(render->font_fallback_cov, 0, sizeof(render->font_fallback_cov));
     load_fallback_fonts(render);
 
     render->ready = true;
@@ -563,6 +584,29 @@ void dc_render_finish(dc_render *render)
         nvgDeleteGLES3(render->vg);
     render->vg = NULL;
     render->ready = false;
+    free(render->font_ui_cov);
+    render->font_ui_cov = NULL;
+    for (int i = 0; i < render->font_fallback_count; i++) {
+        free(render->font_fallback_cov[i]);
+        render->font_fallback_cov[i] = NULL;
+    }
     render->font_fallback_count = 0;
     memset(&g_cov, 0, sizeof(g_cov));
+}
+
+int dc_render_font_for_codepoint(dc_render *render, uint32_t codepoint, const char **out_path)
+{
+    if (render->font_ui_cov && cov_get(render->font_ui_cov, codepoint)) {
+        if (out_path)
+            *out_path = render->font_ui_path;
+        return render->font_ui;
+    }
+    for (int i = 0; i < render->font_fallback_count; i++) {
+        if (render->font_fallback_cov[i] && cov_get(render->font_fallback_cov[i], codepoint)) {
+            if (out_path)
+                *out_path = render->font_fallback_paths[i];
+            return render->font_fallbacks[i];
+        }
+    }
+    return -1;
 }

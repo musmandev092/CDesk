@@ -6,6 +6,7 @@
 #include "dc.h"
 #include "render/icons.h"
 #include "render/nvg.h"
+#include "render/shape.h"
 #include "services/audio.h"
 #include "services/bluez.h"
 #include "services/mpris.h"
@@ -568,39 +569,18 @@ static int load_face_image(dc_render *r, int size)
     return dc_render_load_icon(r, path, size);
 }
 
-/* Truncate `buf` on a UTF-8 codepoint boundary and append an ellipsis until it
- * fits within `max_w` px at the vg context's current font -- a local
- * equivalent of bar.c's bar_ellipsize(), generalized to an arbitrary buffer
- * size since it's used for device names/SSIDs here rather than one fixed
- * title buffer. No-op if `buf` already fits. */
-static void cc_ellipsize(NVGcontext *vg, char *buf, size_t bufsize, float max_w)
+/* Truncate `buf` and append an ellipsis until it fits within `max_w` px --
+ * delegates to render/shape.c's dc_shape_ellipsize() (BiDi+HarfBuzz-aware for
+ * Arabic/Urdu/Hebrew device names/SSIDs, identical plain-nanovg behavior for
+ * everything else) the same way bar.c's bar_ellipsize() does. No-op if `buf`
+ * already fits. */
+static void cc_ellipsize(dc_render *render, char *buf, size_t bufsize, float max_w)
 {
-    float bounds[4];
-    nvgTextBounds(vg, 0.0f, 0.0f, buf, NULL, bounds);
-    if (bounds[2] - bounds[0] <= max_w)
-        return;
-
-    size_t len = strlen(buf);
-    if (bufsize < 4)
-        return;
     char tmp[96];
     if (bufsize > sizeof(tmp))
         bufsize = sizeof(tmp);
-    if (len > bufsize - 4)
-        len = bufsize - 4; /* leave room for the 3-byte ellipsis + NUL */
-
-    while (len > 0) {
-        len--;
-        while (len > 0 && ((unsigned char)buf[len] & 0xC0) == 0x80)
-            len--; /* don't split a multi-byte UTF-8 codepoint */
-        snprintf(tmp, bufsize, "%.*s\xe2\x80\xa6", (int)len, buf);
-        nvgTextBounds(vg, 0.0f, 0.0f, tmp, NULL, bounds);
-        if (bounds[2] - bounds[0] <= max_w || len == 0) {
-            memcpy(buf, tmp, bufsize);
-            return;
-        }
-    }
-    snprintf(buf, bufsize, "\xe2\x80\xa6");
+    dc_shape_ellipsize(render, buf, max_w, tmp, bufsize);
+    memcpy(buf, tmp, bufsize);
 }
 
 /* Mirrors services/audio.c's dc_audio_read() for the default *source* (mic):
@@ -787,18 +767,18 @@ static void draw_pill_tile(dc_render *r, float x, float y, float w, float h, int
     snprintf(title_buf, sizeof(title_buf), "%s", title);
     nvgFontFaceId(vg, r->font_ui);
     nvgFontSize(vg, 14.0f);
-    cc_ellipsize(vg, title_buf, sizeof(title_buf), text_w);
+    cc_ellipsize(r, title_buf, sizeof(title_buf), text_w);
     nvgFillColor(vg, tc(t->surface_text));
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
-    nvgText(vg, text_x, y + h / 2.0f - 9.0f, title_buf, NULL);
+    dc_shape_draw_text(r, text_x, y + h / 2.0f - 9.0f, title_buf, NULL);
 
     if (subtitle && subtitle[0]) {
         char sub_buf[64];
         snprintf(sub_buf, sizeof(sub_buf), "%s", subtitle);
         nvgFontSize(vg, DC_BAR_TEXT_SIZE);
-        cc_ellipsize(vg, sub_buf, sizeof(sub_buf), text_w);
+        cc_ellipsize(r, sub_buf, sizeof(sub_buf), text_w);
         nvgFillColor(vg, tc(t->surface_variant_text));
-        nvgText(vg, text_x, y + h / 2.0f + 9.0f, sub_buf, NULL);
+        dc_shape_draw_text(r, text_x, y + h / 2.0f + 9.0f, sub_buf, NULL);
     }
 }
 
@@ -898,10 +878,10 @@ static void draw_expand_row(dc_render *r, float x, float y, float w, float h, in
     char title_buf[96];
     snprintf(title_buf, sizeof(title_buf), "%s", title ? title : "");
     nvgFontSize(vg, 13.0f);
-    cc_ellipsize(vg, title_buf, sizeof(title_buf), w - 30.0f - status_w);
+    cc_ellipsize(r, title_buf, sizeof(title_buf), w - 30.0f - status_w);
     nvgFillColor(vg, tc(t->surface_text));
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
-    nvgText(vg, x + 30.0f, y + h / 2.0f, title_buf, NULL);
+    dc_shape_draw_text(r, x + 30.0f, y + h / 2.0f, title_buf, NULL);
 
     if (status_buf[0]) {
         nvgFontSize(vg, 12.0f);
@@ -933,18 +913,18 @@ static void draw_media_row(dc_render *r, const cc_layout *l, const dc_mpris_info
     snprintf(title, sizeof(title), "%s", mp->title[0] ? mp->title : "Not playing");
     nvgFontFaceId(vg, r->font_ui);
     nvgFontSize(vg, 13.0f);
-    cc_ellipsize(vg, title, sizeof(title), l->media_text_w);
+    cc_ellipsize(r, title, sizeof(title), l->media_text_w);
     nvgFillColor(vg, tc(t->surface_text));
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
-    nvgText(vg, l->media_text_x, l->media_art_cy - 9.0f, title, NULL);
+    dc_shape_draw_text(r, l->media_text_x, l->media_art_cy - 9.0f, title, NULL);
 
     if (mp->artist[0]) {
         char artist[sizeof(mp->artist)];
         snprintf(artist, sizeof(artist), "%s", mp->artist);
         nvgFontSize(vg, DC_BAR_TEXT_SIZE);
-        cc_ellipsize(vg, artist, sizeof(artist), l->media_text_w);
+        cc_ellipsize(r, artist, sizeof(artist), l->media_text_w);
         nvgFillColor(vg, tc(t->primary));
-        nvgText(vg, l->media_text_x, l->media_art_cy + 9.0f, artist, NULL);
+        dc_shape_draw_text(r, l->media_text_x, l->media_art_cy + 9.0f, artist, NULL);
     }
 
     dc_render_icon(r, DC_ICON_SKIP_PREVIOUS, l->media_btn_cx[0], l->media_btn_cy, 16.0f,

@@ -131,6 +131,36 @@ void fonsVertMetrics(FONScontext* s, float* ascender, float* descender, float* l
 int fonsTextIterInit(FONScontext* stash, FONStextIter* iter, float x, float y, const char* str, const char* end, int bitmapOption);
 int fonsTextIterNext(FONScontext* stash, FONStextIter* iter, struct FONSquad* quad);
 
+// --- dankc patch: pre-shaped glyph rendering ---------------------------
+// The codepoint-driven API above (fonsTextIterInit/Next, fonsAddFont's own
+// cmap lookup) can't render text an external shaper (e.g. HarfBuzz) has
+// already turned into a sequence of (glyph index, pen position) pairs —
+// glyph indices are meaningless as Unicode codepoints, and re-deriving them
+// via the font's cmap would undo the shaper's contextual substitution
+// (Arabic joining forms, ligatures, ...). fonsGetGlyphQuadByIndex() renders
+// ONE glyph, addressed by index instead of codepoint, at an exact caller-
+// supplied pen position (no fontstash-side kerning/advance is applied — the
+// shaper already computed that). It shares the same glyph cache/atlas as
+// the codepoint path (fons__getGlyph): raw glyph-index lookups are tagged
+// with bit 31 of the cache key so they can never collide with a real
+// codepoint (all valid Unicode is <= 0x10FFFF). See dankc's
+// src/render/shape.c (HarfBuzz shaping) and nanovg's nvgTextGlyphs(), the
+// matching patch in nanovg.c/nanovg.h, for the caller side.
+//
+// isize/iblur use fontstash's usual fixed-point convention (isize =
+// size*10; see FONStextIter::isize) so callers can reuse fonsSetSize's
+// output directly. Returns 1 and fills `quad` on success, 0 if the glyph
+// couldn't be produced (e.g. atlas full — caller should fonsExpandAtlas /
+// fonsResetAtlas and retry once, exactly like fonsTextIterNext's callers do).
+int fonsGetGlyphQuadByIndex(FONScontext* stash, int fontId, int gid, short isize, short iblur,
+                            int bitmapOption, float x, float y, struct FONSquad* quad);
+
+// Same vertical-align offset fonsTextIterInit applies internally (see
+// fons__getVertAlign), exposed so nvgTextGlyphs() can match nvgText's
+// vertical alignment without going through the codepoint text iterator.
+float fonsGetVertAlignOffset(FONScontext* stash, int fontId, int align, short isize);
+// -------------------------------------------------------------------------
+
 // Pull texture changes
 const unsigned char* fonsGetTextureData(FONScontext* stash, int* width, int* height);
 int fonsValidateTexture(FONScontext* s, int* dirty);
@@ -1210,6 +1240,161 @@ static FONSglyph* fons__getGlyph(FONScontext* stash, FONSfont* font, unsigned in
 	return glyph;
 }
 
+// --- dankc patch: pre-shaped glyph rendering (see the fonsGetGlyphQuadByIndex
+// declaration above for the rationale). fons__getGlyphByIndex mirrors
+// fons__getGlyph's cache/rasterize logic but is keyed on an explicit glyph
+// index instead of a codepoint->glyph lookup, and — unlike fons__getGlyph —
+// never searches `font->fallbacks`: the caller (render/shape.c) already
+// picked the exact font this glyph index belongs to (glyph indices are only
+// meaningful within the font file they came from), so there is nothing
+// sensible to fall back to here.
+static FONSglyph* fons__getGlyphByIndex(FONScontext* stash, FONSfont* font, int gid,
+										 short isize, short iblur, int bitmapOption)
+{
+	int advance, lsb, x0, y0, x1, y1, gw, gh, gx, gy, x, y;
+	float scale;
+	FONSglyph* glyph = NULL;
+	unsigned int h, key;
+	float size = isize/10.0f;
+	int i, pad, added;
+	unsigned char* bdst;
+	unsigned char* dst;
+
+	if (isize < 2 || gid <= 0) return NULL;
+	if (iblur > 20) iblur = 20;
+	pad = iblur+2;
+
+	stash->nscratch = 0;
+
+	// Real Unicode codepoints are <= 0x10FFFF; tag raw glyph-index cache
+	// entries with bit 31 so this keyspace can never collide with
+	// fons__getGlyph's codepoint keyspace.
+	key = 0x80000000u | (unsigned int)gid;
+
+	h = fons__hashint(key) & (FONS_HASH_LUT_SIZE-1);
+	i = font->lut[h];
+	while (i != -1) {
+		if (font->glyphs[i].codepoint == key && font->glyphs[i].size == isize && font->glyphs[i].blur == iblur) {
+			glyph = &font->glyphs[i];
+			if (bitmapOption == FONS_GLYPH_BITMAP_OPTIONAL || (glyph->x0 >= 0 && glyph->y0 >= 0))
+				return glyph;
+			break;
+		}
+		i = font->glyphs[i].next;
+	}
+
+	scale = fons__tt_getPixelHeightScale(&font->font, size);
+	fons__tt_buildGlyphBitmap(&font->font, gid, size, scale, &advance, &lsb, &x0, &y0, &x1, &y1);
+	gw = x1-x0 + pad*2;
+	gh = y1-y0 + pad*2;
+
+	if (bitmapOption == FONS_GLYPH_BITMAP_REQUIRED) {
+		added = fons__atlasAddRect(stash->atlas, gw, gh, &gx, &gy);
+		if (added == 0 && stash->handleError != NULL) {
+			stash->handleError(stash->errorUptr, FONS_ATLAS_FULL, 0);
+			added = fons__atlasAddRect(stash->atlas, gw, gh, &gx, &gy);
+		}
+		if (added == 0) return NULL;
+	} else {
+		gx = -1;
+		gy = -1;
+	}
+
+	if (glyph == NULL) {
+		glyph = fons__allocGlyph(font);
+		glyph->codepoint = key;
+		glyph->size = isize;
+		glyph->blur = iblur;
+		glyph->next = 0;
+		glyph->next = font->lut[h];
+		font->lut[h] = font->nglyphs-1;
+	}
+	glyph->index = gid;
+	glyph->x0 = (short)gx;
+	glyph->y0 = (short)gy;
+	glyph->x1 = (short)(glyph->x0+gw);
+	glyph->y1 = (short)(glyph->y0+gh);
+	glyph->xadv = (short)(scale * advance * 10.0f);
+	glyph->xoff = (short)(x0 - pad);
+	glyph->yoff = (short)(y0 - pad);
+
+	if (bitmapOption == FONS_GLYPH_BITMAP_OPTIONAL)
+		return glyph;
+
+	dst = &stash->texData[(glyph->x0+pad) + (glyph->y0+pad) * stash->params.width];
+	fons__tt_renderGlyphBitmap(&font->font, dst, gw-pad*2, gh-pad*2, stash->params.width, scale, scale, gid);
+
+	dst = &stash->texData[glyph->x0 + glyph->y0 * stash->params.width];
+	for (y = 0; y < gh; y++) {
+		dst[y*stash->params.width] = 0;
+		dst[gw-1 + y*stash->params.width] = 0;
+	}
+	for (x = 0; x < gw; x++) {
+		dst[x] = 0;
+		dst[x + (gh-1)*stash->params.width] = 0;
+	}
+
+	if (iblur > 0) {
+		stash->nscratch = 0;
+		bdst = &stash->texData[glyph->x0 + glyph->y0 * stash->params.width];
+		fons__blur(stash, bdst, gw, gh, stash->params.width, iblur);
+	}
+
+	stash->dirtyRect[0] = fons__mini(stash->dirtyRect[0], glyph->x0);
+	stash->dirtyRect[1] = fons__mini(stash->dirtyRect[1], glyph->y0);
+	stash->dirtyRect[2] = fons__maxi(stash->dirtyRect[2], glyph->x1);
+	stash->dirtyRect[3] = fons__maxi(stash->dirtyRect[3], glyph->y1);
+
+	return glyph;
+}
+
+// Builds the quad for one glyph at an explicit pen position (x,y) — no
+// kerning/spacing applied, unlike fons__getQuad, since the shaper already
+// computed the correct advance between glyphs.
+static void fons__getQuadByIndex(FONScontext* stash, FONSglyph* glyph, float x, float y, FONSquad* q)
+{
+	float xoff,yoff,x0,y0,x1,y1;
+
+	xoff = (float)(short)(glyph->xoff+1);
+	yoff = (float)(short)(glyph->yoff+1);
+	x0 = (float)(glyph->x0+1);
+	y0 = (float)(glyph->y0+1);
+	x1 = (float)(glyph->x1-1);
+	y1 = (float)(glyph->y1-1);
+
+	if (stash->params.flags & FONS_ZERO_TOPLEFT) {
+		q->x0 = floorf(x + xoff);
+		q->y0 = floorf(y + yoff);
+		q->x1 = q->x0 + x1 - x0;
+		q->y1 = q->y0 + y1 - y0;
+	} else {
+		q->x0 = floorf(x + xoff);
+		q->y0 = floorf(y - yoff);
+		q->x1 = q->x0 + x1 - x0;
+		q->y1 = q->y0 - y1 + y0;
+	}
+	q->s0 = x0 * stash->itw;
+	q->t0 = y0 * stash->ith;
+	q->s1 = x1 * stash->itw;
+	q->t1 = y1 * stash->ith;
+}
+
+int fonsGetGlyphQuadByIndex(FONScontext* stash, int fontId, int gid, short isize, short iblur,
+							int bitmapOption, float x, float y, FONSquad* quad)
+{
+	FONSfont* font;
+	FONSglyph* glyph;
+	if (stash == NULL) return 0;
+	if (fontId < 0 || fontId >= stash->nfonts) return 0;
+	font = stash->fonts[fontId];
+	if (font == NULL || font->data == NULL) return 0;
+	glyph = fons__getGlyphByIndex(stash, font, gid, isize, iblur, bitmapOption);
+	if (glyph == NULL) return 0;
+	fons__getQuadByIndex(stash, glyph, x, y, quad);
+	return 1;
+}
+// -------------------------------------------------------------------------
+
 static void fons__getQuad(FONScontext* stash, FONSfont* font,
 						   int prevGlyphIndex, FONSglyph* glyph,
 						   float scale, float spacing, float* x, float* y, FONSquad* q)
@@ -1317,6 +1502,16 @@ static float fons__getVertAlign(FONScontext* stash, FONSfont* font, int align, s
 		}
 	}
 	return 0.0;
+}
+
+float fonsGetVertAlignOffset(FONScontext* stash, int fontId, int align, short isize)
+{
+	FONSfont* font;
+	if (stash == NULL) return 0.0f;
+	if (fontId < 0 || fontId >= stash->nfonts) return 0.0f;
+	font = stash->fonts[fontId];
+	if (font == NULL) return 0.0f;
+	return fons__getVertAlign(stash, font, align, isize);
 }
 
 float fonsDrawText(FONScontext* stash,

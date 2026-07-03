@@ -6,6 +6,7 @@
 #include "dc.h"
 #include "render/icons.h"
 #include "render/nvg.h"
+#include "render/shape.h"
 #include "services/notifications.h"
 #include "theme/theme.h"
 #include "ui/hover.h"
@@ -173,35 +174,18 @@ static void recompute_physical(dc_notif_center *nc)
     nc->phys_height = (nc->logical_height * nc->scale120 + DC_SCALE_BASE / 2) / DC_SCALE_BASE;
 }
 
-/* Truncate `buf` in place to fit `max_w` at the current font, appending a
- * single-character ellipsis -- same approach as controlcenter.c's
- * cc_ellipsize() (duplicated locally; no shared string-util module yet). */
-static void nc_ellipsize(NVGcontext *vg, char *buf, size_t bufsize, float max_w)
+/* Truncate `buf` in place to fit `max_w`, appending an ellipsis -- delegates
+ * to render/shape.c's dc_shape_ellipsize() (BiDi+HarfBuzz-aware measurement
+ * and truncation for Arabic/Urdu/Hebrew, identical plain-nanovg behavior for
+ * everything else) the same way bar.c's bar_ellipsize() does. Kept as a
+ * thin per-file wrapper (like controlcenter.c's cc_ellipsize()) rather than
+ * factored into a shared helper -- no shared string-util module yet. */
+static void nc_ellipsize(dc_render *render, char *buf, size_t bufsize, float max_w)
 {
-    float bounds[4];
-    nvgTextBounds(vg, 0.0f, 0.0f, buf, NULL, bounds);
-    if (bounds[2] - bounds[0] <= max_w)
-        return;
-
-    size_t len = strlen(buf);
-    if (bufsize < 4)
-        return;
     char tmp[256];
     size_t cap = bufsize > sizeof(tmp) ? sizeof(tmp) : bufsize;
-    if (len > cap - 4)
-        len = cap - 4;
-
-    while (len > 0) {
-        len--;
-        while (len > 0 && ((unsigned char)buf[len] & 0xC0) == 0x80)
-            len--; /* don't split a multi-byte UTF-8 codepoint */
-        snprintf(tmp, cap, "%.*s\xe2\x80\xa6", (int)len, buf);
-        nvgTextBounds(vg, 0.0f, 0.0f, tmp, NULL, bounds);
-        if (bounds[2] - bounds[0] <= max_w || len == 0) {
-            memcpy(buf, tmp, cap);
-            return;
-        }
-    }
+    dc_shape_ellipsize(render, buf, max_w, tmp, cap);
+    memcpy(buf, tmp, cap);
 }
 
 /* "app-name • time" label per docs/13-POPOUTS-SPEC.md sec.3: same calendar
@@ -318,17 +302,17 @@ static void draw_card(dc_notif_center *nc, const dc_notification *n, float x, fl
         snprintf(header_buf, sizeof(header_buf), "%s", time_buf);
     nvgFontFaceId(vg, nc->render->font_ui);
     nvgFontSize(vg, 11.0f);
-    nc_ellipsize(vg, header_buf, sizeof(header_buf), tw);
+    nc_ellipsize(nc->render, header_buf, sizeof(header_buf), tw);
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_TOP);
     nvgFillColor(vg, tc_alpha(t->surface_text, 150));
-    nvgText(vg, tx, y + 14.0f, header_buf, NULL);
+    dc_shape_draw_text(nc->render, tx, y + 14.0f, header_buf, NULL);
 
     char title_buf[DC_NOTIF_SUMMARY];
     snprintf(title_buf, sizeof(title_buf), "%s", n->summary);
     nvgFontSize(vg, 14.0f);
-    nc_ellipsize(vg, title_buf, sizeof(title_buf), tw);
+    nc_ellipsize(nc->render, title_buf, sizeof(title_buf), tw);
     nvgFillColor(vg, tc(t->surface_text));
-    nvgText(vg, tx, y + 32.0f, title_buf, NULL);
+    dc_shape_draw_text(nc->render, tx, y + 32.0f, title_buf, NULL);
 
     if (n->body[0]) {
         nvgSave(vg);
@@ -336,7 +320,7 @@ static void draw_card(dc_notif_center *nc, const dc_notification *n, float x, fl
         nvgFontSize(vg, 12.0f);
         nvgFillColor(vg, tc_alpha(t->surface_text, 160));
         nvgTextLineHeight(vg, 1.15f);
-        nvgTextBox(vg, tx, y + 53.0f, tw, n->body, NULL);
+        dc_shape_draw_textbox(nc->render, tx, y + 53.0f, tw, n->body, NULL);
         nvgRestore(vg);
     }
 

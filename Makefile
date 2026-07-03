@@ -7,11 +7,21 @@ CXX         ?= c++
 PKG_CONFIG  ?= pkg-config
 WAYLAND_SCANNER ?= wayland-scanner
 
-PKGS := wayland-client wayland-egl egl glesv2 libsystemd xkbcommon pam fontconfig
+PKGS := wayland-client wayland-egl egl glesv2 libsystemd xkbcommon pam fontconfig harfbuzz
+
+# FriBidi (real UAX#9 BiDi reordering, see src/render/shape.c) is optional at
+# build time: if pkg-config can't find it, shape.c falls back to its
+# documented "UBA-lite" approximation (contiguous RTL segments reversed,
+# numbers kept LTR) instead of failing the build.
+HAVE_FRIBIDI := $(shell $(PKG_CONFIG) --exists fribidi && echo 1)
+ifeq ($(HAVE_FRIBIDI),1)
+PKGS += fribidi
+FRIBIDI_CFLAGS := -DDC_HAVE_FRIBIDI=1
+endif
 
 WARNINGS := -Wall -Wextra -Wshadow -Wvla -Wpointer-arith -Wno-unused-parameter
 INCLUDES := -Isrc -Iprotocol/generated -Ithird_party/nanovg -Ithird_party/nanosvg -Ithird_party/cjson
-BASE_CFLAGS := -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE $(INCLUDES) \
+BASE_CFLAGS := -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE $(INCLUDES) $(FRIBIDI_CFLAGS) \
 	$(shell $(PKG_CONFIG) --cflags $(PKGS))
 
 CFLAGS   ?= -O2 -g
