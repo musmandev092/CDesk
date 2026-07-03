@@ -94,6 +94,12 @@ typedef enum {
     CC_HOVER_NET_PW_FIELD = CC_HOVER_EXPAND_ROW_BASE + CC_MAX_EXPAND_ROWS,
     CC_HOVER_NET_PW_CANCEL,
     CC_HOVER_NET_PW_CONNECT,
+    /* Bluetooth "Discover" toggle + inline pairing-agent panel (W3.1),
+     * reusing the exact inline-field pattern above. */
+    CC_HOVER_BT_SCAN_BTN,
+    CC_HOVER_BT_AGENT_FIELD,
+    CC_HOVER_BT_AGENT_NO,
+    CC_HOVER_BT_AGENT_YES,
 } cc_hover_id;
 
 /* Max length of the inline Wi-Fi password buffer (nmcli/WPA itself caps PSKs
@@ -181,6 +187,19 @@ struct dc_control_center {
     char net_pw_buf[CC_NET_PW_MAX];
     char net_pw_err[96];
 
+    /* Bluetooth pairing (W3.1): `bt_pairing_active` mirrors `net_pw_connecting`
+     * -- set once dc_bluez_pair() is kicked off, keeps cc_render() requesting
+     * frame callbacks (see the bottom of cc_render()) purely to re-poll
+     * dc_bluez_pair_poll() until the async Pair/Trust/Connect chain resolves,
+     * since those replies arrive via the system bus's own event-loop
+     * integration rather than anything this file drives directly.
+     * `bt_passkey_buf` is the digit buffer for a RequestPasskey agent prompt
+     * (dc_bluez_agent_poll()'s DC_BLUEZ_AGENT_PASSKEY kind) -- unlike the
+     * Wi-Fi password field, whether this is even showing is entirely driven
+     * by bluez.c's agent state, not a flag owned here. */
+    bool bt_pairing_active;
+    char bt_passkey_buf[8];
+
     bool visible;
     bool configured;
     bool egl_ready;
@@ -200,7 +219,7 @@ static void cc_frame_done(void *data, struct wl_callback *cb, uint32_t time)
     cc->frame_cb = NULL;
     if (!cc->visible)
         return;
-    if (dc_anim_active(&cc->anim) || cc->net_pw_connecting)
+    if (dc_anim_active(&cc->anim) || cc->net_pw_connecting || cc->bt_pairing_active)
         cc_render(cc);
     else if (cc->closing)
         cc_teardown(cc);
@@ -265,6 +284,24 @@ typedef struct {
     float pw_cancel_x0, pw_cancel_x1;
     float pw_connect_x0, pw_connect_x1;
 
+    /* Bluetooth "Discover" toggle (W3.1), on the BLUETOOTH DEVICES header
+     * row, only meaningful when expand_kind == 2. */
+    float bt_scan_btn_x0, bt_scan_btn_x1, bt_scan_btn_y0, bt_scan_btn_h;
+
+    /* Bluetooth pairing-agent panel (W3.1): appended after the device rows
+     * (not tied to a particular row, unlike the Wi-Fi password panel above --
+     * BlueZ's agent request isn't scoped to whichever row is currently
+     * visible), shown whenever bluez.c reports a pending confirm/authorize/
+     * passkey request while the bluetooth section is open. */
+    bool bt_agent_active;
+    dc_bluez_agent_kind bt_agent_kind;
+    float bt_agent_h;
+    float bt_agent_text_y;
+    float bt_agent_field_y, bt_agent_field_h; /* only for DC_BLUEZ_AGENT_PASSKEY */
+    float bt_agent_btn_y0, bt_agent_btn_h;
+    float bt_agent_no_x0, bt_agent_no_x1;
+    float bt_agent_yes_x0, bt_agent_yes_x1;
+
     /* Total content height (pad-to-pad, i.e. the card's own height) --
      * cc_render() resizes the layer-surface to this when it changes. */
     float total_h;
@@ -276,9 +313,12 @@ typedef struct {
  * gathered once per render/click/motion by cc_gather_state() so every
  * layout consumer agrees on the card's current size. `pw_after_row`: -1, or
  * the 0-based network-row index the inline password panel (W1.1) is
- * currently open under (only meaningful when expand_kind == 1). */
+ * currently open under (only meaningful when expand_kind == 1).
+ * `bt_agent_kind`: DC_BLUEZ_AGENT_NONE, or which pairing-agent panel (W3.1)
+ * to reserve room for below the bluetooth device rows (only meaningful when
+ * expand_kind == 2). */
 static cc_layout cc_get_layout(float w, bool media_active, int expand_kind, int expand_rows,
-                               int pw_after_row)
+                               int pw_after_row, dc_bluez_agent_kind bt_agent_kind)
 {
     const float pad = 6.0f;   /* room for the drop shadow */
     const float margin = 16.0f; /* content inset from the card edge (~Theme.spacingL) */
@@ -375,7 +415,37 @@ static cc_layout cc_get_layout(float w, bool media_active, int expand_kind, int 
             l.pw_cancel_x0 = l.pw_cancel_x1 - 72.0f;
         }
 
-        l.expand_h = 22.0f + (float)rows * l.expand_row_h + l.pw_panel_h + 6.0f;
+        float bt_agent_panel_h = 0.0f;
+        if (expand_kind == 2) {
+            /* Discover toggle on the BLUETOOTH DEVICES header row. */
+            l.bt_scan_btn_h = 20.0f;
+            l.bt_scan_btn_y0 = l.expand_y0;
+            l.bt_scan_btn_x1 = l.ix + l.iw;
+            l.bt_scan_btn_x0 = l.bt_scan_btn_x1 - 64.0f;
+
+            if (bt_agent_kind != DC_BLUEZ_AGENT_NONE) {
+                l.bt_agent_active = true;
+                l.bt_agent_kind = bt_agent_kind;
+                float y = l.expand_row_y0 + (float)rows * l.expand_row_h + 6.0f;
+                l.bt_agent_text_y = y + 10.0f;
+                float cursor = y + 22.0f;
+                if (bt_agent_kind == DC_BLUEZ_AGENT_PASSKEY) {
+                    l.bt_agent_field_y = cursor;
+                    l.bt_agent_field_h = CC_NET_PW_FIELD_H;
+                    cursor = l.bt_agent_field_y + l.bt_agent_field_h + CC_NET_PW_GAP;
+                }
+                l.bt_agent_btn_y0 = cursor;
+                l.bt_agent_btn_h = CC_NET_PW_BTN_H;
+                l.bt_agent_yes_x1 = l.ix + l.iw;
+                l.bt_agent_yes_x0 = l.bt_agent_yes_x1 - 84.0f;
+                l.bt_agent_no_x1 = l.bt_agent_yes_x0 - 8.0f;
+                l.bt_agent_no_x0 = l.bt_agent_no_x1 - 72.0f;
+                l.bt_agent_h = (l.bt_agent_btn_y0 + l.bt_agent_btn_h) - y + CC_NET_PW_GAP;
+                bt_agent_panel_h = l.bt_agent_h;
+            }
+        }
+
+        l.expand_h = 22.0f + (float)rows * l.expand_row_h + l.pw_panel_h + bt_agent_panel_h + 6.0f;
         l.total_h = l.expand_y0 + l.expand_h + margin + pad;
     } else {
         l.total_h = tiles_end + margin + pad;
@@ -488,6 +558,14 @@ static cc_hover_id cc_hittest(const cc_layout *l, double x, double y)
         }
     }
 
+    /* Bluetooth "Discover" toggle (W3.1) -- on the header row, above the
+     * device-row band, so this is safe to check before the row loop. */
+    if (l->expand_kind == 2) {
+        if (x >= (double)l->bt_scan_btn_x0 && x <= (double)l->bt_scan_btn_x1 &&
+            y >= (double)l->bt_scan_btn_y0 && y <= (double)(l->bt_scan_btn_y0 + l->bt_scan_btn_h))
+            return CC_HOVER_BT_SCAN_BTN;
+    }
+
     if (l->expand_kind != 0 && l->expand_rows > 0) {
         int rows = l->expand_rows > CC_MAX_EXPAND_ROWS ? CC_MAX_EXPAND_ROWS : l->expand_rows;
         for (int i = 0; i < rows; i++) {
@@ -512,6 +590,21 @@ static cc_hover_id cc_hittest(const cc_layout *l, double x, double y)
                 return CC_HOVER_NET_PW_CANCEL;
             if (x >= (double)l->pw_connect_x0 && x <= (double)l->pw_connect_x1)
                 return CC_HOVER_NET_PW_CONNECT;
+        }
+    }
+
+    /* Bluetooth pairing-agent panel (W3.1): field (passkey entry only) +
+     * Reject/Confirm (or Cancel/Submit) buttons. */
+    if (l->bt_agent_active) {
+        if (l->bt_agent_kind == DC_BLUEZ_AGENT_PASSKEY && x >= (double)l->ix &&
+            x <= (double)(l->ix + l->iw) && y >= (double)l->bt_agent_field_y &&
+            y <= (double)(l->bt_agent_field_y + l->bt_agent_field_h))
+            return CC_HOVER_BT_AGENT_FIELD;
+        if (y >= (double)l->bt_agent_btn_y0 && y <= (double)(l->bt_agent_btn_y0 + l->bt_agent_btn_h)) {
+            if (x >= (double)l->bt_agent_no_x0 && x <= (double)l->bt_agent_no_x1)
+                return CC_HOVER_BT_AGENT_NO;
+            if (x >= (double)l->bt_agent_yes_x0 && x <= (double)l->bt_agent_yes_x1)
+                return CC_HOVER_BT_AGENT_YES;
         }
     }
 
@@ -801,6 +894,15 @@ typedef struct {
     int expand_rows;
     dc_net_wifi_ap net_aps[CC_MAX_EXPAND_ROWS];
     dc_bluez_device bt_devs[CC_MAX_EXPAND_ROWS];
+
+    /* Bluetooth pairing (W3.1). */
+    bool bt_discovering;
+    dc_bluez_pair_state bt_pair_state;
+    char bt_pair_mac[18];
+    char bt_pair_err[96];
+    dc_bluez_agent_kind bt_agent_kind;
+    char bt_agent_device[64];
+    char bt_agent_passkey[8];
 } cc_state;
 
 static void cc_gather_state(dc_control_center *cc, cc_state *st)
@@ -819,6 +921,17 @@ static void cc_gather_state(dc_control_center *cc, cc_state *st)
             memcpy(st->bt_devs, bt.devices, (size_t)n * sizeof(bt.devices[0]));
         st->expand_kind = 2;
         st->expand_rows = n;
+
+        st->bt_discovering = dc_bluez_discovering();
+        st->bt_pair_state = dc_bluez_pair_poll(st->bt_pair_mac, sizeof(st->bt_pair_mac),
+                                               st->bt_pair_err, sizeof(st->bt_pair_err));
+
+        dc_bluez_agent_request areq;
+        if (dc_bluez_agent_poll(&areq)) {
+            st->bt_agent_kind = areq.kind;
+            snprintf(st->bt_agent_device, sizeof(st->bt_agent_device), "%s", areq.device_name);
+            snprintf(st->bt_agent_passkey, sizeof(st->bt_agent_passkey), "%s", areq.passkey_str);
+        }
     }
 }
 
@@ -834,6 +947,22 @@ static void cc_close_net_pw(dc_control_center *cc)
     cc->net_pw_connecting = false;
     cc->net_pw_buf[0] = '\0';
     cc->net_pw_err[0] = '\0';
+}
+
+/* Close the bluetooth expand section (W3.1): stops any in-flight discovery
+ * and rejects/aborts any in-flight pairing job or pending agent dialog --
+ * shared by every place that leaves the section (collapsing it, switching to
+ * network, control-center teardown), same "closed == reset" contract as
+ * cc_close_net_pw() above. */
+static void cc_close_bt_section(dc_control_center *cc)
+{
+    if (cc->bt_expanded) {
+        dc_bluez_stop_discovery();
+        dc_bluez_pair_reset();
+    }
+    cc->bt_expanded = false;
+    cc->bt_pairing_active = false;
+    cc->bt_passkey_buf[0] = '\0';
 }
 
 /* 0-based row index of `cc->net_pw_ssid` within `st->net_aps`, or -1 if the
@@ -1099,6 +1228,91 @@ static void draw_net_pw_panel(dc_render *r, const cc_layout *l, const char *pw_b
            connecting ? "Connecting\xe2\x80\xa6" : "Connect", NULL);
 }
 
+/* Bluetooth pairing-agent panel (W3.1): a one-line prompt ("Confirm code
+ * NNNNNN with \"device\"?" / "Pair with \"device\"?" / "Enter the passkey
+ * shown on \"device\"") plus either a masked numeric-entry field (RequestPasskey)
+ * or nothing extra, then Reject/Confirm (or Cancel/Submit) buttons -- same
+ * "layout owns geometry, this only draws" discipline as draw_net_pw_panel()
+ * above, whose masked-field styling this reuses for the passkey-entry case. */
+static void draw_bt_agent_panel(dc_render *r, const cc_layout *l, const char *device_name,
+                                const char *passkey_str, const char *entry_buf)
+{
+    NVGcontext *vg = r->vg;
+    const dc_theme *t = dc_theme_current;
+
+    char text[128];
+    if (l->bt_agent_kind == DC_BLUEZ_AGENT_CONFIRM)
+        snprintf(text, sizeof(text), "Confirm code %s with \"%s\"?",
+                 passkey_str ? passkey_str : "", device_name ? device_name : "device");
+    else if (l->bt_agent_kind == DC_BLUEZ_AGENT_PASSKEY)
+        snprintf(text, sizeof(text), "Enter the passkey shown on \"%s\"",
+                 device_name ? device_name : "device");
+    else
+        snprintf(text, sizeof(text), "Pair with \"%s\"?", device_name ? device_name : "device");
+
+    nvgFontFaceId(vg, r->font_ui);
+    nvgFontSize(vg, 12.5f);
+    cc_ellipsize(r, text, sizeof(text), l->iw);
+    nvgFillColor(vg, tc(t->surface_text));
+    nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+    dc_shape_draw_text(r, l->ix, l->bt_agent_text_y, text, NULL);
+
+    size_t entry_len = entry_buf ? strlen(entry_buf) : 0;
+    bool is_passkey = l->bt_agent_kind == DC_BLUEZ_AGENT_PASSKEY;
+
+    if (is_passkey) {
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, l->ix, l->bt_agent_field_y, l->iw, l->bt_agent_field_h, 8.0f);
+        nvgFillColor(vg, tc(t->surface_container_highest));
+        nvgFill(vg);
+        nvgStrokeWidth(vg, 2.0f);
+        nvgStrokeColor(vg, tc(t->primary));
+        nvgStroke(vg);
+
+        nvgFontSize(vg, 13.0f);
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        if (entry_len == 0) {
+            nvgFillColor(vg, tc_alpha(t->surface_variant_text, 170));
+            nvgText(vg, l->ix + 10.0f, l->bt_agent_field_y + l->bt_agent_field_h / 2.0f, "Passkey",
+                   NULL);
+        } else {
+            char masked[3 * 8 + 1];
+            size_t shown = entry_len < 8 ? entry_len : 8;
+            for (size_t i = 0; i < shown; i++)
+                memcpy(masked + i * 3, "\xe2\x80\xa2", 3);
+            masked[shown * 3] = '\0';
+            nvgFillColor(vg, tc(t->surface_text));
+            nvgText(vg, l->ix + 10.0f, l->bt_agent_field_y + l->bt_agent_field_h / 2.0f, masked,
+                   NULL);
+        }
+    }
+
+    const char *no_label = is_passkey ? "Cancel" : "Reject";
+    const char *yes_label = is_passkey ? "Submit" : "Confirm";
+    bool yes_disabled = is_passkey && entry_len == 0;
+
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, l->bt_agent_no_x0, l->bt_agent_btn_y0, l->bt_agent_no_x1 - l->bt_agent_no_x0,
+                  l->bt_agent_btn_h, l->bt_agent_btn_h / 2.0f);
+    nvgFillColor(vg, tc(t->surface_container_high));
+    nvgFill(vg);
+    nvgFontSize(vg, 12.0f);
+    nvgFillColor(vg, tc(t->surface_text));
+    nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+    nvgText(vg, (l->bt_agent_no_x0 + l->bt_agent_no_x1) / 2.0f,
+           l->bt_agent_btn_y0 + l->bt_agent_btn_h / 2.0f, no_label, NULL);
+
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, l->bt_agent_yes_x0, l->bt_agent_btn_y0,
+                  l->bt_agent_yes_x1 - l->bt_agent_yes_x0, l->bt_agent_btn_h,
+                  l->bt_agent_btn_h / 2.0f);
+    nvgFillColor(vg, yes_disabled ? tc_alpha(t->primary, 130) : tc(t->primary));
+    nvgFill(vg);
+    nvgFillColor(vg, tc(t->primary_text));
+    nvgText(vg, (l->bt_agent_yes_x0 + l->bt_agent_yes_x1) / 2.0f,
+           l->bt_agent_btn_y0 + l->bt_agent_btn_h / 2.0f, yes_label, NULL);
+}
+
 /* Media transport row (docs/13-POPOUTS-SPEC.md sec.1 item 4): art-circle
  * placeholder + title/artist + prev/play-pause/next, shown only while an
  * MPRIS player is active. Mirrors the bar's media widget colors (title
@@ -1237,6 +1451,28 @@ static void draw_cc_hover(dc_control_center *cc, const cc_layout *l)
         nvgRoundedRect(vg, bx0, l->pw_btn_y0, bx1 - bx0, l->pw_btn_h, l->pw_btn_h / 2.0f);
         nvgFillColor(vg, col);
         nvgFill(vg);
+        return;
+    }
+
+    if (cc->hover_id == CC_HOVER_BT_SCAN_BTN) {
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, l->bt_scan_btn_x0, l->bt_scan_btn_y0,
+                      l->bt_scan_btn_x1 - l->bt_scan_btn_x0, l->bt_scan_btn_h,
+                      l->bt_scan_btn_h / 2.0f);
+        nvgFillColor(vg, col);
+        nvgFill(vg);
+        return;
+    }
+
+    if (cc->hover_id == CC_HOVER_BT_AGENT_NO || cc->hover_id == CC_HOVER_BT_AGENT_YES) {
+        bool is_no = cc->hover_id == CC_HOVER_BT_AGENT_NO;
+        float bx0 = is_no ? l->bt_agent_no_x0 : l->bt_agent_yes_x0;
+        float bx1 = is_no ? l->bt_agent_no_x1 : l->bt_agent_yes_x1;
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, bx0, l->bt_agent_btn_y0, bx1 - bx0, l->bt_agent_btn_h,
+                      l->bt_agent_btn_h / 2.0f);
+        nvgFillColor(vg, col);
+        nvgFill(vg);
     }
 }
 
@@ -1277,8 +1513,18 @@ static void cc_render(dc_control_center *cc)
          * "Connecting..."; the frame_cb request below keeps polling. */
     }
 
+    /* Bluetooth pairing job (W3.1): cc_gather_state() above already polled
+     * dc_bluez_pair_poll() into st.bt_pair_state whenever the bluetooth
+     * section is open -- once it's reached a terminal state, stop requesting
+     * extra frame callbacks purely to watch it (the resolved status stays
+     * visible on the device's row regardless, via bluez.c's own job state,
+     * until the next pair attempt or section close). */
+    if (cc->bt_pairing_active && cc->bt_expanded &&
+        (st.bt_pair_state == DC_BLUEZ_PAIR_SUCCESS || st.bt_pair_state == DC_BLUEZ_PAIR_FAILED))
+        cc->bt_pairing_active = false;
+
     cc_layout l = cc_get_layout((float)cc->logical_width, st.media_active, st.expand_kind,
-                                st.expand_rows, cc_find_pw_row(cc, &st));
+                                st.expand_rows, cc_find_pw_row(cc, &st), st.bt_agent_kind);
 
     int desired_h = (int)ceilf(l.total_h);
     if (desired_h != cc->logical_height && cc->layer_surface) {
@@ -1549,11 +1795,32 @@ static void cc_render(dc_control_center *cc)
         nvgText(vg, l.ix, l.expand_header_y, l.expand_kind == 1 ? "NETWORKS" : "BLUETOOTH DEVICES",
                NULL);
 
+        /* "Discover" toggle (W3.1): starts/stops Adapter1 discovery so
+         * unpaired nearby devices show up in the list below. */
+        if (l.expand_kind == 2) {
+            bool discovering = st.bt_discovering;
+            nvgBeginPath(vg);
+            nvgRoundedRect(vg, l.bt_scan_btn_x0, l.bt_scan_btn_y0,
+                          l.bt_scan_btn_x1 - l.bt_scan_btn_x0, l.bt_scan_btn_h,
+                          l.bt_scan_btn_h / 2.0f);
+            nvgFillColor(vg, discovering ? tc(t->primary) : tc(t->surface_container_high));
+            nvgFill(vg);
+            nvgFontSize(vg, 10.0f);
+            nvgFillColor(vg, tc(discovering ? t->primary_text : t->surface_text));
+            nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+            nvgText(vg, (l.bt_scan_btn_x0 + l.bt_scan_btn_x1) / 2.0f,
+                   l.bt_scan_btn_y0 + l.bt_scan_btn_h / 2.0f, discovering ? "Stop" : "Discover",
+                   NULL);
+        }
+
         if (st.expand_rows == 0) {
             nvgFontSize(vg, 13.0f);
             nvgFillColor(vg, tc(t->surface_variant_text));
             nvgText(vg, l.ix, cc_expand_row_y(&l, 0) + l.expand_row_h / 2.0f,
-                   l.expand_kind == 1 ? "Scanning\xe2\x80\xa6" : "No paired devices", NULL);
+                   l.expand_kind == 1 ? "Scanning\xe2\x80\xa6"
+                   : st.bt_discovering  ? "Searching\xe2\x80\xa6"
+                                        : "No paired devices",
+                   NULL);
         }
 
         for (int i = 0; i < st.expand_rows && i < CC_MAX_EXPAND_ROWS; i++) {
@@ -1580,23 +1847,51 @@ static void cc_render(dc_control_center *cc)
                                       cc->net_pw_err);
             } else {
                 const dc_bluez_device *d = &st.bt_devs[i];
-                draw_expand_row(cc->render, l.ix, ry, l.iw, l.expand_row_h,
-                                d->connected ? DC_ICON_BLUETOOTH_CONNECTED : DC_ICON_BLUETOOTH,
-                                d->name, d->connected ? "Connected" : "Tap to connect",
-                                d->connected, false);
+                bool this_job = st.bt_pair_state != DC_BLUEZ_PAIR_IDLE &&
+                                strcmp(st.bt_pair_mac, d->mac) == 0;
+                int icon = d->connected  ? DC_ICON_BLUETOOTH_CONNECTED
+                          : d->paired    ? DC_ICON_BLUETOOTH
+                                         : DC_ICON_ADD;
+                char status[24];
+                bool status_primary = false, status_warn = false;
+                if (this_job && st.bt_pair_state == DC_BLUEZ_PAIR_IN_PROGRESS)
+                    snprintf(status, sizeof(status), "Pairing\xe2\x80\xa6");
+                else if (this_job && st.bt_pair_state == DC_BLUEZ_PAIR_FAILED) {
+                    snprintf(status, sizeof(status), "Failed");
+                    status_warn = true;
+                } else if (this_job && st.bt_pair_state == DC_BLUEZ_PAIR_SUCCESS) {
+                    snprintf(status, sizeof(status), "Paired");
+                    status_primary = true;
+                } else if (d->connected) {
+                    snprintf(status, sizeof(status), "Connected");
+                    status_primary = true;
+                } else if (d->paired) {
+                    snprintf(status, sizeof(status), "Tap to connect");
+                } else {
+                    snprintf(status, sizeof(status), "Tap to pair");
+                }
+                draw_expand_row(cc->render, l.ix, ry, l.iw, l.expand_row_h, icon, d->name, status,
+                                status_primary, status_warn);
             }
         }
+
+        if (l.bt_agent_active)
+            draw_bt_agent_panel(cc->render, &l, st.bt_agent_device, st.bt_agent_passkey,
+                                cc->bt_passkey_buf);
     }
 
     draw_cc_hover(cc, &l);
 
     nvgEndFrame(vg);
 
-    /* Keep requesting frame callbacks while a password-entry connect job is
-     * in flight, purely to keep polling dc_net_wifi_connect_poll() until it
-     * resolves -- otherwise the "Connecting..." row would only ever update
-     * on the next pointer click/motion (docs/13-POPOUTS-SPEC.md sec.1). */
-    if ((dc_anim_active(&cc->anim) || cc->closing || cc->net_pw_connecting) && !cc->frame_cb) {
+    /* Keep requesting frame callbacks while a password-entry connect job or a
+     * bluetooth pairing job is in flight, purely to keep re-polling their
+     * respective poll functions until they resolve -- otherwise the
+     * "Connecting.../Pairing..." row would only ever update on the next
+     * pointer click/motion (docs/13-POPOUTS-SPEC.md sec.1). */
+    if ((dc_anim_active(&cc->anim) || cc->closing || cc->net_pw_connecting ||
+        cc->bt_pairing_active) &&
+       !cc->frame_cb) {
         cc->frame_cb = wl_surface_frame(cc->surface);
         wl_callback_add_listener(cc->frame_cb, &cc_frame_listener, cc);
     }
@@ -1728,7 +2023,7 @@ static void cc_teardown(dc_control_center *cc)
     /* Next open starts collapsed (docs/13-POPOUTS-SPEC.md sec.1 items 1/2) --
      * matches every other popout's "closed == reset" convention. */
     cc->net_expanded = false;
-    cc->bt_expanded = false;
+    cc_close_bt_section(cc);
     cc_close_net_pw(cc);
     dc_debug("control center hidden");
 }
@@ -1777,7 +2072,7 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
     cc_state st;
     cc_gather_state(cc, &st);
     cc_layout l = cc_get_layout((float)cc->logical_width, st.media_active, st.expand_kind,
-                                st.expand_rows, cc_find_pw_row(cc, &st));
+                                st.expand_rows, cc_find_pw_row(cc, &st), st.bt_agent_kind);
 
     /* Header action buttons: lock, power, settings, edit. */
     for (int i = 0; i < 4; i++) {
@@ -1841,7 +2136,7 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
         double dx = x - (double)l.wifi_chevron_cx, dy = y - (double)l.wifi_chevron_cy;
         if (dx * dx + dy * dy <= (double)(l.chevron_r * l.chevron_r)) {
             cc->net_expanded = !cc->net_expanded;
-            cc->bt_expanded = false;
+            cc_close_bt_section(cc);
             cc_close_net_pw(cc);
             cc_render(cc);
             return;
@@ -1849,12 +2144,28 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
         dx = x - (double)l.bt_chevron_cx;
         dy = y - (double)l.bt_chevron_cy;
         if (dx * dx + dy * dy <= (double)(l.chevron_r * l.chevron_r)) {
-            cc->bt_expanded = !cc->bt_expanded;
+            bool now_open = !cc->bt_expanded;
             cc->net_expanded = false;
             cc_close_net_pw(cc);
+            if (now_open)
+                cc->bt_expanded = true;
+            else
+                cc_close_bt_section(cc);
             cc_render(cc);
             return;
         }
+    }
+
+    /* Bluetooth "Discover" toggle (W3.1) -- starts/stops Adapter1 discovery
+     * so unpaired nearby devices show up in the list below. */
+    if (l.expand_kind == 2 && x >= (double)l.bt_scan_btn_x0 && x <= (double)l.bt_scan_btn_x1 &&
+       y >= (double)l.bt_scan_btn_y0 && y <= (double)(l.bt_scan_btn_y0 + l.bt_scan_btn_h)) {
+        if (st.bt_discovering)
+            dc_bluez_stop_discovery();
+        else
+            dc_bluez_start_discovery();
+        cc_render(cc);
+        return;
     }
 
     /* Media transport row (docs/13-POPOUTS-SPEC.md sec.1 item 4). */
@@ -1939,10 +2250,20 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
                 }
             } else {
                 const dc_bluez_device *d = &st.bt_devs[i];
-                if (d->connected)
-                    dc_bluez_disconnect(d->mac);
-                else
-                    dc_bluez_connect(d->mac);
+                if (d->paired) {
+                    if (d->connected)
+                        dc_bluez_disconnect(d->mac);
+                    else
+                        dc_bluez_connect(d->mac);
+                } else {
+                    /* Nearby, unpaired (W3.1) -- kick off Pair+Trust+Connect;
+                     * the row flips to "Pairing.../Paired/Failed" via
+                     * st.bt_pair_state on the next render (dc_bluez_pair()
+                     * replaces any previous job, same "one at a time"
+                     * convention as services/net.c's connect_psk job). */
+                    dc_bluez_pair(d->mac);
+                    cc->bt_pairing_active = true;
+                }
             }
             cc_render(cc);
             return;
@@ -1972,6 +2293,39 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
             return;
         }
     }
+
+    /* Bluetooth pairing-agent panel (W3.1): field (no-op on click, same
+     * "focus is implicit" contract as the Wi-Fi password field above) +
+     * Reject/Confirm (or Cancel/Submit for a passkey-entry request). */
+    if (l.bt_agent_active) {
+        bool in_field = l.bt_agent_kind == DC_BLUEZ_AGENT_PASSKEY && x >= (double)l.ix &&
+                        x <= (double)(l.ix + l.iw) && y >= (double)l.bt_agent_field_y &&
+                        y <= (double)(l.bt_agent_field_y + l.bt_agent_field_h);
+        bool in_btn_row =
+            y >= (double)l.bt_agent_btn_y0 && y <= (double)(l.bt_agent_btn_y0 + l.bt_agent_btn_h);
+        if (in_field)
+            return;
+        if (in_btn_row && x >= (double)l.bt_agent_no_x0 && x <= (double)l.bt_agent_no_x1) {
+            if (l.bt_agent_kind == DC_BLUEZ_AGENT_PASSKEY)
+                dc_bluez_agent_respond_passkey(NULL);
+            else
+                dc_bluez_agent_respond_yesno(false);
+            cc->bt_passkey_buf[0] = '\0';
+            cc_render(cc);
+            return;
+        }
+        if (in_btn_row && x >= (double)l.bt_agent_yes_x0 && x <= (double)l.bt_agent_yes_x1) {
+            if (l.bt_agent_kind == DC_BLUEZ_AGENT_PASSKEY) {
+                if (cc->bt_passkey_buf[0])
+                    dc_bluez_agent_respond_passkey(cc->bt_passkey_buf);
+            } else {
+                dc_bluez_agent_respond_yesno(true);
+            }
+            cc->bt_passkey_buf[0] = '\0';
+            cc_render(cc);
+            return;
+        }
+    }
 }
 
 /* Pointer motion over the panel (docs/13-POPOUTS-SPEC.md sec.1): while a
@@ -1987,7 +2341,7 @@ void dc_control_center_handle_motion(dc_control_center *cc, double x, double y)
     cc_state st;
     cc_gather_state(cc, &st);
     cc_layout l = cc_get_layout((float)cc->logical_width, st.media_active, st.expand_kind,
-                                st.expand_rows, cc_find_pw_row(cc, &st));
+                                st.expand_rows, cc_find_pw_row(cc, &st), st.bt_agent_kind);
 
     if (cc->slider_dragging) {
         float frac = cc_slider_frac_at(&l, cc->slider_drag_slot, x);
@@ -2033,49 +2387,107 @@ void dc_control_center_handle_leave(dc_control_center *cc)
     cc_render(cc);
 }
 
-/* W1.1: only the inline Wi-Fi password field ever wants keyboard input --
- * same "keyboard on demand" contract as dc_settings_wants_keyboard(). */
+/* True while dankc's bluetooth pairing agent (W3.1) has a pending
+ * RequestPasskey request and the bluetooth section is open -- the only
+ * agent-panel kind that needs typed input (RequestConfirmation/
+ * RequestAuthorization only need the Yes/No buttons, handled entirely by
+ * dc_control_center_handle_click()). Cheap to poll (bluez.c just returns a
+ * static flag), safe to call from both wants_keyboard() and handle_key(). */
+static bool bt_wants_passkey_keyboard(dc_control_center *cc, dc_bluez_agent_request *out)
+{
+    if (!cc->bt_expanded)
+        return false;
+    if (!dc_bluez_agent_poll(out))
+        return false;
+    return out->kind == DC_BLUEZ_AGENT_PASSKEY;
+}
+
+/* W1.1/W3.1: the inline Wi-Fi password field or a bluetooth RequestPasskey
+ * prompt are the only two things that ever want keyboard input -- same
+ * "keyboard on demand" contract as dc_settings_wants_keyboard(). */
 bool dc_control_center_wants_keyboard(dc_control_center *cc)
 {
-    return cc->visible && !cc->closing && cc->net_pw_active;
+    if (!cc->visible || cc->closing)
+        return false;
+    if (cc->net_pw_active)
+        return true;
+    dc_bluez_agent_request req;
+    return bt_wants_passkey_keyboard(cc, &req);
 }
 
 void dc_control_center_handle_key(dc_control_center *cc, uint32_t keysym, const char *utf8)
 {
-    if (!cc->net_pw_active)
+    if (cc->net_pw_active) {
+        switch (keysym) {
+        case XKB_KEY_Escape:
+            cc_close_net_pw(cc);
+            cc_render(cc);
+            return;
+        case XKB_KEY_Return:
+        case XKB_KEY_KP_Enter:
+            if (!cc->net_pw_connecting && cc->net_pw_buf[0]) {
+                dc_net_wifi_connect_psk(cc->net_pw_ssid, cc->net_pw_buf);
+                cc->net_pw_connecting = true;
+                cc->net_pw_err[0] = '\0';
+            }
+            cc_render(cc);
+            return;
+        case XKB_KEY_BackSpace: {
+            size_t n = strlen(cc->net_pw_buf);
+            if (n > 0)
+                cc->net_pw_buf[n - 1] = '\0';
+            cc_render(cc);
+            return;
+        }
+        default:
+            /* Append the whole UTF-8 sequence for the key, same control-char
+             * filter as launcher.c's query editing -- passwords may contain
+             * any printable character, not just ASCII. */
+            if (utf8 && utf8[0] && !((unsigned char)utf8[0] < 0x20) &&
+                (unsigned char)utf8[0] != 0x7f) {
+                size_t n = strlen(cc->net_pw_buf);
+                size_t add = strlen(utf8);
+                if (n + add < sizeof(cc->net_pw_buf)) {
+                    memcpy(cc->net_pw_buf + n, utf8, add + 1);
+                    cc_render(cc);
+                }
+            }
+            return;
+        }
+    }
+
+    dc_bluez_agent_request req;
+    if (!bt_wants_passkey_keyboard(cc, &req))
         return;
 
     switch (keysym) {
     case XKB_KEY_Escape:
-        cc_close_net_pw(cc);
+        dc_bluez_agent_respond_passkey(NULL);
+        cc->bt_passkey_buf[0] = '\0';
         cc_render(cc);
         return;
     case XKB_KEY_Return:
     case XKB_KEY_KP_Enter:
-        if (!cc->net_pw_connecting && cc->net_pw_buf[0]) {
-            dc_net_wifi_connect_psk(cc->net_pw_ssid, cc->net_pw_buf);
-            cc->net_pw_connecting = true;
-            cc->net_pw_err[0] = '\0';
+        if (cc->bt_passkey_buf[0]) {
+            dc_bluez_agent_respond_passkey(cc->bt_passkey_buf);
+            cc->bt_passkey_buf[0] = '\0';
         }
         cc_render(cc);
         return;
     case XKB_KEY_BackSpace: {
-        size_t n = strlen(cc->net_pw_buf);
+        size_t n = strlen(cc->bt_passkey_buf);
         if (n > 0)
-            cc->net_pw_buf[n - 1] = '\0';
+            cc->bt_passkey_buf[n - 1] = '\0';
         cc_render(cc);
         return;
     }
     default:
-        /* Append the whole UTF-8 sequence for the key, same control-char
-         * filter as launcher.c's query editing -- passwords may contain any
-         * printable character, not just ASCII. */
-        if (utf8 && utf8[0] && !((unsigned char)utf8[0] < 0x20) &&
-            (unsigned char)utf8[0] != 0x7f) {
-            size_t n = strlen(cc->net_pw_buf);
-            size_t add = strlen(utf8);
-            if (n + add < sizeof(cc->net_pw_buf)) {
-                memcpy(cc->net_pw_buf + n, utf8, add + 1);
+        /* Digits only -- a BlueZ passkey is always a 6-digit decimal code. */
+        if (utf8 && utf8[0] && utf8[1] == '\0' && isdigit((unsigned char)utf8[0])) {
+            size_t n = strlen(cc->bt_passkey_buf);
+            if (n + 1 < sizeof(cc->bt_passkey_buf)) {
+                cc->bt_passkey_buf[n] = utf8[0];
+                cc->bt_passkey_buf[n + 1] = '\0';
                 cc_render(cc);
             }
         }
