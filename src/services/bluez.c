@@ -363,6 +363,81 @@ void dc_bluez_disconnect(const char *mac)
     run_bluetoothctl("disconnect", mac);
 }
 
+/* Synchronous org.freedesktop.DBus.Properties.Set with a boolean value --
+ * shared by the Discoverable/Pairable/Trusted toggles below. A single local
+ * system-bus round trip for a settings toggle is fine to do synchronously
+ * (same precedent as agent_device_display_name()'s blocking property get and
+ * scan_objects()'s blocking GetManagedObjects call, both already in this
+ * file); async is reserved for the multi-step pairing chain where blocking
+ * would stall the UI for as long as real pairing takes. Returns the sd-bus
+ * return code (negative on failure, already logged). */
+static int bluez_set_bool_property(const char *path, const char *iface, const char *prop, bool value)
+{
+    sd_bus_message *m = NULL;
+    int r = sd_bus_message_new_method_call(g_system, &m, "org.bluez", path,
+                                           "org.freedesktop.DBus.Properties", "Set");
+    if (r < 0) {
+        dc_warn("bluez: Properties.Set %s %s.%s: message_new failed: %s", path, iface, prop,
+                strerror(-r));
+        return r;
+    }
+    sd_bus_message_append(m, "ss", iface, prop);
+    sd_bus_message_open_container(m, 'v', "b");
+    sd_bus_message_append(m, "b", (int)value);
+    sd_bus_message_close_container(m);
+
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    r = sd_bus_call(g_system, m, 0, &err, NULL);
+    if (r < 0)
+        dc_warn("bluez: Properties.Set %s %s.%s=%s failed: %s", path, iface, prop,
+                value ? "true" : "false", err.message ? err.message : strerror(-r));
+    sd_bus_error_free(&err);
+    sd_bus_message_unref(m);
+    return r;
+}
+
+/* --- Adapter settings: Discoverable / Pairable (Wave 1) --------------------
+ *
+ * Mirrors the existing Powered toggle (which the UI currently drives via
+ * `bluetoothctl power on|off`, see ui/settings.c) but as a native
+ * Properties.Set, since there's no bluetoothctl-mediated agent/pairing
+ * fallback concern for a plain adapter property the way there is for
+ * connect/disconnect. */
+
+void dc_bluez_set_discoverable(bool on)
+{
+    if (!g_adapter_path[0]) {
+        dc_warn("bluez: set_discoverable: no adapter known yet");
+        return;
+    }
+    if (getenv("DANKC_BT_DRYRUN")) {
+        dc_info("bluez: [DANKC_BT_DRYRUN] would Properties.Set %s org.bluez.Adapter1.Discoverable=%s",
+                g_adapter_path, on ? "true" : "false");
+        return;
+    }
+    if (!g_system)
+        return;
+    if (bluez_set_bool_property(g_adapter_path, "org.bluez.Adapter1", "Discoverable", on) >= 0)
+        g_last_refresh = 0;
+}
+
+void dc_bluez_set_pairable(bool on)
+{
+    if (!g_adapter_path[0]) {
+        dc_warn("bluez: set_pairable: no adapter known yet");
+        return;
+    }
+    if (getenv("DANKC_BT_DRYRUN")) {
+        dc_info("bluez: [DANKC_BT_DRYRUN] would Properties.Set %s org.bluez.Adapter1.Pairable=%s",
+                g_adapter_path, on ? "true" : "false");
+        return;
+    }
+    if (!g_system)
+        return;
+    if (bluez_set_bool_property(g_adapter_path, "org.bluez.Adapter1", "Pairable", on) >= 0)
+        g_last_refresh = 0;
+}
+
 /* --- Discovery (W3.1) ------------------------------------------------------
  */
 
