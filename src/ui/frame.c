@@ -160,6 +160,9 @@ static void layer_surface_handle_configure(void *data, struct zwlr_layer_surface
     f->logical_height = height > 0 ? (int)height : f->logical_height;
     f->configured = true;
     recompute_physical(f);
+    dc_debug("frame: configure %dx%d logical (phys pending), radius=%.1f enabled=%d",
+             f->logical_width, f->logical_height, (double)dc_config_current->frame_radius,
+             dc_config_current->frame_enabled);
     frame_render(f);
 }
 
@@ -229,9 +232,17 @@ static void frame_show(dc_frame *f)
     if (f->wl->viewporter)
         f->viewport = wp_viewporter_get_viewport(f->wl->viewporter, f->surface);
 
-    /* Top layer, anchored to all four edges, zero exclusive zone (docs/
-     * 11-UX-FLOW.md sec.1 z-order table: "Frame ... Top ... exclusive zone —").
-     * No explicit size -> fills the anchored (whole-output) area. */
+    /* Top layer, anchored to all four edges, exclusive zone -1 (docs/
+     * 11-UX-FLOW.md sec.1 z-order table: "Frame ... Top ... exclusive zone —",
+     * i.e. DMS's WlrLayershell.exclusionMode: ExclusionMode.Ignore). Per the
+     * wlr-layer-shell protocol, exclusive_zone=0 on a surface anchored to all
+     * edges means "move me to avoid occluding other surfaces' exclusive
+     * zones" -- which would shrink this surface to the free area *below* the
+     * bar instead of the true output rect. -1 means the opposite: "extend
+     * all the way to the edges I'm anchored to, ignore everyone else's
+     * exclusive zone" -- exactly what a screen-corner mask needs, so it
+     * always sits at the physical screen edges regardless of what else is
+     * docked. No explicit size -> fills the whole anchored (output) area. */
     f->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
         f->wl->layer_shell, f->surface, output ? output->wl_output : NULL,
         ZWLR_LAYER_SHELL_V1_LAYER_TOP, "dankc:frame");
@@ -239,7 +250,7 @@ static void frame_show(dc_frame *f)
                                                             ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
                                                             ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
                                                             ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
-    zwlr_layer_surface_v1_set_exclusive_zone(f->layer_surface, 0);
+    zwlr_layer_surface_v1_set_exclusive_zone(f->layer_surface, -1);
     zwlr_layer_surface_v1_set_size(f->layer_surface, 0, 0);
     zwlr_layer_surface_v1_add_listener(f->layer_surface, &layer_surface_listener, f);
 
