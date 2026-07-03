@@ -7,12 +7,45 @@ project(
     'cpp_std=c++17',
     'warning_level=2',
     'buildtype=debugoptimized',
+    # LTO across all buildtypes: lets gcc/clang inline across translation
+    # units at link time, which matters on the hot text-shaping
+    # (render/shape.c) and nanovg-tessellation paths that cross .c file
+    # boundaries.
+    #
+    # For the shipped/packaged build (see packaging/PKGBUILD) don't use
+    # `--buildtype=release`: it implies -O3, and -O3's more aggressive
+    # inlining combined with b_lto=true trips false-positive
+    # -Wstringop-overflow/-Wstringop-overread warnings (both in vendored
+    # third_party/nanovg's bundled stb_image.h and in src/services/apps.c —
+    # a known GCC diagnostic issue at higher optimization, not real bugs).
+    # packaging/PKGBUILD instead passes -Doptimization=2 -Ddebug=false
+    # -Db_ndebug=true explicitly, which still drops -g and adds -DNDEBUG but
+    # keeps -O2 (matching the Makefile's release profile) and stays
+    # warning-clean.
+    'b_lto=true',
   ],
 )
 
 add_project_arguments('-D_POSIX_C_SOURCE=200809L', '-D_DEFAULT_SOURCE', language: 'c')
 
 cc = meson.get_compiler('c')
+cpp = meson.get_compiler('cpp')
+
+# Portable perf/size flags: only add if the compiler actually supports them
+# (keeps this meson.build working on clang / older gcc / non-x86 without
+# hardcoding a compiler-specific flag list). -fno-plt avoids the PLT
+# indirection on every D-Bus/GL call site; -fvisibility=hidden shrinks the
+# dynamic symbol table and lets LTO reason more aggressively about what's
+# actually reachable from outside the binary — safe here since dankc is an
+# executable, not a shared library.
+foreach flag : ['-fno-plt', '-fvisibility=hidden']
+  if cc.has_argument(flag)
+    add_project_arguments(flag, language: 'c')
+  endif
+  if cpp.has_argument(flag)
+    add_project_arguments(flag, language: 'cpp')
+  endif
+endforeach
 
 # --- dependencies ---------------------------------------------------------
 wayland_client = dependency('wayland-client')
