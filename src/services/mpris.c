@@ -157,14 +157,18 @@ bool dc_mpris_read(dc_mpris_info *out)
      * flags for the same convention): inject a long fake "title • artist" so
      * the bar's media marquee (docs/12-BAR-SPEC.md sec.4 music) can be
      * exercised deterministically on a machine with no live MPRIS player.
-     * Checked once and cached; harmless/no-op when unset. */
+     * DANKC_MARQUEE_TEST=paused does the same but with playing=false, so the
+     * play (rather than pause) transport glyph can be screenshotted for
+     * verification too. Checked once and cached; harmless/no-op when unset. */
     static int test_mode = -1;
-    if (test_mode < 0)
-        test_mode = getenv("DANKC_MARQUEE_TEST") ? 1 : 0;
+    if (test_mode < 0) {
+        const char *v = getenv("DANKC_MARQUEE_TEST");
+        test_mode = !v ? 0 : (strcmp(v, "paused") == 0 ? 2 : 1);
+    }
     if (test_mode) {
         memset(out, 0, sizeof(*out));
         out->active = true;
-        out->playing = true;
+        out->playing = test_mode == 1;
         snprintf(out->title, sizeof(out->title),
                  "This Is A Deliberately Long Fake Track Title For Marquee Testing");
         snprintf(out->artist, sizeof(out->artist), "A Fake Artist Whose Name Also Runs Long");
