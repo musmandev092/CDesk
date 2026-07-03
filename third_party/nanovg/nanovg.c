@@ -2388,6 +2388,29 @@ void nvgFontFace(NVGcontext* ctx, const char* font)
 	state->fontId = fonsGetFontByName(ctx->fs, font);
 }
 
+// dankc patch: read-back getters for the setter-only text state above.
+// render/shape.c's dc_shape_draw_text()/dc_shape_text_bounds() need to
+// mirror whatever font/size/align the caller already set (via
+// nvgFontFaceId/nvgFontSize/nvgTextAlign) exactly the way nvgText() itself
+// reads it internally, so shaped and unshaped text stay call-site
+// identical — "set state, call nvgText()" vs "set state, call
+// dc_shape_draw_text()" — without threading extra parameters through every
+// call site.
+int nvgCurrentFontId(NVGcontext* ctx)
+{
+	return nvg__getState(ctx)->fontId;
+}
+
+float nvgCurrentFontSize(NVGcontext* ctx)
+{
+	return nvg__getState(ctx)->fontSize;
+}
+
+int nvgCurrentTextAlign(NVGcontext* ctx)
+{
+	return nvg__getState(ctx)->textAlign;
+}
+
 static float nvg__quantize(float a, float d)
 {
 	return ((int)(a / d + 0.5f)) * d;
@@ -2537,6 +2560,79 @@ float nvgText(NVGcontext* ctx, float x, float y, const char* string, const char*
 	nvg__renderText(ctx, verts, nverts);
 
 	return iter.nextx / scale;
+}
+
+// dankc patch: draws pre-shaped glyphs (glyph indices + explicit pen
+// offsets from an external shaper) instead of re-deriving glyph selection
+// and layout from a UTF-8 string via fontstash's codepoint cmap path. See
+// NVGglyphRun's declaration in nanovg.h and fonsGetGlyphQuadByIndex's in
+// fontstash.h for the rest of this patch.
+float nvgTextGlyphs(NVGcontext* ctx, float x, float y, const NVGglyphRun* runs, int nruns)
+{
+	NVGstate* state = nvg__getState(ctx);
+	FONSquad q;
+	NVGvertex* verts;
+	float scale = nvg__getFontScale(state) * ctx->devicePxRatio;
+	float invscale = 1.0f / scale;
+	int cverts = 0;
+	int nverts = 0;
+	int isFlipped = nvg__isTransformFlipped(state->xform);
+	short isize, iblur;
+	float valign;
+	int i;
+
+	if (state->fontId == FONS_INVALID) return x;
+	if (nruns <= 0) return x;
+
+	isize = (short)(state->fontSize*scale*10.0f);
+	iblur = (short)(state->fontBlur*scale);
+	// Same vertical offset fonsTextIterInit would have applied for the
+	// current align (top/middle/baseline/bottom) — horizontal align is the
+	// caller's job (see nanovg.h), so only the y axis is adjusted here.
+	valign = fonsGetVertAlignOffset(ctx->fs, state->fontId, state->textAlign, isize);
+
+	cverts = nvg__maxi(2, nruns) * 6;
+	verts = nvg__allocTempVerts(ctx, cverts);
+	if (verts == NULL) return x;
+
+	for (i = 0; i < nruns; i++) {
+		float gx = (x + runs[i].x) * scale;
+		float gy = (y + runs[i].y) * scale + valign;
+		float c[4*2];
+		int ok = fonsGetGlyphQuadByIndex(ctx->fs, state->fontId, runs[i].gid, isize, iblur,
+										  FONS_GLYPH_BITMAP_REQUIRED, gx, gy, &q);
+		if (!ok) {
+			if (!nvg__allocTextAtlas(ctx))
+				break; // no memory :(
+			ok = fonsGetGlyphQuadByIndex(ctx->fs, state->fontId, runs[i].gid, isize, iblur,
+										  FONS_GLYPH_BITMAP_REQUIRED, gx, gy, &q);
+			if (!ok)
+				continue; // still can't find/rasterize this glyph? skip it, not the whole run.
+		}
+		if (isFlipped) {
+			float tmp;
+			tmp = q.y0; q.y0 = q.y1; q.y1 = tmp;
+			tmp = q.t0; q.t0 = q.t1; q.t1 = tmp;
+		}
+		nvgTransformPoint(&c[0],&c[1], state->xform, q.x0*invscale, q.y0*invscale);
+		nvgTransformPoint(&c[2],&c[3], state->xform, q.x1*invscale, q.y0*invscale);
+		nvgTransformPoint(&c[4],&c[5], state->xform, q.x1*invscale, q.y1*invscale);
+		nvgTransformPoint(&c[6],&c[7], state->xform, q.x0*invscale, q.y1*invscale);
+		if (nverts+6 <= cverts) {
+			nvg__vset(&verts[nverts], c[0], c[1], q.s0, q.t0); nverts++;
+			nvg__vset(&verts[nverts], c[4], c[5], q.s1, q.t1); nverts++;
+			nvg__vset(&verts[nverts], c[2], c[3], q.s1, q.t0); nverts++;
+			nvg__vset(&verts[nverts], c[0], c[1], q.s0, q.t0); nverts++;
+			nvg__vset(&verts[nverts], c[6], c[7], q.s0, q.t1); nverts++;
+			nvg__vset(&verts[nverts], c[4], c[5], q.s1, q.t1); nverts++;
+		}
+	}
+
+	nvg__flushTextTexture(ctx);
+
+	nvg__renderText(ctx, verts, nverts);
+
+	return x;
 }
 
 void nvgTextBox(NVGcontext* ctx, float x, float y, float breakRowWidth, const char* string, const char* end)

@@ -17,6 +17,13 @@ typedef struct NVGcontext NVGcontext;
  * font (script coverage + monochrome emoji; see nvg.c's FALLBACK_SPECS). */
 #define DC_RENDER_MAX_FALLBACKS 8
 
+/* Opaque per-font cmap coverage bitmap; real definition (and the parser) is
+ * private to nvg.c. Kept alive for the process lifetime (one per loaded font)
+ * so render/shape.c can ask "does font X actually have a glyph for this
+ * specific codepoint" without re-parsing the font file on every shaped
+ * string — see dc_render_font_for_codepoint(). */
+typedef struct dc_font_coverage dc_font_coverage;
+
 typedef struct dc_render {
     NVGcontext *vg;
     int font_ui;
@@ -27,6 +34,16 @@ typedef struct dc_render {
      * through font_ui and falls back automatically. */
     int font_fallbacks[DC_RENDER_MAX_FALLBACKS];
     int font_fallback_count;
+    /* File path + parsed cmap coverage backing font_ui / each font_fallbacks
+     * entry, in the same order/index. render/shape.c (HarfBuzz shaping) uses
+     * these to (a) open the exact same font bytes nvg's stb_truetype loaded,
+     * so glyph ids line up, and (b) pick the right one per codepoint via
+     * dc_render_font_for_codepoint() — the same "first font in the chain
+     * that covers it" rule fontstash's own fallback resolution uses. */
+    char font_ui_path[256];
+    dc_font_coverage *font_ui_cov;
+    char font_fallback_paths[DC_RENDER_MAX_FALLBACKS][256];
+    dc_font_coverage *font_fallback_cov[DC_RENDER_MAX_FALLBACKS];
     bool ready;
 } dc_render;
 
@@ -53,5 +70,16 @@ void dc_render_finish(dc_render *render);
  * font's cmap couldn't be parsed, so it never strips text it can't
  * positively rule out. */
 bool dc_render_font_has(uint32_t codepoint);
+
+/* Which loaded font (font_ui first, then font_fallbacks[] in registered
+ * order — the exact order/priority fontstash's own glyph-index fallback
+ * search uses) actually has a glyph for `codepoint`. Returns the nvg font id
+ * (>= 0, suitable for nvgFontFaceId()/nvgTextGlyphs()) and, if `out_path` is
+ * non-NULL, the font file path backing it (for opening the same bytes with
+ * HarfBuzz). Returns -1 if no loaded font covers it. Used by render/shape.c
+ * so a HarfBuzz-shaped run targets the identical font+glyph-index space
+ * nanovg's own unshaped fallback path would have used, keeping metrics
+ * (advances, atlas entries) consistent between the two draw paths. */
+int dc_render_font_for_codepoint(dc_render *render, uint32_t codepoint, const char **out_path);
 
 #endif /* DC_RENDER_NVG_H */

@@ -126,6 +126,19 @@ struct NVGglyphPosition {
 };
 typedef struct NVGglyphPosition NVGglyphPosition;
 
+// --- dankc patch: pre-shaped glyph rendering (see fontstash.h's matching
+// fonsGetGlyphQuadByIndex patch for the low-level half). Lets a caller that
+// already ran its own text shaper (dankc's src/render/shape.c, HarfBuzz)
+// draw the result directly by glyph index instead of handing nanovg/
+// fontstash a UTF-8 string to re-shape (which only ever does a 1:1
+// codepoint->glyph cmap lookup, so it can't produce Arabic joining forms,
+// ligatures, or RTL glyph order).
+struct NVGglyphRun {
+	int gid;	// glyph index (NOT a Unicode codepoint) in the currently bound font face (nvgFontFaceId).
+	float x, y;	// pen offset from nvgTextGlyphs' (x,y) origin, same local coordinate space as nvgText.
+};
+typedef struct NVGglyphRun NVGglyphRun;
+
 struct NVGtextRow {
 	const char* start;	// Pointer to the input text where the row starts.
 	const char* end;	// Pointer to the input text where the row ends (one past the last character).
@@ -592,6 +605,14 @@ void nvgFontFaceId(NVGcontext* ctx, int font);
 // Sets the font face based on specified name of current text style.
 void nvgFontFace(NVGcontext* ctx, const char* font);
 
+// dankc patch: read back the current font id / font size / text align set by
+// nvgFontFaceId()/nvgFontSize()/nvgTextAlign() — see nvgTextGlyphs() and
+// src/render/shape.c, which need to mirror a call site's already-set text
+// state rather than take it as extra parameters.
+int nvgCurrentFontId(NVGcontext* ctx);
+float nvgCurrentFontSize(NVGcontext* ctx);
+int nvgCurrentTextAlign(NVGcontext* ctx);
+
 // Draws text string at specified location. If end is specified only the sub-string up to the end is drawn.
 float nvgText(NVGcontext* ctx, float x, float y, const char* string, const char* end);
 
@@ -614,6 +635,16 @@ void nvgTextBoxBounds(NVGcontext* ctx, float x, float y, float breakRowWidth, co
 // Calculates the glyph x positions of the specified text. If end is specified only the sub-string will be used.
 // Measured values are returned in local coordinate space.
 int nvgTextGlyphPositions(NVGcontext* ctx, float x, float y, const char* string, const char* end, NVGglyphPosition* positions, int maxPositions);
+
+// dankc patch: draws `nruns` pre-shaped glyphs (see NVGglyphRun above) at
+// (x + runs[i].x, y + runs[i].y). Honors the current fill color, font size,
+// blur, and *vertical* text align (top/middle/baseline/bottom) exactly like
+// nvgText(); horizontal alignment is the caller's responsibility (shape.c
+// sums the shaper's own advances) since fontstash has no way to measure a
+// pre-shaped run's total width itself. Returns x unchanged (kept for
+// signature symmetry with nvgText; callers needing the end position should
+// track it themselves, e.g. via the last run's x + its advance).
+float nvgTextGlyphs(NVGcontext* ctx, float x, float y, const NVGglyphRun* runs, int nruns);
 
 // Returns the vertical metrics based on the current text style.
 // Measured values are returned in local coordinate space.
