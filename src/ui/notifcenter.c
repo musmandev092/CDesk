@@ -414,7 +414,24 @@ static void draw_card(dc_notif_center *nc, const dc_notification *n, float x, fl
         nvgFontSize(vg, 12.0f);
         nvgFillColor(vg, tc_alpha(t->surface_text, 160));
         nvgTextLineHeight(vg, 1.15f);
-        dc_shape_draw_textbox(nc->render, tx, y + 53.0f, tw, n->body, NULL);
+        /* This 30px scissor only budgets 2 rows -- but dc_shape_draw_textbox()
+         * word-wraps by width alone and will happily lay out a 3rd (or more)
+         * row, whose clipped remnant peeks out just above the button row
+         * directly below (reproduced with a real 3-line Slack message: a
+         * sliver of wrapped text bled in above "Dismiss/Reply/Mark as
+         * read"). Clamp to 2 rows and ellipsize the 2nd instead of letting a
+         * 3rd row exist at all. */
+        NVGtextRow rows[3];
+        int nrows = nvgTextBreakLines(vg, n->body, NULL, tw, rows, 3);
+        if (nrows <= 2) {
+            dc_shape_draw_textbox(nc->render, tx, y + 53.0f, tw, n->body, NULL);
+        } else {
+            dc_shape_draw_text(nc->render, tx, y + 53.0f, rows[0].start, rows[0].end);
+            char rest_buf[DC_NOTIF_BODY], line2_buf[DC_NOTIF_BODY];
+            snprintf(rest_buf, sizeof(rest_buf), "%s", rows[1].start);
+            dc_shape_ellipsize(nc->render, rest_buf, tw, line2_buf, sizeof(line2_buf));
+            dc_shape_draw_text(nc->render, tx, y + 53.0f + 12.0f * 1.15f, line2_buf, NULL);
+        }
         nvgRestore(vg);
     }
 
