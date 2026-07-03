@@ -15,6 +15,7 @@
 #include "services/clipboard.h"
 #include "services/dbus.h"
 #include "services/audio.h"
+#include "services/display.h"
 #include "services/autostart.h"
 #include "services/logind.h"
 #include "services/mpris.h"
@@ -54,6 +55,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 
@@ -939,6 +941,83 @@ int main(int argc, char **argv)
     }
 
     dc_niri *niri = dc_niri_connect();
+
+    /* DANKC_DISPLAY_TEST=1: read-verification for the Displays service
+     * layer (docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.3) -- log the full
+     * `dc_display_list()` result at startup so it can be diffed by hand
+     * against `niri msg -j outputs`. Read-only; never touches display state. */
+    if (getenv("DANKC_DISPLAY_TEST")) {
+        dc_display_info outs[DC_DISPLAY_MAX_OUTPUTS];
+        int n = dc_display_list(outs);
+        dc_info("display test: %d output(s)", n);
+        for (int i = 0; i < n; i++) {
+            const dc_display_info *o = &outs[i];
+            dc_info("display[%d]: name=%s make=\"%s\" model=\"%s\" serial=\"%s\"", i, o->name,
+                    o->make, o->model, o->serial);
+            dc_info("display[%d]: enabled=%d focused=%d pos=(%d,%d) logical=%dx%d scale=%.4f "
+                     "transform=%s vrr_supported=%d vrr_enabled=%d current_mode_idx=%d",
+                    i, o->enabled, o->is_focused, o->x, o->y, o->logical_width, o->logical_height,
+                    o->scale, dc_display_transform_name(o->transform), o->vrr_supported,
+                    o->vrr_enabled, o->current_mode_idx);
+            for (int m = 0; m < o->mode_count; m++) {
+                char refresh[16];
+                dc_display_format_refresh(o->modes[m].refresh_mhz, refresh, sizeof(refresh));
+                dc_info("display[%d].mode[%d]: %dx%d@%sHz preferred=%d%s", i, m, o->modes[m].width,
+                        o->modes[m].height, refresh, o->modes[m].is_preferred,
+                        m == o->current_mode_idx ? " <-- current" : "");
+            }
+        }
+
+        /* Write-path verification: only ever exercised when
+         * DANKC_DISPLAY_DRYRUN=1 is ALSO set -- checked here at the call
+         * site (not just inside display.c's run_niri_output_cmd()) as a
+         * second, redundant safety gate so this test path can never fire a
+         * real `niri msg output ...` against the user's live session. */
+        if (n > 0 && getenv("DANKC_DISPLAY_DRYRUN")) {
+            const dc_display_info *o = &outs[0];
+            dc_info("display test: dry-run write-path check on %s", o->name);
+            dc_display_set_mode(o->name, o->modes[0].width, o->modes[0].height,
+                    o->modes[0].refresh_mhz);
+            dc_display_set_mode_auto(o->name);
+            dc_display_set_scale(o->name, 1.5);
+            dc_display_set_position(o->name, 0, 0);
+            dc_display_set_position_auto(o->name);
+            dc_display_set_transform(o->name, DC_DISPLAY_TRANSFORM_90);
+            dc_display_set_enabled(o->name, true);
+            dc_display_set_enabled(o->name, false);
+            dc_display_set_vrr(o->name, true);
+            dc_display_set_vrr(o->name, false);
+        }
+
+        /* Persist-path verification: always targets an isolated temp
+         * directory, never $HOME/.config/niri -- safe to run unconditionally
+         * alongside the read test. */
+        if (n > 0) {
+            dc_display_persist_config cfg = {0};
+            snprintf(cfg.name, sizeof(cfg.name), "%s", outs[0].name);
+            cfg.has_mode = true;
+            cfg.width = outs[0].modes[0].width;
+            cfg.height = outs[0].modes[0].height;
+            cfg.refresh_mhz = outs[0].modes[0].refresh_mhz;
+            cfg.has_scale = true;
+            cfg.scale = outs[0].scale;
+            cfg.has_transform = true;
+            cfg.transform = outs[0].transform;
+            cfg.has_position = true;
+            cfg.x = outs[0].x;
+            cfg.y = outs[0].y;
+            cfg.has_enabled = true;
+            cfg.enabled = true;
+            cfg.has_vrr = true;
+            cfg.vrr_enabled = outs[0].vrr_enabled;
+
+            const char *tmp_dir = "/tmp/dankc-display-persist-test";
+            mkdir(tmp_dir, 0755);
+            bool ok = dc_display_persist(&cfg, 1, tmp_dir);
+            dc_info("display test: persist to isolated %s -> %s", tmp_dir, ok ? "ok" : "FAILED");
+        }
+    }
+
     dc_dbus *dbus = dc_dbus_connect();
     dc_bluez_init(dbus);
     dc_net_init(dbus);
