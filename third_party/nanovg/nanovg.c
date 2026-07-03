@@ -2596,18 +2596,43 @@ float nvgTextGlyphs(NVGcontext* ctx, float x, float y, const NVGglyphRun* runs, 
 	if (verts == NULL) return x;
 
 	for (i = 0; i < nruns; i++) {
-		float gx = (x + runs[i].x) * scale;
-		float gy = (y + runs[i].y) * scale + valign;
+		float gx, gy;
 		float c[4*2];
-		int ok = fonsGetGlyphQuadByIndex(ctx->fs, state->fontId, runs[i].gid, isize, iblur,
-										  FONS_GLYPH_BITMAP_REQUIRED, gx, gy, &q);
+		int ok;
+
+		// A non-positive glyph id means the shaper's font has no glyph at
+		// all for this position (e.g. the font lacks that codepoint) --
+		// permanently unrenderable, never an atlas-space problem. Skip it
+		// WITHOUT calling nvg__allocTextAtlas(): that function resets the
+		// whole glyph atlas (see fonsResetAtlas), which would invalidate
+		// the atlas UV coordinates already baked into `verts` for every
+		// glyph queued earlier in this same run -- since those vertices
+		// aren't flushed to the GPU until nvg__renderText() below, a
+		// mid-loop reset here left them pointing at whatever the atlas
+		// reallocated into that texture region afterward, rendering as
+		// wrong/garbled glyphs. (Real "atlas full" cases below, where the
+		// glyph DOES exist, still correctly flush pending verts before
+		// resetting.)
+		if (runs[i].gid <= 0)
+			continue;
+
+		gx = (x + runs[i].x) * scale;
+		gy = (y + runs[i].y) * scale + valign;
+		ok = fonsGetGlyphQuadByIndex(ctx->fs, state->fontId, runs[i].gid, isize, iblur,
+									  FONS_GLYPH_BITMAP_REQUIRED, gx, gy, &q);
 		if (!ok) {
+			// Atlas full: flush what's already queued so its UVs stay
+			// valid against the CURRENT atlas contents before resetting.
+			if (nverts != 0) {
+				nvg__renderText(ctx, verts, nverts);
+				nverts = 0;
+			}
 			if (!nvg__allocTextAtlas(ctx))
 				break; // no memory :(
 			ok = fonsGetGlyphQuadByIndex(ctx->fs, state->fontId, runs[i].gid, isize, iblur,
 										  FONS_GLYPH_BITMAP_REQUIRED, gx, gy, &q);
 			if (!ok)
-				continue; // still can't find/rasterize this glyph? skip it, not the whole run.
+				continue; // still can't rasterize this glyph? skip it, not the whole run.
 		}
 		if (isFlipped) {
 			float tmp;
