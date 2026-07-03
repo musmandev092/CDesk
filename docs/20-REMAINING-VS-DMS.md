@@ -42,3 +42,15 @@ parity for core surfaces; below is what DMS has that dankc lacks, triaged.
 6. Battery protection + Power&Sleep depth (M) — laptop-relevant
 
 Everything else = HOLD until user picks.
+
+## Addendum (from theming/IPC catalogs)
+- **⭐ Matugen system-wide theming** (HIGH VALUE): DMS regenerates GTK3/4, Qt5/6ct, KDE, terminals
+  (kitty/foot/alacritty/ghostty/wezterm), Firefox/Zen, Discord (vesktop/vencord), Neovim/Emacs/Zed/
+  VSCode, dgop — all recolored from the wallpaper/accent via the `matugen` binary + per-app template
+  toml/templates, gated by ~24 per-app toggles, live-applied (gsettings/SIGUSR reload). dankc themes
+  ONLY itself. This is the single biggest "cohesive desktop" gap. Effort M-L (matugen is external;
+  mostly shipping the config/template set + invoking matugen + the settings toggles). RECOMMEND: build
+  — makes the whole desktop match, high daily visibility.
+- **Richer IPC** (`dms ipc call <domain> <verb>`, ~90 commands): dankc has `dankc ctl` (fewer). Extend
+  incrementally as needed. S per command.
+- **Per-monitor wallpaper + light/dark wallpaper + wallpaper cycling schedule**: DMS session config. M.
