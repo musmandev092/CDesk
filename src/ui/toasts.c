@@ -7,11 +7,13 @@
 #include "render/nvg.h"
 #include "services/notifications.h"
 #include "theme/theme.h"
+#include "ui/notif_image.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
 #include <GLES2/gl2.h>
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +32,19 @@
 #define DC_SCALE_BASE 120
 
 #define DC_TOAST_STACK_H (DC_TOAST_MAX * (DC_TOAST_CARD_H + DC_TOAST_GAP))
+
+/* Hit-test rect(s) for one visible toast card, captured during draw_card()
+ * and consumed by dc_toasts_handle_click() -- same "record while drawing"
+ * convention notifcenter.c's nc_card_hit uses. The card body itself is a
+ * uniform DC_TOAST_CARD_H-tall slot at index*(DC_TOAST_CARD_H+DC_TOAST_GAP),
+ * so it doesn't need its own stored rect the way the action buttons (whose
+ * count/position varies per card) do. */
+typedef struct {
+    uint32_t id;
+    int action_count;
+    float action_x0[DC_NOTIF_ACTION_MAX], action_x1[DC_NOTIF_ACTION_MAX];
+    float action_y0, action_y1;
+} toast_card_hit;
 
 struct dc_toasts {
     dc_wayland *wl;
@@ -51,7 +66,7 @@ struct dc_toasts {
     int phys_height;
 
     /* Cards currently laid out, for hit-testing clicks. */
-    uint32_t card_ids[DC_TOAST_MAX];
+    toast_card_hit hits[DC_TOAST_MAX];
     int card_count;
 
     dc_anim anim;
@@ -96,8 +111,10 @@ static void update_input_region(dc_toasts *t, int card_count)
     wl_region_destroy(region);
 }
 
-/* Draw a single notification card at top-left (cx, cy0) in logical units. */
-static void draw_card(dc_toasts *t, const dc_notification *n, float x, float y)
+/* Draw a single notification card at top-left (cx, cy0) in logical units,
+ * recording its action-button hit rects into *hit (id/action_count already
+ * set by the caller). */
+static void draw_card(dc_toasts *t, const dc_notification *n, float x, float y, toast_card_hit *hit)
 {
     NVGcontext *vg = t->render->vg;
     const dc_theme *th = dc_theme_current;
@@ -131,23 +148,36 @@ static void draw_card(dc_toasts *t, const dc_notification *n, float x, float y)
         nvgFill(vg);
     }
 
-    /* Avatar circle with the app's initial. */
+    /* Avatar: the notification's image (image-data hint / image-path /
+     * app_icon file) cover-fit into the circle, else a circle with the app's
+     * initial -- see notif_image.h (cache shared with notifcenter.c). */
     const float av_r = 20.0f;
     const float av_cx = x + 16.0f + av_r;
     const float av_cy = y + h / 2.0f;
+    int img_w = 0, img_h = 0;
+    int img = dc_notif_image_get(t->render, n, &img_w, &img_h);
     nvgBeginPath(vg);
     nvgCircle(vg, av_cx, av_cy, av_r);
-    nvgFillColor(vg, nvgRGBA(th->primary.r, th->primary.g, th->primary.b, 255));
-    nvgFill(vg);
+    if (img > 0 && img_w > 0 && img_h > 0) {
+        float scale = fmaxf((av_r * 2.0f) / (float)img_w, (av_r * 2.0f) / (float)img_h);
+        float iw = (float)img_w * scale, ih = (float)img_h * scale;
+        NVGpaint pat =
+            nvgImagePattern(vg, av_cx - iw / 2.0f, av_cy - ih / 2.0f, iw, ih, 0.0f, img, 1.0f);
+        nvgFillPaint(vg, pat);
+        nvgFill(vg);
+    } else {
+        nvgFillColor(vg, nvgRGBA(th->primary.r, th->primary.g, th->primary.b, 255));
+        nvgFill(vg);
 
-    char initial[2] = {0};
-    initial[0] = n->app_name[0] ? (char)toupper((unsigned char)n->app_name[0]) : '?';
-    nvgFontFaceId(vg, t->render->font_ui);
-    nvgFontSize(vg, 20.0f);
-    nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
-    nvgFillColor(vg, nvgRGBA(th->surface_container.r, th->surface_container.g,
-                             th->surface_container.b, 255));
-    nvgText(vg, av_cx, av_cy + 1.0f, initial, NULL);
+        char initial[2] = {0};
+        initial[0] = n->app_name[0] ? (char)toupper((unsigned char)n->app_name[0]) : '?';
+        nvgFontFaceId(vg, t->render->font_ui);
+        nvgFontSize(vg, 20.0f);
+        nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+        nvgFillColor(vg, nvgRGBA(th->surface_container.r, th->surface_container.g,
+                                 th->surface_container.b, 255));
+        nvgText(vg, av_cx, av_cy + 1.0f, initial, NULL);
+    }
 
     /* Text column. */
     const float tx = av_cx + av_r + 14.0f;
@@ -167,14 +197,58 @@ static void draw_card(dc_toasts *t, const dc_notification *n, float x, float y)
     nvgText(vg, tx, y + 31.0f, n->summary, NULL);
     nvgRestore(vg);
 
+    /* Body text yields its bottom rows to a pill-button row when the
+     * notification has actions (docs/13-POPOUTS-SPEC.md; DMS's NotificationPopup
+     * reserves basePopupHeight for actionButtonHeight the same way). */
+    bool has_actions = n->action_count > 0;
+    float body_h = has_actions ? 16.0f : 30.0f;
     if (n->body[0]) {
         nvgFontSize(vg, 13.0f);
         nvgFillColor(vg, nvgRGBA(th->surface_text.r, th->surface_text.g, th->surface_text.b, 170));
         nvgSave(vg);
-        nvgScissor(vg, tx, y + 50.0f, tw, 30.0f);
+        nvgScissor(vg, tx, y + 50.0f, tw, body_h);
         nvgTextLineHeight(vg, 1.1f);
         nvgTextBox(vg, tx, y + 51.0f, tw, n->body, NULL);
         nvgRestore(vg);
+    }
+
+    hit->action_count = 0;
+    if (has_actions) {
+        /* Right-aligned pill row, drawn right-to-left (mirrors notifcenter.c's
+         * draw_card) so array order still reads left-to-right; buttons past
+         * the text column's left edge are silently skipped rather than
+         * overlapping the avatar. */
+        const float row_y1 = y + h - 6.0f;
+        const float row_h = 18.0f;
+        const float row_y0 = row_y1 - row_h;
+        const float row_min_x = tx;
+        float cursor_x1 = x + w - 14.0f;
+
+        nvgFontFaceId(vg, t->render->font_ui);
+        nvgFontSize(vg, 12.0f);
+        nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+
+        hit->action_count = n->action_count;
+        hit->action_y0 = row_y0;
+        hit->action_y1 = row_y1;
+        for (int i = n->action_count - 1; i >= 0; i--) {
+            const char *label = n->actions[i].label[0] ? n->actions[i].label : "Open";
+            float b[4];
+            nvgTextBounds(vg, 0, 0, label, NULL, b);
+            float aw = b[2] - b[0] + 16.0f;
+            if (aw < 44.0f)
+                aw = 44.0f;
+            float a_x0 = cursor_x1 - aw;
+            if (a_x0 < row_min_x || cursor_x1 <= row_min_x) {
+                hit->action_x0[i] = hit->action_x1[i] = 0.0f; /* no room -- not drawn/clickable */
+                continue;
+            }
+            nvgFillColor(vg, nvgRGBA(th->primary.r, th->primary.g, th->primary.b, 255));
+            nvgText(vg, (a_x0 + cursor_x1) / 2.0f, (row_y0 + row_y1) / 2.0f, label, NULL);
+            hit->action_x0[i] = a_x0;
+            hit->action_x1[i] = cursor_x1;
+            cursor_x1 = a_x0 - 6.0f;
+        }
     }
 }
 
@@ -214,10 +288,14 @@ static void toasts_render(dc_toasts *t)
     nvgTranslate(vg, (1.0f - ap) * 40.0f, 0.0f);
 
     for (int i = 0; i < count; i++) {
-        t->card_ids[i] = popups[i]->id;
-        draw_card(t, popups[i], 0.0f, (float)(i * (DC_TOAST_CARD_H + DC_TOAST_GAP)));
+        t->hits[i].id = popups[i]->id;
+        draw_card(t, popups[i], 0.0f, (float)(i * (DC_TOAST_CARD_H + DC_TOAST_GAP)), &t->hits[i]);
     }
     nvgEndFrame(vg);
+
+    /* GL context is still current -- drop cached textures for anything no
+     * longer Current/History (dismissed/expired-and-acted-on/cleared). */
+    dc_notif_image_gc(t->render, t->notifications);
 
     if (dc_anim_active(&t->anim) && !t->frame_cb) {
         t->frame_cb = wl_surface_frame(t->surface);
@@ -379,12 +457,30 @@ bool dc_toasts_handle_click(dc_toasts *t, struct wl_surface *surface, double x, 
 {
     if (!t || !t->visible || surface != t->surface)
         return false;
-    DC_UNUSED(x);
     int idx = (int)(y / (DC_TOAST_CARD_H + DC_TOAST_GAP));
-    if (idx >= 0 && idx < t->card_count) {
-        double within = y - idx * (DC_TOAST_CARD_H + DC_TOAST_GAP);
-        if (within <= DC_TOAST_CARD_H)
-            dc_notifications_dismiss(t->notifications, t->card_ids[idx]);
+    if (idx < 0 || idx >= t->card_count)
+        return true;
+    double within = y - idx * (DC_TOAST_CARD_H + DC_TOAST_GAP);
+    if (within > DC_TOAST_CARD_H)
+        return true;
+
+    const toast_card_hit *hit = &t->hits[idx];
+    for (int i = 0; i < hit->action_count; i++) {
+        if (hit->action_x1[i] > hit->action_x0[i] && x >= hit->action_x0[i] &&
+            x <= hit->action_x1[i] && y >= hit->action_y0 && y <= hit->action_y1) {
+            dc_notifications_invoke_action(t->notifications, hit->id, i);
+            return true;
+        }
     }
+
+    /* Body click (not on an action button): DMS's NotificationPopup invokes
+     * the first action if there is one, otherwise just dismisses -- see
+     * NotificationPopup.qml's cardHoverArea onClicked (the
+     * canExpand/description-toggle branch doesn't apply here, dankc's toast
+     * body isn't expandable). */
+    if (hit->action_count > 0)
+        dc_notifications_invoke_action(t->notifications, hit->id, 0);
+    else
+        dc_notifications_dismiss(t->notifications, hit->id);
     return true;
 }

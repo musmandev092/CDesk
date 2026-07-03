@@ -24,6 +24,29 @@ struct dc_dbus;
 #define DC_NOTIF_ICON 160
 #define DC_NOTIF_ACTION 48
 
+/* Action-buttons row (docs/13-POPOUTS-SPEC.md sec.3; DMS's NotificationPopup/
+ * NotificationCard render a Repeater over the "default"-filtered actions
+ * array). Capped at 4: DMS's own layout hides its separate "Dismiss" pill
+ * once actionCount>=3, i.e. it isn't designed for more than a handful of
+ * buttons either; 4 is generous headroom over what any real sender sends
+ * (typically 1-2) while keeping dc_notification's fixed size bounded. */
+#define DC_NOTIF_ACTION_MAX 4
+
+/* Inline image bound (image-data hint, iiibiiay): stored pixels are
+ * downscaled (nearest-neighbor) to fit within this many px on the long side
+ * before being kept, so a single notification can never pin down more than
+ * DC_NOTIF_IMAGE_MAX_DIM^2*4 bytes -- see notifications.c's
+ * decode_image_data(). 128 comfortably covers every on-screen use (toast/
+ * center avatar circle is ~40px) while being sharp on HiDPI. */
+#define DC_NOTIF_IMAGE_MAX_DIM 128
+
+/* Memory bound for History: only the N most-recently-archived History
+ * entries keep their decoded image-data pixels; older ones have
+ * image_pixels freed (falls back to re-resolving image_path/app_icon from
+ * disk, which is just a path string -- effectively free to keep forever).
+ * See notifications.c's enforce_history_image_cap(). */
+#define DC_NOTIF_HISTORY_IMAGE_KEEP 8
+
 typedef enum {
     DC_URGENCY_LOW = 0,
     DC_URGENCY_NORMAL = 1,
@@ -47,14 +70,41 @@ typedef enum {
     DC_NOTIF_HISTORY = 1,
 } dc_notif_status;
 
+/* One action button: key is what's sent back in ActionInvoked, label is the
+ * button text. The spec's reserved "default" key (invoked by clicking the
+ * notification body itself, not a button) is filtered out at parse time --
+ * see method_notify() -- so everything in dc_notification.actions[] is a
+ * real, clickable button. */
+typedef struct {
+    char key[DC_NOTIF_ACTION];
+    char label[DC_NOTIF_ACTION];
+} dc_notif_action;
+
 typedef struct {
     uint32_t id;
     char app_name[DC_NOTIF_APP];
     char summary[DC_NOTIF_SUMMARY];
     char body[DC_NOTIF_BODY];
-    char app_icon[DC_NOTIF_ICON];
-    char action_key[DC_NOTIF_ACTION];   /* first non-"default" action id, "" if none */
-    char action_label[DC_NOTIF_ACTION]; /* that action's button label, e.g. "Open" */
+    char app_icon[DC_NOTIF_ICON]; /* icon name (XDG theme) or absolute path from the Notify() app_icon arg / icon_data hint */
+    char image_path[DC_NOTIF_ICON]; /* image-path hint: absolute file path, higher priority than app_icon */
+    dc_notif_action actions[DC_NOTIF_ACTION_MAX];
+    int action_count;
+    bool resident; /* "resident" hint: don't auto-dismiss the card after ActionInvoked */
+
+    /* Decoded image-data hint (iiibiiay), downscaled to <=DC_NOTIF_IMAGE_MAX_DIM
+     * per side -- RGBA8, row-major, malloc'd by decode_image_data(); NULL if
+     * the app didn't send this hint (image_path/app_icon are the fallback,
+     * resolved+cached by the renderer instead since they're just paths).
+     * Freed on slot reuse/clear/destroy and by enforce_history_image_cap()
+     * once archived past DC_NOTIF_HISTORY_IMAGE_KEEP -- see notifications.c.
+     * image_version bumps every time this notification's slot is (re)filled
+     * by Notify() so a renderer's nvg-image cache (keyed by id+version) knows
+     * to reload after a replaces_id update, even though `id` itself is
+     * unchanged. */
+    unsigned char *image_pixels;
+    int image_w, image_h;
+    uint32_t image_version;
+
     dc_urgency urgency;
     int expire_timeout_ms; /* -1 = server default, 0 = never expire */
     int64_t created_ms;    /* CLOCK_MONOTONIC ms when posted -- lifetime/ordering math */
@@ -110,10 +160,12 @@ void dc_notifications_clear_history(dc_notifications *n);
  * closed once). */
 void dc_notifications_dismiss(dc_notifications *n, uint32_t id);
 
-/* Per-card action button (e.g. "Open"): emits ActionInvoked for `id`'s first
- * action, then resolves it exactly like dc_notifications_dismiss(). No-op if
- * `id` has no action. */
-void dc_notifications_invoke_action(dc_notifications *n, uint32_t id);
+/* Per-card action button: emits ActionInvoked for `id`'s actions[action_index],
+ * then resolves it exactly like dc_notifications_dismiss() -- UNLESS the
+ * notification carries the "resident" hint, in which case it stays put (spec:
+ * a resident notification isn't auto-removed after an action). No-op if `id`
+ * doesn't exist or action_index is out of range. */
+void dc_notifications_invoke_action(dc_notifications *n, uint32_t id, int action_index);
 
 /* True if a notification has arrived since the notification center was last
  * opened (docs/12-BAR-SPEC.md sec.4 notificationButton: the bell's unread
