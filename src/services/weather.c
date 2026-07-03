@@ -336,6 +336,44 @@ static void start_fetch(void)
 
 bool dc_weather_get(dc_weather_state *out)
 {
+    /* DANKC_WEATHER_FAKE=1 (debug-only, env-gated -- same convention as
+     * battery.c's DANKC_FAKE_BATTERY / net.c's DANKC_WIFI_FAKE_AP): populate
+     * a deterministic 7-day + 24h forecast so the dashboard Weather tab's
+     * card grid/hourly row can be visually verified on a machine with no
+     * network access to Open-Meteo. Checked once and cached; no-op unset. */
+    static int fake = -1;
+    if (fake < 0)
+        fake = getenv("DANKC_WEATHER_FAKE") ? 1 : 0;
+    if (fake) {
+        memset(out, 0, sizeof(*out));
+        out->valid = true;
+        out->temp_c = 24;
+        out->weather_code = 2;
+        out->is_day = true;
+        out->have_current_extra = true;
+        out->feels_like = 26;
+        out->humidity = 55;
+        out->wind_kmh = 14;
+        out->pressure_hpa = 1013;
+        out->precip_prob = 20;
+        static const int codes[7] = {2, 0, 3, 61, 2, 1, 3};
+        for (int i = 0; i < 7; i++) {
+            out->daily[i].weather_code = codes[i];
+            out->daily[i].temp_max = 26 + i;
+            out->daily[i].temp_min = 14 + (i % 3);
+            snprintf(out->daily[i].sunrise, sizeof(out->daily[i].sunrise), "06:1%d", i % 10);
+            snprintf(out->daily[i].sunset, sizeof(out->daily[i].sunset), "19:0%d", i % 10);
+        }
+        out->daily_count = 7;
+        for (int i = 0; i < 24; i++) {
+            out->hourly[i].weather_code = codes[i % 7];
+            out->hourly[i].temp_c = 18 + (i % 10);
+            out->hourly[i].hour = i;
+        }
+        out->hourly_count = 24;
+        return true;
+    }
+
     if (!g_weather.configured) {
         memset(out, 0, sizeof(*out));
         return false;
