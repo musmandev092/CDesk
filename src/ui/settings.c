@@ -733,23 +733,6 @@ static bool xdg_default_browser(char *out, size_t n)
     return cache_ok;
 }
 
-static bool xdg_default_filemanager(char *out, size_t n)
-{
-    static char cache[DC_XDG_ID_MAX];
-    static bool cache_ok;
-    static time_t cache_time;
-    time_t now = time(NULL);
-    if (cache_time && now - cache_time < SYS_CACHE_SECONDS) {
-        snprintf(out, n, "%s", cache);
-        return cache_ok;
-    }
-    cache_time = now;
-    cache_ok = xdg_query("xdg-mime query default inode/directory 2>/dev/null", cache,
-                         sizeof(cache));
-    snprintf(out, n, "%s", cache);
-    return cache_ok;
-}
-
 static bool xdg_default_terminal(char *out, size_t n)
 {
     static char cache[DC_XDG_ID_MAX];
@@ -774,13 +757,6 @@ static void xdg_set_browser(const char *desktop_id)
     run_xdg_detached(cmd);
 }
 
-static void xdg_set_filemanager(const char *desktop_id)
-{
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "xdg-mime default %s inode/directory", desktop_id);
-    run_xdg_detached(cmd);
-}
-
 static void xdg_set_terminal(const char *desktop_id)
 {
     char cmd[320];
@@ -789,24 +765,6 @@ static void xdg_set_terminal(const char *desktop_id)
              "\"${XDG_CONFIG_HOME:-$HOME/.config}/xdg-terminals.list\"",
              desktop_id);
     run_xdg_detached(cmd);
-}
-
-/* Heuristic category match against a desktop-entry id/exec (apps.c doesn't
- * parse Categories=; matching DMS's exact category-based filtering would
- * need extending that shared service, so this stays local to the tab --
- * see docs/14-COMPLETION-PLAN.md W2.8). Case-insensitive substring match on
- * a short curated keyword list per role. */
-static bool id_matches_any(const char *id, const char *const *needles, int n)
-{
-    char lower[DC_APP_ID];
-    size_t i = 0;
-    for (; id[i] && i + 1 < sizeof(lower); i++)
-        lower[i] = (char)tolower((unsigned char)id[i]);
-    lower[i] = '\0';
-    for (int k = 0; k < n; k++)
-        if (strstr(lower, needles[k]))
-            return true;
-    return false;
 }
 
 /* --- backlight: read sysfs directly (controlcenter.c's read_brightness
@@ -1515,17 +1473,162 @@ static const char *strip_desktop_suffix(const char *id, char *buf, size_t bufsz)
     return buf;
 }
 
-/* One Default Apps role: current value (read-only, live xdg query) + a
- * scrollable pick-list of installed apps heuristically matching `keywords`
- * (apps.c doesn't parse Categories=, docs/14-COMPLETION-PLAN.md W2.8 --
- * matching DMS's category-based dropdown exactly would need extending that
- * shared service). Clicking a row calls `set_fn` with the ".desktop"-suffixed
- * id xdg-settings/xdg-mime expect. */
-static void default_app_role(uictx *c, const char *label, bool (*get_fn)(char *, size_t),
-                             void (*set_fn)(const char *), const char *const *keywords, int nkw)
+/* One Default Apps category (docs/17-DEFAULT-APPS-PLAN.md sec 5.1). mimes[0]
+ * is the primary MIME type (used for `xdg-mime query default`/enumeration
+ * reads and as the first arg to the batched write); mimes[1..nmimes-1] are
+ * "also set" MIME types folded into that same write. `category`, if non-NULL,
+ * switches BOTH candidate enumeration (dc_apps_find_by_category() instead of
+ * dc_apps_find_by_mime()) to a Categories= token -- used for the three roles
+ * where plain MimeType= matching is the wrong tool (Web Browser/File Manager/
+ * Terminal, see docs/17 sec 1.6/1.7); reads/writes for these still go through
+ * their own special mechanism per is_browser/is_terminal below. */
+typedef struct {
+    const char *label;   /* UI row label, e.g. "Web Browser" */
+    const char *section; /* ui_section() header this row falls under */
+    const char *const *mimes;
+    int nmimes;
+    const char *category; /* NULL => enumerate by mimes[0] instead */
+    bool is_browser;       /* true only for the one row using xdg-settings */
+    bool is_terminal;      /* true only for the one row using xdg-terminals.list */
+} dc_default_app_category;
+
+static const char *const cat_browser_mimes[] = {
+    "x-scheme-handler/http",
+    "x-scheme-handler/https",
+    "text/html",
+    "application/xhtml+xml",
+};
+static const char *const cat_mailto_mimes[] = {"x-scheme-handler/mailto"};
+static const char *const cat_calendar_mimes[] = {"text/calendar", "x-scheme-handler/calendar"};
+static const char *const cat_rss_mimes[] = {"application/rss+xml", "application/atom+xml"};
+static const char *const cat_geo_mimes[] = {"x-scheme-handler/geo"};
+static const char *const cat_torrent_mimes[] = {"application/x-bittorrent",
+                                                "x-scheme-handler/magnet"};
+static const char *const cat_filemgr_mimes[] = {"inode/directory"};
+static const char *const cat_archive_mimes[] = {
+    "application/zip",     "application/x-tar",       "application/x-7z-compressed",
+    "application/vnd.rar", "application/gzip", "application/x-bzip2",       "application/x-xz",
+};
+static const char *const cat_software_mimes[] = {"application/x-desktop"};
+static const char *const cat_text_mimes[] = {"text/plain"};
+static const char *const cat_pdf_mimes[] = {"application/pdf"};
+static const char *const cat_doc_mimes[] = {
+    "application/vnd.oasis.opendocument.text",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "text/rtf",
+};
+static const char *const cat_sheet_mimes[] = {
+    "application/vnd.oasis.opendocument.spreadsheet",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "text/csv",
+};
+static const char *const cat_slide_mimes[] = {
+    "application/vnd.oasis.opendocument.presentation",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+};
+static const char *const cat_ebook_mimes[] = {"application/epub+zip",
+                                              "application/x-mobipocket-ebook"};
+static const char *const cat_image_mimes[] = {
+    "image/png", "image/jpeg", "image/gif", "image/bmp", "image/webp", "image/svg+xml",
+    "image/tiff",
+};
+static const char *const cat_video_mimes[] = {
+    "video/mp4",  "video/x-matroska", "video/webm",      "video/mpeg",
+    "video/quicktime", "video/x-msvideo", "video/ogg",
+};
+static const char *const cat_audio_mimes[] = {
+    "audio/mpeg", "audio/flac", "audio/x-flac", "audio/ogg",
+    "audio/wav",  "audio/x-wav", "audio/aac",    "audio/opus",
+};
+
+#define DC_MIMES(arr) arr, (int)(sizeof(arr) / sizeof((arr)[0]))
+
+static const dc_default_app_category DEFAULT_APP_CATEGORIES[] = {
+    {"Web Browser", "INTERNET", DC_MIMES(cat_browser_mimes), "WebBrowser", true, false},
+    {"Email", "INTERNET", DC_MIMES(cat_mailto_mimes), NULL, false, false},
+    {"Calendar", "INTERNET", DC_MIMES(cat_calendar_mimes), NULL, false, false},
+    {"RSS Reader", "INTERNET", DC_MIMES(cat_rss_mimes), NULL, false, false},
+    {"Maps", "INTERNET", DC_MIMES(cat_geo_mimes), NULL, false, false},
+    {"Torrent Client", "INTERNET", DC_MIMES(cat_torrent_mimes), NULL, false, false},
+    {"File Manager", "FILES & SYSTEM", DC_MIMES(cat_filemgr_mimes), "FileManager", false, false},
+    {"Terminal", "FILES & SYSTEM", NULL, 0, "TerminalEmulator", false, true},
+    {"Archive Manager", "FILES & SYSTEM", DC_MIMES(cat_archive_mimes), NULL, false, false},
+    {"Software Center", "FILES & SYSTEM", DC_MIMES(cat_software_mimes), NULL, false, false},
+    {"Text Editor", "DOCUMENTS", DC_MIMES(cat_text_mimes), NULL, false, false},
+    {"PDF Viewer", "DOCUMENTS", DC_MIMES(cat_pdf_mimes), NULL, false, false},
+    {"Document Viewer", "DOCUMENTS", DC_MIMES(cat_doc_mimes), NULL, false, false},
+    {"Spreadsheet", "DOCUMENTS", DC_MIMES(cat_sheet_mimes), NULL, false, false},
+    {"Presentation", "DOCUMENTS", DC_MIMES(cat_slide_mimes), NULL, false, false},
+    {"E-book Reader", "DOCUMENTS", DC_MIMES(cat_ebook_mimes), NULL, false, false},
+    {"Image Viewer", "MEDIA", DC_MIMES(cat_image_mimes), NULL, false, false},
+    {"Video Player", "MEDIA", DC_MIMES(cat_video_mimes), NULL, false, false},
+    {"Music Player", "MEDIA", DC_MIMES(cat_audio_mimes), NULL, false, false},
+};
+#define DC_DEFAULT_APP_CAT_COUNT \
+    (int)(sizeof(DEFAULT_APP_CATEGORIES) / sizeof(DEFAULT_APP_CATEGORIES[0]))
+
+/* Per-row read cache for the generic MIME categories (mirrors
+ * xdg_default_browser()/xdg_default_terminal()'s single-role statics above,
+ * generalized to every row instead of one static per role). Indexed by the
+ * row's position in DEFAULT_APP_CATEGORIES[]. */
+typedef struct {
+    char cache[DC_XDG_ID_MAX];
+    bool cache_ok;
+    time_t cache_time;
+} dc_xdg_mime_cache;
+static dc_xdg_mime_cache g_default_app_cache[32];
+
+static bool xdg_default_mime(int idx, const char *mime, char *out, size_t n)
+{
+    dc_xdg_mime_cache *slot = &g_default_app_cache[idx];
+    time_t now = time(NULL);
+    if (slot->cache_time && now - slot->cache_time < SYS_CACHE_SECONDS) {
+        snprintf(out, n, "%s", slot->cache);
+        return slot->cache_ok;
+    }
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "xdg-mime query default %s 2>/dev/null", mime);
+    slot->cache_time = now;
+    slot->cache_ok = xdg_query(cmd, slot->cache, sizeof(slot->cache));
+    snprintf(out, n, "%s", slot->cache);
+    return slot->cache_ok;
+}
+
+/* Batch every mime in `mimes` into one `xdg-mime default` call (one file
+ * rewrite instead of N -- see docs/17 sec 1.1/4). */
+static void xdg_set_mimes(const char *desktop_id, const char *const *mimes, int nmimes)
+{
+    char cmd[768];
+    int off = snprintf(cmd, sizeof(cmd), "xdg-mime default %s", desktop_id);
+    for (int i = 0; i < nmimes && off > 0 && (size_t)off < sizeof(cmd); i++)
+        off += snprintf(cmd + off, sizeof(cmd) - (size_t)off, " %s", mimes[i]);
+    run_xdg_detached(cmd);
+}
+
+/* One Default Apps row: current value (read-only, live xdg query, cached
+ * SYS_CACHE_SECONDS) + a scrollable pick-list of installed apps that
+ * genuinely declare the category's MimeType=/Categories= (dc_apps_find_by_
+ * mime()/dc_apps_find_by_category(), apps.c -- real desktop-entry data, not
+ * a name heuristic). Clicking a candidate writes it as the new default via
+ * the row's write path: xdg-settings + a batched xdg-mime write for the
+ * browser (docs/17 sec 4), xdg-terminals.list for the terminal, else one
+ * batched `xdg-mime default` call covering every mime in the row. `idx` is
+ * this row's position in DEFAULT_APP_CATEGORIES[], used only to key the
+ * per-row read cache above. */
+static void default_app_row(uictx *c, const dc_default_app_category *cat, int idx)
 {
     char cur[DC_XDG_ID_MAX];
-    bool have = get_fn(cur, sizeof(cur));
+    bool have;
+    if (cat->is_browser)
+        have = xdg_default_browser(cur, sizeof(cur));
+    else if (cat->is_terminal)
+        have = xdg_default_terminal(cur, sizeof(cur));
+    else
+        have = xdg_default_mime(idx, cat->mimes[0], cur, sizeof(cur));
+
     char cur_stripped[DC_XDG_ID_MAX];
     if (have)
         strip_desktop_suffix(cur, cur_stripped, sizeof(cur_stripped));
@@ -1534,61 +1637,60 @@ static void default_app_role(uictx *c, const char *label, bool (*get_fn)(char *,
 
     char valline[64];
     snprintf(valline, sizeof(valline), "%s", have ? cur_stripped : "(none set)");
-    ui_value(c, label, valline);
+    ui_value(c, cat->label, valline);
 
-    const dc_app *apps[300];
-    int n = dc_apps_search(c->s->apps, "", apps, 300);
+    const dc_app *apps[16];
+    int n = cat->category ? dc_apps_find_by_category(c->s->apps, cat->category, apps, 16)
+                          : dc_apps_find_by_mime(c->s->apps, cat->mimes[0], apps, 16);
+
     int shown = 0;
     for (int i = 0; i < n && shown < 6; i++) {
-        if (!id_matches_any(apps[i]->id, keywords, nkw))
-            continue;
         bool active = have && strcmp(apps[i]->id, cur_stripped) == 0;
         if (ui_list_row(c, apps[i]->name, active ? "Default" : NULL, 0, active) == 1 &&
             !active) {
             char withdesktop[DC_APP_ID + 16];
             snprintf(withdesktop, sizeof(withdesktop), "%s.desktop", apps[i]->id);
-            set_fn(withdesktop);
+            if (cat->is_browser) {
+                xdg_set_browser(withdesktop);
+                xdg_set_mimes(withdesktop, cat->mimes, cat->nmimes);
+            } else if (cat->is_terminal) {
+                xdg_set_terminal(withdesktop);
+            } else {
+                xdg_set_mimes(withdesktop, cat->mimes, cat->nmimes);
+            }
         }
         shown++;
     }
     if (shown == 0)
-        ui_hint(c, "No installed apps matched (heuristic name match; try DANKC_XDG_DRYRUN=1)");
+        ui_hint(c, "No apps found");
 }
 
-/* docs/14-COMPLETION-PLAN.md W2.8: browser/file-manager/terminal pickers.
- * Reads are always live (xdg-settings/xdg-mime/xdg-terminals.list); writes
- * are detached shell commands gated by DANKC_XDG_DRYRUN for offline
- * verification (see run_xdg_detached() above) -- this tab never has its own
- * config.json keys, same pattern as the Audio/Network/Bluetooth tabs (the
- * xdg databases and $XDG_CONFIG_HOME/xdg-terminals.list ARE the persisted
- * state; dc_config_save() has nothing to add). */
+/* docs/17-DEFAULT-APPS-PLAN.md: 19-category default-apps manager. Reads are
+ * always live (xdg-settings/xdg-mime/xdg-terminals.list, cached
+ * SYS_CACHE_SECONDS); writes are detached shell commands gated by
+ * DANKC_XDG_DRYRUN for offline verification (see run_xdg_detached() above)
+ * -- this tab never has its own config.json keys, same pattern as the Audio/
+ * Network/Bluetooth tabs (the xdg databases and $XDG_CONFIG_HOME/xdg-
+ * terminals.list ARE the persisted state; dc_config_save() has nothing to
+ * add). One generalized loop over DEFAULT_APP_CATEGORIES[] replaces the old
+ * one-hand-written-block-per-role approach. */
 static void tab_default_apps(uictx *c)
 {
     if (!c->s->apps)
         c->s->apps = dc_apps_load();
 
-    static const char *const browser_kw[] = {"firefox",  "chromium", "chrome",     "brave",
-                                             "librewolf", "vivaldi",  "opera",      "epiphany",
-                                             "falkon",    "qutebrowser", "waterfox", "thorium"};
-    static const char *const filemgr_kw[] = {"nautilus", "files",  "dolphin", "thunar",
-                                             "nemo",      "pcmanfm", "krusader", "caja",
-                                             "doublecmd", "ranger"};
-    static const char *const term_kw[] = {"alacritty", "kitty",   "foot",       "konsole",
-                                         "xterm",     "wezterm", "terminal",   "terminator",
-                                         "tilix",     "urxvt",   "ghostty",    "contour",
-                                         "xterm"};
-
-    ui_section(c, "INTERNET");
-    default_app_role(c, "Web Browser", xdg_default_browser, xdg_set_browser, browser_kw,
-                     (int)(sizeof(browser_kw) / sizeof(browser_kw[0])));
-
-    ui_section(c, "UTILITIES");
-    default_app_role(c, "File Manager", xdg_default_filemanager, xdg_set_filemanager, filemgr_kw,
-                     (int)(sizeof(filemgr_kw) / sizeof(filemgr_kw[0])));
-    default_app_role(c, "Terminal", xdg_default_terminal, xdg_set_terminal, term_kw,
-                     (int)(sizeof(term_kw) / sizeof(term_kw[0])));
-    ui_hint(c, "Terminal uses xdg-terminals.list (read by xdg-terminal-exec); the");
-    ui_hint(c, "others use xdg-settings/xdg-mime, same as DMS's Default Apps tab.");
+    const char *last_section = NULL;
+    for (int i = 0; i < DC_DEFAULT_APP_CAT_COUNT; i++) {
+        const dc_default_app_category *cat = &DEFAULT_APP_CATEGORIES[i];
+        if (!last_section || strcmp(last_section, cat->section) != 0) {
+            ui_section(c, cat->section);
+            last_section = cat->section;
+        }
+        default_app_row(c, cat, i);
+    }
+    ui_hint(c, "Terminal uses xdg-terminals.list (read by xdg-terminal-exec); Web");
+    ui_hint(c, "Browser/File Manager/Terminal match Categories=, others match");
+    ui_hint(c, "MimeType= (real .desktop data, not a name guess).");
 }
 
 /* docs/14-COMPLETION-PLAN.md W2 "Locale": first day of week for the
