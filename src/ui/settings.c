@@ -11,7 +11,9 @@
 #include "services/bluez.h"
 #include "services/display.h"
 #include "services/net.h"
+#include "services/nightlight.h"
 #include "services/power.h"
+#include "services/printers.h"
 #include "services/weather.h"
 #include "theme/theme.h"
 #include "ui/material_bg.h"
@@ -103,6 +105,12 @@
  * render/icons.h (used nowhere else yet), no font-subset update needed. */
 #define IC_EXPAND_MORE DC_ICON_EXPAND_MORE
 #define IC_EXPAND_LESS DC_ICON_EXPAND_LESS
+/* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.4: Night Light gets its own tab
+ * (replaces the old duplicated pgrep/pkill/gammastep toggle that used to live
+ * in tab_displays). Glyph already used by controlcenter.c's "Night Mode"
+ * tile -- already in the bundled font subset, no scripts/subset-fonts.sh
+ * update needed. */
+#define IC_NIGHTLIGHT DC_ICON_NIGHTLIGHT
 
 typedef enum {
     TAB_PERSONALIZATION = 0,
@@ -113,6 +121,7 @@ typedef enum {
     TAB_WEATHER,
     TAB_DOCK,
     TAB_DISPLAYS,
+    TAB_NIGHTLIGHT,
     TAB_AUDIO,
     TAB_NETWORK,
     TAB_BLUETOOTH,
@@ -144,6 +153,7 @@ static const s_tab_def TABS[TAB_COUNT] = {
     {IC_TEXT_FORMAT, "Typography & Motion"}, {IC_TOOLBAR, "Bar"},
     {IC_WIDGETS, "Widgets"},              {IC_CLOUD, "Weather"},
     {IC_DOCK, "Dock"},                    {IC_MONITOR, "Displays"},
+    {IC_NIGHTLIGHT, "Night Light"},
     {IC_AUDIO, "Audio"},                  {IC_NETWORK, "Network"},
     {IC_BLUETOOTH, "Bluetooth"},          {IC_NOTIFICATIONS, "Notifications"},
     {IC_GRID_VIEW, "Launcher"},           {IC_APPS, "Default Apps"},
@@ -208,6 +218,13 @@ struct dc_settings {
      * disclosure is open right now. */
     int disp_selected;
     bool disp_res_open;
+
+    /* Network tab hotspot form (docs/19 sec.2, "Hotspot" section extension):
+     * draft SSID/password, not persisted anywhere until "Start Hotspot" is
+     * clicked -- dc_net_hotspot_start() is the actual owner of the resulting
+     * NetworkManager connection, this is just the in-progress form state. */
+    char net_hotspot_ssid[64];
+    char net_hotspot_password[64];
 };
 
 /* Bounded string copy without gcc's -Wformat-truncation firing: several text
@@ -854,27 +871,6 @@ static void backlight_set(const backlight_info *bl, float frac)
              ">/dev/null 2>&1",
              bl->device, raw);
     run_detached(cmd);
-}
-
-/* --- night mode: gammastep one-shot, same command pair as main.c's `dankc
- * ctl night`. State = "a gammastep process exists". The local flip below
- * makes the toggle respond instantly instead of waiting out the cache. */
-static bool night_mode_read(void)
-{
-    static bool cache = false;
-    static time_t cache_time = 0;
-    time_t now = time(NULL);
-    if (cache_time && now - cache_time < SYS_CACHE_SECONDS)
-        return cache;
-    cache_time = now;
-    cache = system("pgrep -x gammastep >/dev/null 2>&1") == 0;
-    return cache;
-}
-
-static void night_mode_toggle(void)
-{
-    run_detached("if pgrep -x gammastep >/dev/null; then pkill -x gammastep; "
-                 "else gammastep -O 4000 >/dev/null 2>&1 & fi");
 }
 
 /* --- default audio *source* (mic) mute state; audio.h's dc_audio_read()
@@ -2103,14 +2099,6 @@ static void tab_displays(uictx *c)
         ui_hint(c, "No backlight device found");
     }
 
-    ui_section(c, "NIGHT MODE");
-    static opt_flip night_flip;
-    bool night = flip_get(&night_flip, night_mode_read());
-    if (ui_toggle(c, "Night mode", "Warm color temperature (gammastep, 4000K)", night)) {
-        night_mode_toggle();
-        flip_set(&night_flip, !night);
-    }
-
     ui_section(c, "MONITORS");
     dc_display_info outs[DC_DISPLAY_MAX_OUTPUTS];
     int n = dc_display_list(outs);
@@ -2180,6 +2168,86 @@ static void tab_displays(uictx *c)
             }
         }
         dc_display_persist(cfgs, cn, NULL);
+    }
+}
+
+/* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.4: Night Light -- its own tab now
+ * (replaces the old duplicated pgrep/pkill/gammastep-O-4000 one-shot that
+ * used to live in tab_displays; main.c's `ctl night` was already migrated to
+ * this same services/nightlight.c backend). All state is owned by
+ * nightlight.c (persists to config.json itself) -- this tab is a thin
+ * getter/setter view, same shape as tab_power over services/power.c. */
+static void tab_nightlight(uictx *c)
+{
+    ui_section(c, "NIGHT LIGHT");
+    dc_nightlight_backend be = dc_nightlight_backend_get();
+    if (be == DC_NIGHTLIGHT_BACKEND_NONE) {
+        ui_hint(c, "No backend found -- install wlsunset or gammastep.");
+        return;
+    }
+    char backend_line[64];
+    snprintf(backend_line, sizeof(backend_line), "Backend: %s", dc_nightlight_backend_name(be));
+    ui_hint(c, backend_line);
+
+    static opt_flip enabled_flip;
+    bool enabled = flip_get(&enabled_flip, dc_nightlight_active());
+    if (ui_toggle(c, "Enable Night Light", "Warm color temperature at night", enabled)) {
+        dc_nightlight_enable(!enabled);
+        flip_set(&enabled_flip, !enabled);
+    }
+
+    ui_section(c, "TEMPERATURE");
+    static opt_value temp_pending;
+    float temp = (float)dc_nightlight_get_temp();
+    float pv;
+    if (opt_value_get(&temp_pending, &pv))
+        temp = pv;
+    char tv[16];
+    snprintf(tv, sizeof(tv), "%dK", (int)lroundf(temp));
+    if (ui_slider(c, "Color temperature (night side)", &temp, 2500.0f, 6500.0f, tv)) {
+        int k = (int)lroundf(temp);
+        dc_nightlight_set_temp(k);
+        opt_value_set(&temp_pending, (float)k);
+    }
+
+    ui_section(c, "SCHEDULE");
+    dc_nightlight_schedule sched = dc_nightlight_get_schedule();
+    static const char *const sched_opts[] = {"Manual", "Sunset - Sunrise", "Custom Times"};
+    int clicked = ui_segmented(c, "Mode", sched_opts, 3, (int)sched);
+    if (clicked >= 0 && clicked != (int)sched) {
+        char from[6], to[6];
+        dc_nightlight_get_times(from, sizeof(from), to, sizeof(to));
+        dc_nightlight_set_schedule((dc_nightlight_schedule)clicked, from, to);
+        sched = (dc_nightlight_schedule)clicked;
+    }
+
+    if (sched == DC_NIGHTLIGHT_SCHED_SUNSET) {
+        ui_hint(c, "Uses the Weather tab's latitude/longitude for sunset/sunrise.");
+    } else if (sched == DC_NIGHTLIGHT_SCHED_TIMES) {
+        char from[6], to[6];
+        dc_nightlight_get_times(from, sizeof(from), to, sizeof(to));
+
+        bool from_focus = c->s->focus_field == 7;
+        char frombuf[6];
+        if (from_focus)
+            copy_trunc(frombuf, sizeof(frombuf), c->s->edit_buf);
+        else
+            snprintf(frombuf, sizeof(frombuf), "%s", from);
+        if (ui_textfield(c, "From (HH:MM)", frombuf, from_focus)) {
+            c->s->focus_field = 7;
+            snprintf(c->s->edit_buf, sizeof(c->s->edit_buf), "%s", from);
+        }
+
+        bool to_focus = c->s->focus_field == 8;
+        char tobuf[6];
+        if (to_focus)
+            copy_trunc(tobuf, sizeof(tobuf), c->s->edit_buf);
+        else
+            snprintf(tobuf, sizeof(tobuf), "%s", to);
+        if (ui_textfield(c, "To (HH:MM)", tobuf, to_focus)) {
+            c->s->focus_field = 8;
+            snprintf(c->s->edit_buf, sizeof(c->s->edit_buf), "%s", to);
+        }
     }
 }
 
@@ -3433,6 +3501,9 @@ static void build_tab(uictx *c)
     case TAB_DISPLAYS:
         tab_displays(c);
         break;
+    case TAB_NIGHTLIGHT:
+        tab_nightlight(c);
+        break;
     case TAB_AUDIO:
         tab_audio(c);
         break;
@@ -3540,6 +3611,32 @@ static void commit_edit(dc_settings *s)
     case 6: /* niri window-rules "add" app-id draft -- not config.json state, see
              * wr_add_rule() (writes ~/.config/niri/dankc-rules.kdl instead) */
         copy_trunc(s->wr_new_app_id, sizeof(s->wr_new_app_id), s->edit_buf);
+        break;
+    case 7: { /* nightlight custom-schedule "from" HH:MM -- nightlight.c owns
+               * persistence itself, so this calls straight into the service
+               * rather than mutating cfg (the dc_config_save() below is a
+               * harmless no-op extra for this field, same as case 6). */
+        char from[6], to[6];
+        dc_nightlight_get_times(from, sizeof(from), to, sizeof(to));
+        char newfrom[6];
+        copy_trunc(newfrom, sizeof(newfrom), s->edit_buf);
+        dc_nightlight_set_schedule(DC_NIGHTLIGHT_SCHED_TIMES, newfrom, to);
+        break;
+    }
+    case 8: { /* nightlight custom-schedule "to" HH:MM */
+        char from[6], to[6];
+        dc_nightlight_get_times(from, sizeof(from), to, sizeof(to));
+        char newto[6];
+        copy_trunc(newto, sizeof(newto), s->edit_buf);
+        dc_nightlight_set_schedule(DC_NIGHTLIGHT_SCHED_TIMES, from, newto);
+        break;
+    }
+    case 9: /* network hotspot SSID draft -- not persisted until "Start
+             * Hotspot" is clicked (tab_network), see dc_settings.net_hotspot_ssid */
+        copy_trunc(s->net_hotspot_ssid, sizeof(s->net_hotspot_ssid), s->edit_buf);
+        break;
+    case 10: /* network hotspot password draft */
+        copy_trunc(s->net_hotspot_password, sizeof(s->net_hotspot_password), s->edit_buf);
         break;
     default:
         break;
