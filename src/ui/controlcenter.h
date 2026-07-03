@@ -9,6 +9,7 @@
 #define DC_UI_CONTROLCENTER_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 struct dc_wayland;
 struct dc_egl;
@@ -43,5 +44,14 @@ void dc_control_center_handle_release(dc_control_center *cc);
 
 /* Pointer left the panel: clears hover + any in-progress drag. */
 void dc_control_center_handle_leave(dc_control_center *cc);
+
+/* True while the inline Wi-Fi password field (W1.1) is open -- lets main.c
+ * route keys here first, same pattern as dc_settings_wants_keyboard(). */
+bool dc_control_center_wants_keyboard(dc_control_center *cc);
+
+/* Handle a key while dc_control_center_wants_keyboard() is true: Escape
+ * cancels the password panel, Enter/BackSpace edit/submit it, otherwise
+ * `utf8` is appended (masked-dot rendering, control chars filtered). */
+void dc_control_center_handle_key(dc_control_center *cc, uint32_t keysym, const char *utf8);
 
 #endif /* DC_UI_CONTROLCENTER_H */

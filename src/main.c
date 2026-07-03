@@ -319,6 +319,7 @@ struct kbd_ctx {
     dc_processes *processes;
     dc_lock *lock;
     dc_settings *settings;
+    dc_control_center *control_center;
     dc_powermenu *powermenu;
     dc_keybinds_modal *keybinds_modal;
     dc_polkit_modal *polkit_modal;
@@ -333,6 +334,8 @@ static void handle_key(uint32_t keysym, const char *utf8, void *data)
         dc_polkit_modal_handle_key(k->polkit_modal, keysym, utf8);
     else if (dc_settings_wants_keyboard(k->settings))
         dc_settings_handle_key(k->settings, keysym, utf8);
+    else if (dc_control_center_wants_keyboard(k->control_center))
+        dc_control_center_handle_key(k->control_center, keysym, utf8);
     else if (dc_clip_picker_visible(k->clip_picker))
         dc_clip_picker_handle_key(k->clip_picker, keysym, utf8);
     else if (dc_processes_visible(k->processes))
@@ -1013,6 +1016,7 @@ int main(int argc, char **argv)
         .processes = processes,
         .lock = lock,
         .settings = settings,
+        .control_center = control_center,
         .powermenu = powermenu,
         .keybinds_modal = keybinds_modal,
         .polkit_modal = polkit_modal};

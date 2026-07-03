@@ -365,7 +365,49 @@ int dc_net_wifi_scan(dc_net_wifi_ap *out, int max)
     int n = g_scan.count < max ? g_scan.count : max;
     if (n > 0)
         memcpy(out, g_scan.aps, (size_t)n * sizeof(*out));
+
+    /* DANKC_WIFI_FAKE_AP=<ssid> (debug-only, env-gated -- same convention as
+     * services/battery.c's DANKC_FAKE_BATTERY): append one synthetic
+     * secured, not-yet-known, not-in-use AP so the inline password panel
+     * (W1.1) can be screenshotted on a machine whose real scan results don't
+     * happen to include an unknown secured network. No-op when unset. */
+    const char *fake_ssid = getenv("DANKC_WIFI_FAKE_AP");
+    if (fake_ssid && fake_ssid[0] && n < max) {
+        dc_net_wifi_ap *ap = &out[n];
+        memset(ap, 0, sizeof(*ap));
+        snprintf(ap->ssid, sizeof(ap->ssid), "%s", fake_ssid);
+        ap->signal_percent = 62;
+        ap->secured = true;
+        ap->in_use = false;
+        ap->known = false;
+        n++;
+    }
+
     return n;
+}
+
+/* Single-quote `in` for /bin/sh into `out`, escaping any embedded single
+ * quotes ('\'' -- close quote, literal quote, reopen quote). Shared by
+ * dc_net_wifi_connect() and the password-entry connect job below so both
+ * build shell-safe nmcli invocations the same way. */
+static void shell_quote_single(const char *in, char *out, size_t out_sz)
+{
+    size_t j = 0;
+    if (out_sz == 0)
+        return;
+    out[j++] = '\'';
+    for (const char *p = in; *p && j < out_sz - 6; p++) {
+        if (*p == '\'') {
+            out[j++] = '\'';
+            out[j++] = '\\';
+            out[j++] = '\'';
+            out[j++] = '\'';
+        } else {
+            out[j++] = *p;
+        }
+    }
+    out[j++] = '\'';
+    out[j] = '\0';
 }
 
 void dc_net_wifi_connect(const char *ssid)
@@ -373,23 +415,8 @@ void dc_net_wifi_connect(const char *ssid)
     if (!ssid || !ssid[0])
         return;
 
-    /* Single-quote the SSID for /bin/sh, escaping any embedded single quotes
-     * ('\'' -- close quote, literal quote, reopen quote). */
     char quoted[192];
-    size_t j = 0;
-    quoted[j++] = '\'';
-    for (const char *p = ssid; *p && j < sizeof(quoted) - 6; p++) {
-        if (*p == '\'') {
-            quoted[j++] = '\'';
-            quoted[j++] = '\\';
-            quoted[j++] = '\'';
-            quoted[j++] = '\'';
-        } else {
-            quoted[j++] = *p;
-        }
-    }
-    quoted[j++] = '\'';
-    quoted[j] = '\0';
+    shell_quote_single(ssid, quoted, sizeof(quoted));
 
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "nmcli dev wifi connect %s", quoted);
@@ -405,4 +432,180 @@ void dc_net_wifi_connect(const char *ssid)
      * read instead of serving a pre-connect "Disconnected" for up to a few
      * seconds. */
     scan_arm_next(2);
+}
+
+/* --- Wi-Fi password entry connect job (control-center inline password
+ * field, W1.1) -- same fork+pipe+non-blocking-drain shape as the scan list
+ * above, but for a single one-shot `nmcli dev wifi connect ... password ...`
+ * whose combined stdout+stderr is inspected once the child exits so the UI
+ * can tell a wrong password apart from success. */
+#define DC_NET_CONNECT_TIMEOUT_SEC 15
+#define DC_NET_CONNECT_BUF_CAP 2048
+#define DC_NET_CONNECT_DRYRUN_DELAY_SEC 1
+
+static struct {
+    dc_net_connect_state state;
+    char err[128];
+
+    bool active; /* a real nmcli child is running */
+    pid_t pid;
+    int fd;
+    char buf[DC_NET_CONNECT_BUF_CAP];
+    size_t len;
+    struct timespec started;
+
+    bool dryrun_pending; /* DANKC_WIFI_DRYRUN: simulate without a child */
+} g_connect = {.fd = -1};
+
+/* Look for nmcli's own "Error: ..." line in its (stdout+stderr) output and
+ * copy it into `err` -- that's the only failure signal available (no exit
+ * status; SIGCHLD is SIG_IGN process-wide, see the file header comment). */
+static void connect_extract_error(const char *buf, char *err, size_t err_sz)
+{
+    const char *e = strstr(buf, "Error");
+    if (!e)
+        e = strstr(buf, "error");
+    if (!e) {
+        snprintf(err, err_sz, "Connection failed");
+        return;
+    }
+    size_t len = strcspn(e, "\r\n");
+    if (len >= err_sz)
+        len = err_sz - 1;
+    memcpy(err, e, len);
+    err[len] = '\0';
+}
+
+static void connect_finish(bool eof_reached)
+{
+    close(g_connect.fd);
+    g_connect.fd = -1;
+    g_connect.active = false;
+
+    if (!eof_reached) {
+        g_connect.state = DC_NET_CONNECT_FAILED;
+        snprintf(g_connect.err, sizeof(g_connect.err), "Timed out");
+        return;
+    }
+
+    g_connect.buf[g_connect.len] = '\0';
+    if (strstr(g_connect.buf, "Error") || strstr(g_connect.buf, "error")) {
+        g_connect.state = DC_NET_CONNECT_FAILED;
+        connect_extract_error(g_connect.buf, g_connect.err, sizeof(g_connect.err));
+    } else {
+        g_connect.state = DC_NET_CONNECT_SUCCESS;
+        /* Reflect "Connected" in the scan list soon instead of waiting a
+         * full DC_NET_SCAN_REFRESH_SEC. */
+        scan_arm_next(2);
+    }
+}
+
+void dc_net_wifi_connect_reset(void)
+{
+    if (g_connect.pid > 0)
+        kill(g_connect.pid, SIGKILL);
+    if (g_connect.fd >= 0)
+        close(g_connect.fd);
+    memset(&g_connect, 0, sizeof(g_connect));
+    g_connect.fd = -1;
+    g_connect.state = DC_NET_CONNECT_IDLE;
+}
+
+void dc_net_wifi_connect_psk(const char *ssid, const char *psk)
+{
+    if (!ssid || !ssid[0])
+        return;
+    dc_net_wifi_connect_reset();
+
+    char quoted_ssid[192], quoted_psk[192];
+    shell_quote_single(ssid, quoted_ssid, sizeof(quoted_ssid));
+    shell_quote_single(psk ? psk : "", quoted_psk, sizeof(quoted_psk));
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "nmcli dev wifi connect %s password %s 2>&1", quoted_ssid,
+             quoted_psk);
+
+    g_connect.state = DC_NET_CONNECT_IN_PROGRESS;
+    clock_gettime(CLOCK_MONOTONIC, &g_connect.started);
+
+    if (getenv("DANKC_WIFI_DRYRUN")) {
+        /* Never spawn nmcli -- just prove the command was built correctly. */
+        dc_info("net: [DANKC_WIFI_DRYRUN] would run: %s", cmd);
+        g_connect.dryrun_pending = true;
+        return;
+    }
+
+    int fds[2];
+    if (pipe(fds) < 0) {
+        g_connect.state = DC_NET_CONNECT_FAILED;
+        snprintf(g_connect.err, sizeof(g_connect.err), "pipe() failed");
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        g_connect.state = DC_NET_CONNECT_FAILED;
+        snprintf(g_connect.err, sizeof(g_connect.err), "fork() failed");
+        return;
+    }
+
+    if (pid == 0) { /* child: nmcli -> write end of the pipe */
+        close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+        close(fds[1]);
+        setsid();
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+
+    close(fds[1]);
+    fcntl(fds[0], F_SETFL, O_NONBLOCK);
+
+    g_connect.fd = fds[0];
+    g_connect.pid = pid;
+    g_connect.len = 0;
+    g_connect.active = true;
+}
+
+dc_net_connect_state dc_net_wifi_connect_poll(char *err, size_t err_sz)
+{
+    if (g_connect.dryrun_pending) {
+        if (scan_secs_since(&g_connect.started) < DC_NET_CONNECT_DRYRUN_DELAY_SEC)
+            return DC_NET_CONNECT_IN_PROGRESS;
+        g_connect.dryrun_pending = false;
+        g_connect.state = DC_NET_CONNECT_SUCCESS;
+        return g_connect.state;
+    }
+
+    if (g_connect.active) {
+        if (scan_secs_since(&g_connect.started) > DC_NET_CONNECT_TIMEOUT_SEC) {
+            kill(g_connect.pid, SIGKILL);
+            connect_finish(false);
+        } else {
+            struct pollfd pfd = {.fd = g_connect.fd, .events = POLLIN};
+            if (poll(&pfd, 1, 0) > 0) {
+                for (;;) {
+                    if (g_connect.len + 1 >= sizeof(g_connect.buf)) {
+                        connect_finish(true);
+                        break;
+                    }
+                    ssize_t n = read(g_connect.fd, g_connect.buf + g_connect.len,
+                                     sizeof(g_connect.buf) - g_connect.len - 1);
+                    if (n > 0) {
+                        g_connect.len += (size_t)n;
+                        continue;
+                    }
+                    if (n == 0)
+                        connect_finish(true);
+                    break; /* EAGAIN (n < 0): try again next call */
+                }
+            }
+        }
+    }
+
+    if (g_connect.state == DC_NET_CONNECT_FAILED && err && err_sz)
+        snprintf(err, err_sz, "%s", g_connect.err);
+    return g_connect.state;
 }
