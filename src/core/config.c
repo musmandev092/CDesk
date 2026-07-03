@@ -64,6 +64,8 @@ static dc_config config = {
     .frame_enabled = false,
     .frame_radius = 12.0f,
     .material_blur = true,
+
+    .autostart_enabled = true,
 };
 
 const dc_config *dc_config_current = &config;
@@ -292,6 +294,7 @@ void dc_config_load(void)
     get_bool(root, "frameEnabled", &config.frame_enabled);
     get_float(root, "frameRadius", &config.frame_radius, 0.0f, 200.0f);
     get_bool(root, "materialBlur", &config.material_blur);
+    get_bool(root, "autostartEnabled", &config.autostart_enabled);
     cJSON_Delete(root);
 
     apply_theme();
@@ -398,6 +401,7 @@ void dc_config_save(void)
     cJSON_AddBoolToObject(root, "frameEnabled", config.frame_enabled);
     cJSON_AddNumberToObject(root, "frameRadius", (double)config.frame_radius);
     cJSON_AddBoolToObject(root, "materialBlur", config.material_blur);
+    cJSON_AddBoolToObject(root, "autostartEnabled", config.autostart_enabled);
 
     char *text = cJSON_Print(root);
     cJSON_Delete(root);
