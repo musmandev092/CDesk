@@ -563,6 +563,17 @@ typedef struct {
 
 static bluez_agent_state g_agent;
 
+/* Push-notification hook for the UI (dc_bluez_set_agent_cb()); NULL until a
+ * caller registers one. Invoked from the same request/display handlers that
+ * drive g_agent above, so the UI can react immediately instead of only ever
+ * polling dc_bluez_agent_poll() once per frame. */
+static dc_bluez_agent_cb g_agent_cb = NULL;
+
+void dc_bluez_set_agent_cb(dc_bluez_agent_cb cb)
+{
+    g_agent_cb = cb;
+}
+
 /* Best-effort human-readable name for a Device1 object path -- Alias (falls
  * back to Name-less devices' MAC, same fallback order as scan_objects()'s
  * dev_name/dev_alias/mac chain). Used only for the agent dialog's device
@@ -597,10 +608,23 @@ static int agent_method_request_pin_code(sd_bus_message *m, void *userdata, sd_b
 {
     DC_UNUSED(userdata);
     DC_UNUSED(ret_error);
-    /* Legacy PIN-code pairing (pre-SSP devices) has no dankc UI yet -- reject
-     * rather than silently hanging BlueZ's request. */
-    return sd_bus_reply_method_errorf(m, "org.bluez.Error.Rejected",
-                                      "PIN code entry not supported");
+    /* Legacy pre-SSP PIN pairing: answerable exactly like RequestPasskey,
+     * just with a string reply (up to 16 ASCII chars per the Bluetooth
+     * spec) instead of a uint32 -- reuses the same deferred-reply shape via
+     * dc_bluez_agent_respond_pin_code() below. */
+    if (g_agent.pending_msg || g_agent.fake_pending)
+        return sd_bus_reply_method_errorf(m, "org.bluez.Error.Rejected", "busy");
+
+    const char *device = NULL;
+    sd_bus_message_read(m, "o", &device);
+
+    g_agent.kind = DC_BLUEZ_AGENT_PIN_CODE;
+    agent_device_display_name(device, g_agent.device_name, sizeof(g_agent.device_name));
+    g_agent.passkey_str[0] = '\0';
+    g_agent.pending_msg = sd_bus_message_ref(m);
+    if (g_agent_cb)
+        g_agent_cb(g_agent.kind, g_agent.device_name, g_agent.passkey_str);
+    return 1; /* handled; reply deferred until dc_bluez_agent_respond_pin_code() */
 }
 
 static int agent_method_display_pin_code(sd_bus_message *m, void *userdata, sd_bus_error *ret_error)
@@ -610,6 +634,15 @@ static int agent_method_display_pin_code(sd_bus_message *m, void *userdata, sd_b
     const char *device = NULL, *pincode = NULL;
     sd_bus_message_read(m, "os", &device, &pincode);
     dc_info("bluez: DisplayPinCode %s: %s", device ? device : "?", pincode ? pincode : "?");
+    /* Notification only (BlueZ doesn't wait for a UI decision here, dankc
+     * replies immediately below either way) -- pushed straight to the
+     * callback rather than through g_agent/dc_bluez_agent_poll(), since
+     * there is nothing to answer. */
+    if (g_agent_cb) {
+        char name[64];
+        agent_device_display_name(device, name, sizeof(name));
+        g_agent_cb(DC_BLUEZ_AGENT_DISPLAY_PIN_CODE, name, pincode ? pincode : "");
+    }
     return sd_bus_reply_method_return(m, "");
 }
 
@@ -627,6 +660,8 @@ static int agent_method_request_passkey(sd_bus_message *m, void *userdata, sd_bu
     agent_device_display_name(device, g_agent.device_name, sizeof(g_agent.device_name));
     g_agent.passkey_str[0] = '\0';
     g_agent.pending_msg = sd_bus_message_ref(m);
+    if (g_agent_cb)
+        g_agent_cb(g_agent.kind, g_agent.device_name, g_agent.passkey_str);
     return 1; /* handled; reply deferred until dc_bluez_agent_respond_passkey() */
 }
 
@@ -640,6 +675,14 @@ static int agent_method_display_passkey(sd_bus_message *m, void *userdata, sd_bu
     sd_bus_message_read(m, "ouq", &device, &passkey, &entered);
     dc_debug("bluez: DisplayPasskey %s: %06u (%u digits entered)", device ? device : "?",
             (unsigned)passkey, (unsigned)entered);
+    /* Notification only, same shape as DisplayPinCode above. */
+    if (g_agent_cb) {
+        char name[64];
+        char passkey_str[8];
+        agent_device_display_name(device, name, sizeof(name));
+        snprintf(passkey_str, sizeof(passkey_str), "%06u", (unsigned)passkey);
+        g_agent_cb(DC_BLUEZ_AGENT_DISPLAY_PASSKEY, name, passkey_str);
+    }
     return sd_bus_reply_method_return(m, "");
 }
 
@@ -659,6 +702,8 @@ static int agent_method_request_confirmation(sd_bus_message *m, void *userdata,
     agent_device_display_name(device, g_agent.device_name, sizeof(g_agent.device_name));
     snprintf(g_agent.passkey_str, sizeof(g_agent.passkey_str), "%06u", (unsigned)passkey);
     g_agent.pending_msg = sd_bus_message_ref(m);
+    if (g_agent_cb)
+        g_agent_cb(g_agent.kind, g_agent.device_name, g_agent.passkey_str);
     return 1; /* handled; reply deferred until dc_bluez_agent_respond_yesno() */
 }
 
@@ -677,6 +722,8 @@ static int agent_method_request_authorization(sd_bus_message *m, void *userdata,
     agent_device_display_name(device, g_agent.device_name, sizeof(g_agent.device_name));
     g_agent.passkey_str[0] = '\0';
     g_agent.pending_msg = sd_bus_message_ref(m);
+    if (g_agent_cb)
+        g_agent_cb(g_agent.kind, g_agent.device_name, g_agent.passkey_str);
     return 1; /* handled; reply deferred until dc_bluez_agent_respond_yesno() */
 }
 
@@ -822,6 +869,19 @@ void dc_bluez_agent_respond_passkey(const char *digits)
     } else {
         sd_bus_reply_method_errorf(g_agent.pending_msg, "org.bluez.Error.Rejected", "Cancelled");
     }
+    sd_bus_message_unref(g_agent.pending_msg);
+    g_agent.pending_msg = NULL;
+    g_agent.kind = DC_BLUEZ_AGENT_NONE;
+}
+
+void dc_bluez_agent_respond_pin_code(const char *pin)
+{
+    if (!g_agent.pending_msg)
+        return;
+    if (pin && pin[0])
+        sd_bus_reply_method_return(g_agent.pending_msg, "s", pin);
+    else
+        sd_bus_reply_method_errorf(g_agent.pending_msg, "org.bluez.Error.Rejected", "Cancelled");
     sd_bus_message_unref(g_agent.pending_msg);
     g_agent.pending_msg = NULL;
     g_agent.kind = DC_BLUEZ_AGENT_NONE;
