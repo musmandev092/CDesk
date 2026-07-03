@@ -4,7 +4,12 @@
 #include "core/config.h"
 #include "core/log.h"
 #include "dc.h"
+#include "render/icons.h"
 #include "render/nvg.h"
+#include "services/audio.h"
+#include "services/bluez.h"
+#include "services/net.h"
+#include "services/power.h"
 #include "services/weather.h"
 #include "theme/theme.h"
 #include "ui/material_bg.h"
@@ -13,10 +18,12 @@
 #include "wayland/wl.h"
 
 #include <GLES2/gl2.h>
+#include <dirent.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <xkbcommon/xkbcommon-keysyms.h>
@@ -26,30 +33,38 @@
 #include "viewporter-client-protocol.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 
-#define DC_SET_WIDTH 760
-#define DC_SET_HEIGHT 600
+/* 760x600 fit the original 10 tabs; full config + system-settings coverage
+ * (docs task "settings full coverage") added 4 more sidebar tabs (Dock,
+ * Audio, Network, Bluetooth) which no longer fit at the old height. */
+#define DC_SET_WIDTH 800
+#define DC_SET_HEIGHT 720
 #define DC_SCALE_BASE 120
 #define DC_SET_PAD 6.0f
 #define DC_SIDEBAR_W 196.0f
 #define DC_CONTENT_INSET 24.0f
 #define DC_SET_THEME_COLS 5
 
-/* Material Symbols codepoints for the sidebar + a few controls (all present in
- * the bundled full font; see docs/09 inventory / SettingsSidebar.qml icons). */
-#define IC_PALETTE 0xe40a
-#define IC_SCHEDULE 0xefd6
-#define IC_TOOLBAR 0xe9f7
-#define IC_WIDGETS 0xe1bd
-#define IC_CLOUD 0xf172 /* partly_cloudy_day */
-#define IC_MONITOR 0xef5b
-#define IC_NOTIFICATIONS 0xe7f5
-#define IC_GRID_VIEW 0xe9b0
-#define IC_SECURITY 0xe32a
-#define IC_INFO 0xe88e
-#define IC_ADD 0xe145
-#define IC_REMOVE 0xe15b
-#define IC_DONE 0xe876
-#define IC_LINK 0xe250
+/* Sidebar/control icon aliases -- render/icons.h owns the actual codepoints
+ * (see its "Settings window" block) so scripts/subset-fonts.sh keeps the
+ * bundled font subset in sync automatically. */
+#define IC_PALETTE DC_ICON_PALETTE
+#define IC_SCHEDULE DC_ICON_SCHEDULE
+#define IC_TOOLBAR DC_ICON_TOOLBAR
+#define IC_WIDGETS DC_ICON_WIDGETS
+#define IC_CLOUD DC_ICON_PARTLY_CLOUDY_DAY
+#define IC_MONITOR DC_ICON_MONITOR
+#define IC_NOTIFICATIONS DC_ICON_NOTIFICATIONS
+#define IC_GRID_VIEW DC_ICON_GRID_VIEW
+#define IC_POWER DC_ICON_POWER
+#define IC_INFO DC_ICON_INFO
+#define IC_ADD DC_ICON_ADD
+#define IC_REMOVE DC_ICON_REMOVE
+#define IC_DONE DC_ICON_DONE
+#define IC_LINK DC_ICON_LINK
+#define IC_DOCK DC_ICON_DOCK_TO_BOTTOM
+#define IC_AUDIO DC_ICON_VOLUME_UP
+#define IC_NETWORK DC_ICON_WIFI
+#define IC_BLUETOOTH DC_ICON_BLUETOOTH
 
 typedef enum {
     TAB_PERSONALIZATION = 0,
@@ -57,7 +72,11 @@ typedef enum {
     TAB_BAR,
     TAB_WIDGETS,
     TAB_WEATHER,
+    TAB_DOCK,
     TAB_DISPLAYS,
+    TAB_AUDIO,
+    TAB_NETWORK,
+    TAB_BLUETOOTH,
     TAB_NOTIFICATIONS,
     TAB_LAUNCHER,
     TAB_POWER,
@@ -68,15 +87,16 @@ typedef enum {
 typedef struct {
     int icon;
     const char *label;
-    bool implemented;
 } s_tab_def;
 
 static const s_tab_def TABS[TAB_COUNT] = {
-    {IC_PALETTE, "Personalization", true},   {IC_SCHEDULE, "Time & Date", true},
-    {IC_TOOLBAR, "Bar", true},               {IC_WIDGETS, "Widgets", true},
-    {IC_CLOUD, "Weather", true},             {IC_MONITOR, "Displays", false},
-    {IC_NOTIFICATIONS, "Notifications", true}, {IC_GRID_VIEW, "Launcher", true},
-    {IC_SECURITY, "Power", false},           {IC_INFO, "About", true},
+    {IC_PALETTE, "Personalization"}, {IC_SCHEDULE, "Time & Date"},
+    {IC_TOOLBAR, "Bar"},             {IC_WIDGETS, "Widgets"},
+    {IC_CLOUD, "Weather"},           {IC_DOCK, "Dock"},
+    {IC_MONITOR, "Displays"},        {IC_AUDIO, "Audio"},
+    {IC_NETWORK, "Network"},         {IC_BLUETOOTH, "Bluetooth"},
+    {IC_NOTIFICATIONS, "Notifications"}, {IC_GRID_VIEW, "Launcher"},
+    {IC_POWER, "Power"},             {IC_INFO, "About"},
 };
 
 struct dc_settings {
@@ -102,7 +122,8 @@ struct dc_settings {
     float scroll_y;
     float content_h; /* recomputed each render, drives scroll clamp */
 
-    int focus_field; /* 0 none, 1 latitude, 2 longitude, 3 weather location, 4 wallpaper path */
+    int focus_field; /* 0 none, 1 latitude, 2 longitude, 3 weather location,
+                      * 4 wallpaper path, 5 dock pinned-app id (add) */
     char edit_buf[256];
 };
 
@@ -226,7 +247,7 @@ static bool ui_toggle(uictx *c, const char *label, const char *desc, bool value)
     if (c->mode == UI_RENDER) {
         NVGcontext *vg = c->vg;
         nvgFontFaceId(vg, c->s->render->font_ui);
-        nvgFontSize(vg, 15.0f);
+        nvgFontSize(vg, 14.0f);
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(c->t->surface_text));
         nvgText(vg, 0, c->y + (desc ? 18.0f : rh / 2.0f), label, NULL);
@@ -259,7 +280,7 @@ static bool ui_slider(uictx *c, const char *label, float *value, float lo, float
     if (c->mode == UI_RENDER) {
         NVGcontext *vg = c->vg;
         nvgFontFaceId(vg, c->s->render->font_ui);
-        nvgFontSize(vg, 15.0f);
+        nvgFontSize(vg, 14.0f);
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(c->t->surface_text));
         nvgText(vg, 0, c->y + 14.0f, label, NULL);
@@ -307,7 +328,7 @@ static bool ui_stepper(uictx *c, const char *label, int *value, int lo, int hi, 
     if (c->mode == UI_RENDER) {
         NVGcontext *vg = c->vg;
         nvgFontFaceId(vg, c->s->render->font_ui);
-        nvgFontSize(vg, 15.0f);
+        nvgFontSize(vg, 14.0f);
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(c->t->surface_text));
         nvgText(vg, 0, cy, label, NULL);
@@ -324,7 +345,7 @@ static bool ui_stepper(uictx *c, const char *label, int *value, int lo, int hi, 
         char buf[16];
         snprintf(buf, sizeof(buf), "%d", *value);
         nvgFontFaceId(vg, c->s->render->font_ui);
-        nvgFontSize(vg, 15.0f);
+        nvgFontSize(vg, 14.0f);
         nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(c->t->surface_text));
         nvgText(vg, (minus_x + bw + plus_x) / 2.0f, cy, buf, NULL);
@@ -359,7 +380,7 @@ static int ui_segmented(uictx *c, const char *label, const char *const *opts, in
     if (c->mode == UI_RENDER) {
         NVGcontext *vg = c->vg;
         nvgFontFaceId(vg, c->s->render->font_ui);
-        nvgFontSize(vg, 15.0f);
+        nvgFontSize(vg, 14.0f);
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(c->t->surface_text));
         nvgText(vg, 0, c->y + 8.0f, label, NULL);
@@ -415,7 +436,7 @@ static bool ui_textfield(uictx *c, const char *label, const char *text, bool foc
         nvgStroke(vg);
         nvgSave(vg);
         nvgScissor(vg, 0, box_y, c->w, bh);
-        nvgFontSize(vg, 15.0f);
+        nvgFontSize(vg, 14.0f);
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(c->t->surface_text));
         nvgText(vg, 12.0f, box_y + bh / 2.0f, text && text[0] ? text : " ", NULL);
@@ -435,17 +456,416 @@ static bool ui_textfield(uictx *c, const char *label, const char *text, bool foc
     return clicked;
 }
 
-static void ui_note(uictx *c, const char *text)
+/* Small left-aligned caption row (tips, "unavailable" notes). */
+static void ui_hint(uictx *c, const char *text)
 {
     if (c->mode == UI_RENDER) {
         NVGcontext *vg = c->vg;
         nvgFontFaceId(vg, c->s->render->font_ui);
-        nvgFontSize(vg, 15.0f);
-        nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
-        nvgFillColor(vg, tc_a(c->t->surface_variant_text, 150));
-        nvgText(vg, c->w / 2.0f, 120.0f, text, NULL);
+        nvgFontSize(vg, 12.0f);
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        nvgFillColor(vg, tc_a(c->t->surface_variant_text, 170));
+        nvgText(vg, 0, c->y + 8.0f, text, NULL);
     }
-    c->y += 240.0f;
+    c->y += 24.0f;
+}
+
+/* Read-only status row: label left, value right. */
+static void ui_value(uictx *c, const char *label, const char *value)
+{
+    if (c->mode == UI_RENDER) {
+        NVGcontext *vg = c->vg;
+        nvgFontFaceId(vg, c->s->render->font_ui);
+        nvgFontSize(vg, 14.0f);
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        nvgFillColor(vg, tc(c->t->surface_text));
+        nvgText(vg, 0, c->y + 20.0f, label, NULL);
+        nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
+        nvgFillColor(vg, tc(c->t->surface_variant_text));
+        nvgText(vg, c->w, c->y + 20.0f, value, NULL);
+    }
+    c->y += 40.0f;
+}
+
+/* Selectable/actionable list row inside a rounded box: title (+optional
+ * right-aligned status) and an optional trailing icon button. Returns 1 when
+ * the row body was clicked, 2 when the trailing icon was clicked, else 0.
+ * `active` paints the primary-tinted selected style. */
+static int ui_list_row(uictx *c, const char *title, const char *status, int trailing_icon,
+                       bool active)
+{
+    const float rh = 44.0f, gap = 8.0f;
+    const float bw = trailing_icon ? 36.0f : 0.0f;
+    float row_w = c->w - (trailing_icon ? bw + gap : 0.0f);
+    if (c->mode == UI_RENDER) {
+        NVGcontext *vg = c->vg;
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, 0, c->y, row_w, rh, 12.0f);
+        nvgFillColor(vg, active ? tc_a(c->t->primary, 46) : tc(c->t->surface_container_highest));
+        nvgFill(vg);
+        nvgFontFaceId(vg, c->s->render->font_ui);
+        nvgFontSize(vg, 14.0f);
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        nvgFillColor(vg, active ? tc(c->t->primary) : tc(c->t->surface_text));
+        nvgSave(vg);
+        nvgScissor(vg, 8.0f, c->y, row_w - (status ? 96.0f : 16.0f), rh);
+        nvgText(vg, 12.0f, c->y + rh / 2.0f, title, NULL);
+        nvgRestore(vg);
+        if (status) {
+            nvgFontSize(vg, 12.0f);
+            nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
+            nvgFillColor(vg, tc(c->t->surface_variant_text));
+            nvgText(vg, row_w - 12.0f, c->y + rh / 2.0f, status, NULL);
+        }
+        if (trailing_icon) {
+            float bx = c->w - bw;
+            nvgBeginPath(vg);
+            nvgRoundedRect(vg, bx, c->y + (rh - 36.0f) / 2.0f, bw, 36.0f, 10.0f);
+            nvgFillColor(vg, tc(c->t->surface_container_highest));
+            nvgFill(vg);
+            dc_render_icon(c->s->render, trailing_icon, bx + bw / 2.0f, c->y + rh / 2.0f, 18.0f,
+                           c->t->surface_text, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+        }
+    }
+    int clicked = 0;
+    if (trailing_icon && ui_click_in(c, c->w - bw, c->y, bw, rh)) {
+        clicked = 2;
+        c->hit = true;
+    } else if (ui_click_in(c, 0, c->y, row_w, rh)) {
+        clicked = 1;
+        c->hit = true;
+    }
+    c->y += rh + 8.0f;
+    return clicked;
+}
+
+/* ====================== system-settings glue (Task B) ======================
+ *
+ * These sections drive the *live system*, not dankc's config.json: audio via
+ * wpctl (services/audio.c pattern), brightness via logind SetBrightness (the
+ * unprivileged sysfs-backed setter -- busctl-style call spawned detached),
+ * night mode via gammastep (same one-shot main.c's `ctl night` uses), Wi-Fi
+ * radio via nmcli, Bluetooth power via bluetoothctl, power profiles via
+ * services/power.c. State readers are cached a few seconds (bluez.c/net.c's
+ * window) because build_tab() runs on every render AND hit pass. */
+
+/* Run a shell command detached (children auto-reaped via main.c's SIG_IGN on
+ * SIGCHLD) -- same shape as controlcenter.c's run_detached(). */
+static void run_detached(const char *cmd)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+}
+
+#define SYS_CACHE_SECONDS 3
+
+/* --- backlight: read sysfs directly (controlcenter.c's read_brightness
+ * pattern), set via logind's Session.SetBrightness (works unprivileged,
+ * unlike writing the sysfs file; brightnessctl isn't installed here). */
+typedef struct {
+    char device[64]; /* e.g. "intel_backlight" */
+    int cur, max;
+} backlight_info;
+
+static bool backlight_read(backlight_info *out)
+{
+    static backlight_info cache;
+    static bool cache_ok = false;
+    static time_t cache_time = 0;
+    time_t now = time(NULL);
+    if (cache_time && now - cache_time < SYS_CACHE_SECONDS) {
+        *out = cache;
+        return cache_ok;
+    }
+    cache_time = now;
+    cache_ok = false;
+    DIR *dir = opendir("/sys/class/backlight");
+    if (dir) {
+        struct dirent *ent;
+        while ((ent = readdir(dir))) {
+            if (ent->d_name[0] == '.')
+                continue;
+            char path[300];
+            int cur = -1, max = -1;
+            snprintf(path, sizeof(path), "/sys/class/backlight/%.200s/brightness", ent->d_name);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                if (fscanf(f, "%d", &cur) != 1)
+                    cur = -1;
+                fclose(f);
+            }
+            snprintf(path, sizeof(path), "/sys/class/backlight/%.200s/max_brightness",
+                     ent->d_name);
+            f = fopen(path, "r");
+            if (f) {
+                if (fscanf(f, "%d", &max) != 1)
+                    max = -1;
+                fclose(f);
+            }
+            if (cur >= 0 && max > 0) {
+                copy_trunc(cache.device, sizeof(cache.device), ent->d_name);
+                cache.cur = cur;
+                cache.max = max;
+                cache_ok = true;
+                break;
+            }
+        }
+        closedir(dir);
+    }
+    *out = cache;
+    return cache_ok;
+}
+
+static void backlight_set(const backlight_info *bl, float frac)
+{
+    if (frac < 0.0f)
+        frac = 0.0f;
+    if (frac > 1.0f)
+        frac = 1.0f;
+    unsigned raw = (unsigned)((float)bl->max * frac + 0.5f);
+    char cmd[256];
+    /* logind grants the session owner SetBrightness without polkit prompts;
+     * "auto" resolves the caller's own session. */
+    snprintf(cmd, sizeof(cmd),
+             "busctl call org.freedesktop.login1 /org/freedesktop/login1/session/auto "
+             "org.freedesktop.login1.Session SetBrightness ssu backlight %s %u "
+             ">/dev/null 2>&1",
+             bl->device, raw);
+    run_detached(cmd);
+}
+
+/* --- night mode: gammastep one-shot, same command pair as main.c's `dankc
+ * ctl night`. State = "a gammastep process exists". The local flip below
+ * makes the toggle respond instantly instead of waiting out the cache. */
+static bool night_mode_read(void)
+{
+    static bool cache = false;
+    static time_t cache_time = 0;
+    time_t now = time(NULL);
+    if (cache_time && now - cache_time < SYS_CACHE_SECONDS)
+        return cache;
+    cache_time = now;
+    cache = system("pgrep -x gammastep >/dev/null 2>&1") == 0;
+    return cache;
+}
+
+static void night_mode_toggle(void)
+{
+    run_detached("if pgrep -x gammastep >/dev/null; then pkill -x gammastep; "
+                 "else gammastep -O 4000 >/dev/null 2>&1 & fi");
+}
+
+/* --- default audio *source* (mic) mute state; audio.h's dc_audio_read()
+ * only targets @DEFAULT_AUDIO_SINK@ (same split as controlcenter.c's
+ * audio_source_read()). */
+static bool audio_source_read(dc_audio_info *out)
+{
+    static dc_audio_info cache;
+    static bool cache_ok = false;
+    static time_t cache_time = 0;
+    time_t now = time(NULL);
+    if (cache_time && now - cache_time < SYS_CACHE_SECONDS) {
+        *out = cache;
+        return cache_ok;
+    }
+    cache_time = now;
+    cache_ok = false;
+    memset(&cache, 0, sizeof(cache));
+    FILE *pipe = popen("wpctl get-volume @DEFAULT_AUDIO_SOURCE@ 2>/dev/null", "r");
+    if (pipe) {
+        char line[128];
+        if (fgets(line, sizeof(line), pipe)) {
+            float volume = 0.0f;
+            if (sscanf(line, "Volume: %f", &volume) == 1) {
+                cache.volume = (int)(volume * 100.0f + 0.5f);
+                cache.available = true;
+                cache_ok = true;
+            }
+            if (strstr(line, "MUTED"))
+                cache.muted = true;
+        }
+        pclose(pipe);
+    }
+    *out = cache;
+    return cache_ok;
+}
+
+/* Force the audio caches to refresh on the next read (after a mute toggle /
+ * default-sink switch, so the UI reflects the change immediately instead of
+ * up to SYS_CACHE_SECONDS later). dc_audio_set_volume() already invalidates
+ * audio.c's own sink cache; the statics here need the same treatment. */
+static time_t g_audio_dirty_until = 0;
+
+/* --- output-device (sink) list from `wpctl status`. Parsed read-only; rows
+ * switch the default via `wpctl set-default <id>`. The status output frames
+ * the Audio section's sink block between "Sinks:" and the next blank-ish
+ * header line; entries look like " │  *   50. Name ... [vol: 0.97]". */
+#define SINKS_MAX 6
+
+typedef struct {
+    int id;
+    char name[64];
+    bool is_default;
+} sink_entry;
+
+static int sinks_read(sink_entry *out, int max)
+{
+    static sink_entry cache[SINKS_MAX];
+    static int cache_n = 0;
+    static time_t cache_time = 0;
+    time_t now = time(NULL);
+    if (cache_time && now - cache_time < SYS_CACHE_SECONDS && now >= g_audio_dirty_until) {
+        int n = cache_n < max ? cache_n : max;
+        memcpy(out, cache, (size_t)n * sizeof(*out));
+        return n;
+    }
+    cache_time = now;
+    g_audio_dirty_until = 0;
+    cache_n = 0;
+    FILE *pipe = popen("wpctl status 2>/dev/null", "r");
+    if (pipe) {
+        char line[256];
+        bool in_audio = false, in_sinks = false;
+        while (fgets(line, sizeof(line), pipe)) {
+            if (strncmp(line, "Audio", 5) == 0) {
+                in_audio = true;
+                continue;
+            }
+            if (in_audio && (strncmp(line, "Video", 5) == 0 || strncmp(line, "Settings", 8) == 0))
+                break;
+            if (!in_audio)
+                continue;
+            if (strstr(line, "Sinks:")) {
+                in_sinks = true;
+                continue;
+            }
+            if (!in_sinks)
+                continue;
+            /* Sink entries carry an "id. name"; the section ends at the next
+             * header line ("Sources:", "Filters:", ...) or a blank row. */
+            if (strstr(line, "Sources:") || strstr(line, "Filters:") ||
+                strstr(line, "Streams:") || strstr(line, "Devices:"))
+                break;
+            char *dot = strchr(line, '.');
+            if (!dot)
+                continue;
+            /* Walk back from the dot to find the numeric id start. */
+            char *p = dot;
+            while (p > line && p[-1] >= '0' && p[-1] <= '9')
+                p--;
+            if (p == dot)
+                continue; /* separator row, no id */
+            int id = atoi(p);
+            if (id <= 0 || cache_n >= SINKS_MAX)
+                continue;
+            sink_entry *e = &cache[cache_n];
+            e->id = id;
+            /* A '*' between the tree bars and the id marks the default. */
+            e->is_default = false;
+            for (char *q = line; q < p; q++)
+                if (*q == '*')
+                    e->is_default = true;
+            /* Name: after ". ", trimmed of the trailing "[vol: ...]" tag. */
+            const char *name = dot + 1;
+            while (*name == ' ')
+                name++;
+            snprintf(e->name, sizeof(e->name), "%s", name);
+            char *tag = strstr(e->name, "[vol:");
+            if (tag)
+                *tag = '\0';
+            /* rtrim */
+            size_t len = strlen(e->name);
+            while (len > 0 && (e->name[len - 1] == ' ' || e->name[len - 1] == '\n'))
+                e->name[--len] = '\0';
+            cache_n++;
+        }
+        pclose(pipe);
+    }
+    int n = cache_n < max ? cache_n : max;
+    memcpy(out, cache, (size_t)n * sizeof(*out));
+    return n;
+}
+
+static void sinks_set_default(int id)
+{
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "wpctl set-default %d", id);
+    run_detached(cmd);
+    g_audio_dirty_until = time(NULL) + 1; /* re-parse shortly after the switch */
+}
+
+/* --- Wi-Fi radio state via nmcli (`nmcli radio wifi` -> "enabled"). The
+ * toggle spawns `nmcli radio wifi on|off` detached; the optimistic local
+ * flip keeps the switch responsive within the cache window. */
+static bool wifi_radio_read(void)
+{
+    static bool cache = false;
+    static time_t cache_time = 0;
+    time_t now = time(NULL);
+    if (cache_time && now - cache_time < SYS_CACHE_SECONDS)
+        return cache;
+    cache_time = now;
+    cache = false;
+    FILE *pipe = popen("nmcli radio wifi 2>/dev/null", "r");
+    if (pipe) {
+        char line[64];
+        if (fgets(line, sizeof(line), pipe))
+            cache = strncmp(line, "enabled", 7) == 0;
+        pclose(pipe);
+    }
+    return cache;
+}
+
+/* Optimistic local state flip: the spawned command takes effect async, so
+ * the next render would still show the stale cached value for up to
+ * SYS_CACHE_SECONDS. flip_set() records the expected value; flip_get()
+ * serves it until the cache window has passed (by which point the real
+ * reader reflects the change). */
+typedef struct {
+    bool active;
+    bool to;
+    time_t at;
+} opt_flip;
+
+static bool flip_get(opt_flip *f, bool raw)
+{
+    if (f->active && time(NULL) - f->at < SYS_CACHE_SECONDS + 2)
+        return f->to;
+    f->active = false;
+    return raw;
+}
+
+static void flip_set(opt_flip *f, bool to)
+{
+    f->active = true;
+    f->to = to;
+    f->at = time(NULL);
+}
+
+/* Same idea for slider values (brightness/volume): show the just-set value
+ * until the reader cache catches up. */
+typedef struct {
+    float value;
+    time_t at;
+} opt_value;
+
+static bool opt_value_get(const opt_value *v, float *out)
+{
+    if (v->at && time(NULL) - v->at < SYS_CACHE_SECONDS + 2) {
+        *out = v->value;
+        return true;
+    }
+    return false;
+}
+
+static void opt_value_set(opt_value *v, float value)
+{
+    v->value = value;
+    v->at = time(NULL);
 }
 
 /* ============================ bar-widget helpers ============================ */
@@ -580,25 +1000,52 @@ static void tab_personalization(uictx *c)
         c->changed = true;
         c->reapply = true;
     }
-    if (c->cfg->dynamic_color) {
-        bool wp_focus = c->s->focus_field == 4;
-        char wpbuf[256];
-        if (wp_focus)
-            snprintf(wpbuf, sizeof(wpbuf), "%s", c->s->edit_buf);
-        else
-            copy_trunc(wpbuf, sizeof(wpbuf), c->cfg->wallpaper);
-        if (ui_textfield(c, "Wallpaper image path", wpbuf, wp_focus)) {
-            c->s->focus_field = 4;
-            copy_trunc(c->s->edit_buf, sizeof(c->s->edit_buf), c->cfg->wallpaper);
+
+    /* Wallpaper drives dynamic color AND the material-blur card background,
+     * so the path row is always visible (it used to hide unless dynamic
+     * color was on, leaving the materialBlur source uneditable). */
+    ui_section(c, "WALLPAPER");
+    bool wp_focus = c->s->focus_field == 4;
+    char wpbuf[256];
+    if (wp_focus)
+        snprintf(wpbuf, sizeof(wpbuf), "%s", c->s->edit_buf);
+    else
+        copy_trunc(wpbuf, sizeof(wpbuf), c->cfg->wallpaper);
+    if (ui_textfield(c, "Wallpaper image path", wpbuf, wp_focus)) {
+        c->s->focus_field = 4;
+        copy_trunc(c->s->edit_buf, sizeof(c->s->edit_buf), c->cfg->wallpaper);
+    }
+    ui_hint(c, "Tip: browse and pick visually in the Dashboard's Wallpapers tab");
+    if (ui_toggle(c, "Material backgrounds", "Blurred wallpaper behind panel cards",
+                  c->cfg->material_blur)) {
+        c->cfg->material_blur = !c->cfg->material_blur;
+        c->changed = true;
+        c->bars = true;
+    }
+
+    ui_section(c, "SCREEN FRAME");
+    if (ui_toggle(c, "Rounded screen corners", "Draw a frame overlay rounding the display corners",
+                  c->cfg->frame_enabled)) {
+        c->cfg->frame_enabled = !c->cfg->frame_enabled;
+        c->changed = true;
+        c->bars = true; /* config_changed() also reconfigures the frames */
+    }
+    if (c->cfg->frame_enabled) {
+        char fr[16];
+        snprintf(fr, sizeof(fr), "%d px", (int)lroundf(c->cfg->frame_radius));
+        if (ui_slider(c, "Corner radius", &c->cfg->frame_radius, 4.0f, 48.0f, fr)) {
+            c->cfg->frame_radius = roundf(c->cfg->frame_radius);
+            c->changed = true;
+            c->bars = true;
         }
     }
+
+    ui_section(c, "MOTION");
     if (ui_toggle(c, "Animations", "Panel entrance/exit animations",
                   c->cfg->animations_enabled)) {
         c->cfg->animations_enabled = !c->cfg->animations_enabled;
         c->changed = true;
     }
-
-    ui_section(c, "MOTION");
     char sv[16];
     snprintf(sv, sizeof(sv), "%.2fx", (double)c->cfg->animation_speed);
     if (ui_slider(c, "Animation speed", &c->cfg->animation_speed, 0.25f, 4.0f, sv))
@@ -771,12 +1218,221 @@ static void tab_launcher(uictx *c)
     }
 }
 
+static void tab_dock(uictx *c)
+{
+    ui_section(c, "DOCK");
+    if (ui_toggle(c, "Show dock", "Display a dock with pinned and running applications",
+                  c->cfg->dock_enabled)) {
+        c->cfg->dock_enabled = !c->cfg->dock_enabled;
+        c->changed = true;
+        c->bars = true; /* config_changed() maps/unmaps the dock surface */
+    }
+    if (c->cfg->dock_enabled) {
+        if (ui_toggle(c, "Auto-hide", "Hide the dock until the pointer reaches the screen edge",
+                      c->cfg->dock_auto_hide)) {
+            c->cfg->dock_auto_hide = !c->cfg->dock_auto_hide;
+            c->changed = true;
+            c->bars = true;
+        }
+        if (ui_stepper(c, "Icon size", &c->cfg->dock_icon_size, 16, 96, 4)) {
+            c->changed = true;
+            c->bars = true;
+        }
+    }
+
+    ui_section(c, "PINNED APPS");
+    for (int i = 0; i < c->cfg->dock_pinned_n; i++) {
+        if (ui_list_row(c, c->cfg->dock_pinned[i], NULL, IC_REMOVE, false) == 2) {
+            char id[DC_CONFIG_WIDGET_ID_MAX]; /* the array compacts under us */
+            snprintf(id, sizeof(id), "%s", c->cfg->dock_pinned[i]);
+            widget_remove_from(c->cfg->dock_pinned, &c->cfg->dock_pinned_n, id);
+            c->changed = true;
+            c->bars = true;
+            break; /* the list shifted -- stop iterating this pass */
+        }
+    }
+    if (c->cfg->dock_pinned_n == 0)
+        ui_hint(c, "No pinned apps yet");
+    bool pin_focus = c->s->focus_field == 5;
+    if (ui_textfield(c, "Pin an app (desktop-entry id, e.g. \"firefox\" -- Enter to add)",
+                     pin_focus ? c->s->edit_buf : "", pin_focus)) {
+        c->s->focus_field = 5;
+        c->s->edit_buf[0] = '\0';
+    }
+    ui_hint(c, "Running apps always appear in the dock; pinning keeps them there");
+}
+
+static void tab_displays(uictx *c)
+{
+    ui_section(c, "BRIGHTNESS");
+    backlight_info bl;
+    if (backlight_read(&bl)) {
+        static opt_value pending;
+        float frac = (float)bl.cur / (float)bl.max;
+        opt_value_get(&pending, &frac);
+        char v[16];
+        snprintf(v, sizeof(v), "%d%%", (int)lroundf(frac * 100.0f));
+        if (ui_slider(c, "Screen brightness", &frac, 0.0f, 1.0f, v)) {
+            backlight_set(&bl, frac);
+            opt_value_set(&pending, frac);
+        }
+        char dev[128];
+        snprintf(dev, sizeof(dev), "Backlight device: %.64s (set via logind)", bl.device);
+        ui_hint(c, dev);
+    } else {
+        ui_hint(c, "No backlight device found");
+    }
+
+    ui_section(c, "NIGHT MODE");
+    static opt_flip night_flip;
+    bool night = flip_get(&night_flip, night_mode_read());
+    if (ui_toggle(c, "Night mode", "Warm color temperature (gammastep, 4000K)", night)) {
+        night_mode_toggle();
+        flip_set(&night_flip, !night);
+    }
+}
+
+static void tab_audio(uictx *c)
+{
+    ui_section(c, "OUTPUT");
+    dc_audio_info out;
+    bool have_out = dc_audio_read(&out);
+    if (have_out) {
+        static opt_value pending;
+        float frac = (float)out.volume / 100.0f;
+        opt_value_get(&pending, &frac);
+        char v[16];
+        snprintf(v, sizeof(v), "%d%%", (int)lroundf(frac * 100.0f));
+        if (ui_slider(c, "Volume", &frac, 0.0f, 1.0f, v)) {
+            dc_audio_set_volume((int)lroundf(frac * 100.0f));
+            opt_value_set(&pending, frac);
+        }
+        static opt_flip mute_flip;
+        bool muted = flip_get(&mute_flip, out.muted);
+        if (ui_toggle(c, "Mute output", NULL, muted)) {
+            run_detached("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
+            flip_set(&mute_flip, !muted);
+        }
+    } else {
+        ui_hint(c, "Audio unavailable (wpctl/WirePlumber not responding)");
+    }
+
+    ui_section(c, "OUTPUT DEVICE");
+    sink_entry sinks[SINKS_MAX];
+    int n = sinks_read(sinks, SINKS_MAX);
+    for (int i = 0; i < n; i++) {
+        if (ui_list_row(c, sinks[i].name, sinks[i].is_default ? "Default" : NULL, 0,
+                        sinks[i].is_default) == 1 &&
+            !sinks[i].is_default)
+            sinks_set_default(sinks[i].id);
+    }
+    if (n == 0)
+        ui_hint(c, "No output devices found");
+
+    ui_section(c, "INPUT");
+    dc_audio_info in;
+    if (audio_source_read(&in)) {
+        static opt_flip mic_flip;
+        bool muted = flip_get(&mic_flip, in.muted);
+        if (ui_toggle(c, "Mute microphone", NULL, muted)) {
+            run_detached("wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle");
+            flip_set(&mic_flip, !muted);
+        }
+    } else {
+        ui_hint(c, "No input device found");
+    }
+}
+
+static void tab_network(uictx *c)
+{
+    ui_section(c, "WI-FI");
+    static opt_flip wifi_flip;
+    bool on = flip_get(&wifi_flip, wifi_radio_read());
+    if (ui_toggle(c, "Wi-Fi enabled", "Radio on/off (nmcli)", on)) {
+        run_detached(on ? "nmcli radio wifi off" : "nmcli radio wifi on");
+        flip_set(&wifi_flip, !on);
+    }
+
+    ui_section(c, "STATUS");
+    dc_net_info net;
+    dc_net_wifi(&net);
+    if (!net.has_wifi) {
+        ui_value(c, "Wi-Fi adapter", "Not found");
+    } else if (net.connected) {
+        ui_value(c, "Connected to", net.ssid[0] ? net.ssid : "(unknown SSID)");
+        if (net.signal_percent >= 0) {
+            char sig[16];
+            snprintf(sig, sizeof(sig), "%d%%", net.signal_percent);
+            ui_value(c, "Signal", sig);
+        }
+    } else {
+        ui_value(c, "Connection", "Disconnected");
+    }
+    ui_hint(c, "Scan and join networks from the Control Center's Wi-Fi section");
+}
+
+static void tab_bluetooth(uictx *c)
+{
+    ui_section(c, "BLUETOOTH");
+    dc_bluez_info bt;
+    bool have = dc_bluez_read(&bt);
+    static opt_flip bt_flip;
+    bool powered = flip_get(&bt_flip, have && bt.powered);
+    if (ui_toggle(c, "Bluetooth enabled", "Adapter power (bluetoothctl)", powered)) {
+        run_detached(powered ? "bluetoothctl power off" : "bluetoothctl power on");
+        flip_set(&bt_flip, !powered);
+    }
+
+    ui_section(c, "DEVICES");
+    if (!have) {
+        ui_hint(c, "BlueZ unavailable");
+        return;
+    }
+    if (!powered) {
+        ui_hint(c, "Turn Bluetooth on to see paired devices");
+        return;
+    }
+    if (bt.device_count == 0)
+        ui_hint(c, "No paired devices");
+    for (int i = 0; i < bt.device_count; i++) {
+        const dc_bluez_device *d = &bt.devices[i];
+        if (ui_list_row(c, d->name[0] ? d->name : d->mac,
+                        d->connected ? "Connected" : "Paired", 0, d->connected) == 1) {
+            if (d->connected)
+                dc_bluez_disconnect(d->mac);
+            else
+                dc_bluez_connect(d->mac);
+        }
+    }
+    ui_hint(c, "Click a device to connect or disconnect");
+}
+
+static void tab_power(uictx *c)
+{
+    ui_section(c, "POWER PROFILE");
+    dc_power_info pw;
+    if (!dc_power_read(&pw)) {
+        ui_hint(c, "No power-profile backend (power-profiles-daemon or tuned) detected");
+        return;
+    }
+    static const char *const opts[3] = {"Power Saver", "Balanced", "Performance"};
+    int cur = (int)pw.active_mode; /* -1 (unknown) selects nothing */
+    int clicked = ui_segmented(c, "Profile", opts, 3, cur);
+    if (clicked >= 0 && clicked != cur)
+        dc_power_set_mode((dc_power_mode)clicked);
+    /* Raw backend profile as a caption when it isn't literally one of the 3
+     * mode slugs (same rule as the battery popout's caption). */
+    if (pw.active_profile[0])
+        ui_value(c, "Active profile", pw.active_profile);
+    ui_hint(c, "Lock, suspend and power-off live in the power menu (bar \xc2\xb7 power button)");
+}
+
 static void tab_about(uictx *c)
 {
     if (c->mode == UI_RENDER) {
         NVGcontext *vg = c->vg;
         nvgFontFaceId(vg, c->s->render->font_ui);
-        nvgFontSize(vg, 26.0f);
+        nvgFontSize(vg, 20.0f);
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_TOP);
         nvgFillColor(vg, tc(c->t->surface_text));
         nvgText(vg, 0, c->y + 8.0f, "DankC", NULL);
@@ -797,7 +1453,7 @@ static void tab_about(uictx *c)
             snprintf(buf, sizeof(buf), "%.1f MB", rss / 1024.0);
         else
             snprintf(buf, sizeof(buf), "unavailable");
-        nvgFontSize(vg, 15.0f);
+        nvgFontSize(vg, 14.0f);
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(c->t->surface_text));
         nvgText(vg, 0, c->y + 14.0f, "Memory usage (RSS)", NULL);
@@ -846,17 +1502,34 @@ static void build_tab(uictx *c)
     case TAB_WEATHER:
         tab_weather(c);
         break;
+    case TAB_DOCK:
+        tab_dock(c);
+        break;
+    case TAB_DISPLAYS:
+        tab_displays(c);
+        break;
+    case TAB_AUDIO:
+        tab_audio(c);
+        break;
+    case TAB_NETWORK:
+        tab_network(c);
+        break;
+    case TAB_BLUETOOTH:
+        tab_bluetooth(c);
+        break;
     case TAB_NOTIFICATIONS:
         tab_notifications(c);
         break;
     case TAB_LAUNCHER:
         tab_launcher(c);
         break;
+    case TAB_POWER:
+        tab_power(c);
+        break;
     case TAB_ABOUT:
         tab_about(c);
         break;
     default:
-        ui_note(c, "Not implemented yet");
         break;
     }
 }
@@ -898,6 +1571,14 @@ static void commit_edit(dc_settings *s)
         snprintf(cfg->wallpaper, sizeof(cfg->wallpaper), "%s", s->edit_buf);
         wallpaper_changed = true;
         break;
+    case 5: /* dock pinned-app add (dedup'd; ids are desktop-entry basenames) */
+        if (s->edit_buf[0] && cfg->dock_pinned_n < DC_CONFIG_DOCK_PINNED_MAX &&
+            !widget_in(cfg->dock_pinned, cfg->dock_pinned_n, s->edit_buf)) {
+            copy_trunc(cfg->dock_pinned[cfg->dock_pinned_n], DC_CONFIG_WIDGET_ID_MAX,
+                       s->edit_buf);
+            cfg->dock_pinned_n++;
+        }
+        break;
     default:
         break;
     }
@@ -937,7 +1618,7 @@ static void draw_sidebar(dc_settings *s, NVGcontext *vg, const dc_theme *t)
     nvgFill(vg);
 
     nvgFontFaceId(vg, s->render->font_ui);
-    nvgFontSize(vg, 18.0f);
+    nvgFontSize(vg, 20.0f);
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
     nvgFillColor(vg, tc(t->surface_text));
     nvgText(vg, x0 + 16.0f, DC_SET_PAD + 28.0f, "Settings", NULL);

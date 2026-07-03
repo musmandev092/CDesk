@@ -84,10 +84,15 @@ static void render_all(struct bar_set *set)
  * geometry / widget lists, so re-apply each bar's layer-surface geometry and
  * repaint. Also drives the frame overlay (docs/POLISH.md P2): it reads
  * frame_enabled/frame_radius from the same dc_config, so it needs the same
- * "config changed" signal as the bars, not a separate hook. */
+ * "config changed" signal as the bars, not a separate hook. The dock joined
+ * for the settings Dock tab: dockEnabled maps/unmaps its surface live, and
+ * icon-size/pinned-list edits re-derive its geometry (dc_dock_refresh). An
+ * auto-hide flip takes effect on the next reveal cycle. */
 struct config_change_ctx {
     struct bar_set *bars;
     struct frame_set *frames;
+    dc_dock *dock;
+    dc_wayland *wl;
 };
 
 static void config_changed(void *ud)
@@ -97,6 +102,22 @@ static void config_changed(void *ud)
         dc_bar_reconfigure(ctx->bars->bars[i]);
     for (int i = 0; i < ctx->frames->count; i++)
         dc_frame_reconfigure(ctx->frames->frames[i]);
+    if (ctx->dock) {
+        bool want = dc_config_current->dock_enabled;
+        bool have = dc_dock_visible(ctx->dock);
+        if (want && !have) {
+            dc_output *first = NULL;
+            wl_list_for_each(first, &ctx->wl->outputs, link) {
+                break;
+            }
+            if (first)
+                dc_dock_show(ctx->dock, first);
+        } else if (!want && have) {
+            dc_dock_hide(ctx->dock);
+        } else if (want && have) {
+            dc_dock_refresh(ctx->dock);
+        }
+    }
 }
 
 struct tick_ctx {
@@ -919,7 +940,7 @@ int main(int argc, char **argv)
         .settings = settings,
         .powermenu = powermenu};
     dc_wayland_set_key_cb(wl, handle_key, &kbd);
-    struct config_change_ctx cfg_ctx = {.bars = &set, .frames = &frames};
+    struct config_change_ctx cfg_ctx = {.bars = &set, .frames = &frames, .dock = dock, .wl = wl};
     dc_config_set_change_cb(config_changed, &cfg_ctx);
 
     struct click_ctx cctx = {.set = &set,
