@@ -6,7 +6,19 @@ pkgdesc="Lightweight C Wayland shell for niri (DankMaterialShell rewrite)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/AvengeMedia/DankMaterialShell"
 license=('MIT')
-depends=('wayland' 'libxkbcommon' 'systemd-libs' 'mesa' 'pam')
+depends=(
+  'wayland' 'libxkbcommon' 'systemd-libs' 'mesa' 'pam'
+  # Fontconfig-located script fallbacks dankc's own renderer loads at startup
+  # (src/render/nvg.c FALLBACK_SPECS) — Latin/Cyrillic/Greek/Arabic/Urdu/
+  # Devanagari/Thai and most other scripts, plus everything GTK/Qt/browsers
+  # need for the same languages system-wide (see packaging/fontconfig).
+  'noto-fonts'
+  # CJK (Chinese/Japanese/Korean) fallback; not covered by noto-fonts.
+  'noto-fonts-cjk'
+  # Latin/symbol safety net: last-resort fallback if a Noto face is somehow
+  # missing/uninstalled, both for dankc's own chain and system-wide.
+  'ttf-dejavu'
+)
 makedepends=('meson' 'ninja' 'wayland-protocols' 'pkgconf')
 optdepends=(
   'wireplumber: volume control (wpctl)'
@@ -16,6 +28,7 @@ optdepends=(
   'grim: screenshots'
   'slurp: region screenshot + color picker'
   'gammastep: night mode / warm filter'
+  'noto-fonts-emoji: color emoji in browsers/GTK/Qt apps (system-wide fontconfig fallback only — dankc'"'"'s own renderer is monochrome-only and vendors its own NotoEmoji subset, see src/render/nvg.c)'
 )
 # For a release, point source at a tagged tarball/commit and set sha256sums.
 # Local build: run `makepkg` from a checkout, or just use the Makefile / meson
@@ -42,4 +55,11 @@ package() {
   meson install -C build --destdir "$pkgdir"
   # T1.3: strip the installed binary to reduce disk footprint (debug_info only, no RAM impact)
   strip "$pkgdir/usr/local/bin/dankc" || strip "$pkgdir/usr/bin/dankc" 2>/dev/null || true
+
+  # System-wide fontconfig fallback (browsers/GTK/Qt apps), see
+  # packaging/fontconfig/49-dankc-fonts.conf and packaging/README.md.
+  # $startdir is the directory containing this PKGBUILD (packaging/),
+  # always correct regardless of BUILDDIR — unlike $srcdir, which moves.
+  install -Dm644 "$startdir/fontconfig/49-dankc-fonts.conf" \
+    "$pkgdir/etc/fonts/conf.d/49-dankc-fonts.conf"
 }
