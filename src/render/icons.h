@@ -149,4 +149,23 @@
  * .codepoints file, same convention as the rest of this header. */
 #define DC_ICON_CALCULATE 0xea5f
 
+/* Settings window (docs task "settings full coverage"): sidebar tab icons +
+ * a few control glyphs. ui/settings.c previously defined its own local IC_*
+ * macros that were never migrated into this header, so subset-fonts.sh (which
+ * only scans DC_ICON_* here) never picked most of them up -- confirmed by
+ * parsing assets/fonts/MaterialSymbolsRounded.subset.ttf's cmap directly:
+ * PALETTE/TOOLBAR/INFO/MONITOR/ADD/REMOVE/LINK were all silently rendering as
+ * tofu. Fixed by moving them here (so they're covered by the next subset
+ * regen) and having settings.c include this header directly. */
+#define DC_ICON_PALETTE 0xe40a
+#define DC_ICON_TOOLBAR 0xe9f7
+#define DC_ICON_INFO 0xe88e
+#define DC_ICON_MONITOR 0xef5b
+#define DC_ICON_ADD 0xe145
+#define DC_ICON_REMOVE 0xe15b
+#define DC_ICON_LINK 0xe250
+/* New tabs (Dock & Launcher, Audio; Network/Bluetooth reuse the existing
+ * WIFI/BLUETOOTH glyphs above, Power reuses the existing POWER glyph). */
+#define DC_ICON_DOCK_TO_BOTTOM 0xf7e6
+
 #endif /* DC_RENDER_ICONS_H */
