@@ -14,38 +14,25 @@ A lightweight desktop shell for the **niri** Wayland compositor, written in C �
 DankMaterialShell's core (QML/Quickshell + Go) as one native binary. Full spec in `docs/` (00–11).
 niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
 
-## Current status — bar + ALL panels at DMS parity ✅ (2026-07-02 late)
-Second wave (7 parallel worktree agents, merged to main through 0a6cc3d): startup-SIGSEGV
-fix, battery popout (health/capacity/power profiles), Processes popout (tabs/search/rings/
-sortable /proc table, cpu+mem chips open it), launcher parity (descriptions, view modes,
-footer pills, hover selection, icon cache), popout hover + slider DRAG everywhere,
-tabbed Settings (10 tabs, live-apply incl. bar position), DankDash dashboard (Overview/
-Weather w/ 7-day forecast/Media w/ album art/Wallpapers; clock/music/weather chips open it).
-Plus: full-Unicode fallback fonts + monochrome emoji; **Makefile now does header dep
-tracking (-MMD)** — stale-.o struct mismatches previously caused phantom "corruption";
-dc_render_icon now saves/restores nvg state (recurring garbled-text class killed).
-Power menu modal DONE (wt/powermenu): centered modal, arm-then-confirm, login1 actions,
-`ctl power-menu`, Mod+Escape keybind, DANKC_POWER_DRYRUN/POWERMENU_DEMO hooks.
-Media marquee DONE (wt/marquee): bar music title scrolls DMS-style (2s pause / 60ms-per-px
-bounce, playing+overflow gated, frame-callback driven, DANKC_MARQUEE_TEST=1 test hook).
-Hourly forecast + wallpaper grid DONE (wt/dash): weather.c fetches &hourly=..., Weather tab
-Daily/Hourly pills toggle a next-24h strip; Wallpapers tab is a lazy-thumbnail 4-col grid
-(stb decode + box-sample, 2/frame), click = config wallpaper + dynamic color +
-swaybg-if-present, wheel scroll.
-
-**Tuned power-profile backend DONE** (wt/tuned): `src/services/power.c/.h` — real 3-mode
-(power-saver/balanced/performance) power-profile service backed by whichever of (a)
-`org.freedesktop.UPower.PowerProfiles`, (b) tuned's native `com.redhat.tuned` D-Bus control, or
-(c) the `tuned-adm` CLI is available, probed lazily and cached ~5s like bluez.c. The user runs
-`tuned` (not power-profiles-daemon); tuned ships its own `tuned-ppd` bridge service that speaks
-the standard PowerProfiles interface backed by real tuned profiles, so that's the backend
-actually used. battery_popout.c's segmented control is wired to it (click to switch, active
-mode highlighted, raw tuned profile name shown as a caption when it doesn't exactly match a
-mode slug, e.g. "tuned: throughput-performance" for Performance).
-Remaining polish: notif action-images, settings/launcher/CC-depth/clipboard waves, HarfBuzz
-shaping, P7 perf (damage tracking, poll reduction, font subsetting). Plugins (T29) still
-deferred.
-
+## Current status — BACKLOG COMPLETE ✅ (2026-07-03, main @ 189045d)
+Bar + all panels at DMS parity AND the full polish/perf backlog is done. Landed 2026-07-03
+(16 worktree merges, every one make+meson zero-warning, reviewed before merge):
+power menu modal (arm-then-confirm, login1), bar media marquee (DMS 60ms/px bounce),
+dashboard hourly forecast + wallpaper grid browser, notification action buttons + inline
+images, control-center depth (async Wi-Fi scan list, BlueZ device list, media row, live %
+labels), launcher calc/frecency/desktop-actions/paging (tests/test_calc.c 41/41),
+settings tab depth, power profiles (PPD→tuned D-Bus→tuned-adm; battery-popout chips),
+brightness OSD (generalized dc_osd), clipboard image thumbnails + pins + delete (+8MB-cap
+truncation fix), tray click/SecondaryActivate + IconPixmap + dbusmenu popups, auto-hide
+dock (dockEnabled off by default), rounded screen corners (frameEnabled off) + blurred
+material bg behind all 5 panel cards (materialBlur on), P7 perf (bar damage-hash skips
+66-79% idle frames; wpctl forks -69%; icon font subset 14.5MB→244KB via
+scripts/subset-fonts.sh; Pss 77MB vs DMS qs 595MB), HarfBuzz+FriBidi shaping
+(render/shape.c + vendored nvgTextGlyphs; Urdu/Arabic joins correctly incl. U+06C1/U+06D2
+via lang=ur fallback; Latin path byte-identical).
+Remaining (deliberate): T29 plugins (post-v1 by design), light theme variants, true
+HCT/MCU dynamic color, full 424-setting parity. meson source list now matches src (a
+4-file gap had silently broken the meson LINK while `make` stayed green — check BOTH).
 ## Previous status — bar parity DONE ✅ (S1–S6, 2026-07-02); panels parity next
 Bar now pixel-matches the user's live DMS bottom bar (docs/12-BAR-SPEC.md, commits
 07831c7..c412bb6): floating rounded 40px container + elevation shadow + bottom position,
