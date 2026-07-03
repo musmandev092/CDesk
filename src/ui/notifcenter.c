@@ -414,16 +414,40 @@ static void draw_card(dc_notif_center *nc, const dc_notification *n, float x, fl
         nvgFontSize(vg, 12.0f);
         nvgFillColor(vg, tc_alpha(t->surface_text, 160));
         nvgTextLineHeight(vg, 1.15f);
-        dc_shape_draw_textbox(nc->render, tx, y + 53.0f, tw, n->body, NULL);
+        /* This 30px scissor only budgets 2 rows -- but dc_shape_draw_textbox()
+         * word-wraps by width alone and will happily lay out a 3rd (or more)
+         * row, whose clipped remnant peeks out just above the button row
+         * directly below (reproduced with a real 3-line Slack message: a
+         * sliver of wrapped text bled in above "Dismiss/Reply/Mark as
+         * read"). Clamp to 2 rows and ellipsize the 2nd instead of letting a
+         * 3rd row exist at all. */
+        NVGtextRow rows[3];
+        int nrows = nvgTextBreakLines(vg, n->body, NULL, tw, rows, 3);
+        if (nrows <= 2) {
+            dc_shape_draw_textbox(nc->render, tx, y + 53.0f, tw, n->body, NULL);
+        } else {
+            dc_shape_draw_text(nc->render, tx, y + 53.0f, rows[0].start, rows[0].end);
+            char rest_buf[DC_NOTIF_BODY], line2_buf[DC_NOTIF_BODY];
+            snprintf(rest_buf, sizeof(rest_buf), "%s", rows[1].start);
+            dc_shape_ellipsize(nc->render, rest_buf, tw, line2_buf, sizeof(line2_buf));
+            dc_shape_draw_text(nc->render, tx, y + 53.0f + 12.0f * 1.15f, line2_buf, NULL);
+        }
         nvgRestore(vg);
     }
 
-    /* Bottom-right button row: [actions...] Dismiss, right-aligned. DMS hides
-     * its separate Dismiss pill once actionCount>=3 (NotificationCard.qml
-     * clearButton.visible: actionCount<3) since the row is already crowded
-     * with real action buttons by then -- mirrored here. Actions are drawn
-     * right-to-left (closest to Dismiss first) so array index order still
-     * reads left-to-right, matching the sender's actions[] order. */
+    /* Bottom-right button row: [actions...] Dismiss, right-aligned. Actions
+     * are drawn right-to-left (closest to Dismiss first) so array index
+     * order still reads left-to-right, matching the sender's actions[]
+     * order. Real actions are laid out *before* Dismiss (not after): Dismiss
+     * only duplicates the X close button already in the card's top-right, so
+     * if the row is too narrow to fit every real action button plus Dismiss
+     * (seen with a real 2-action NetworkManager Applet notification whose
+     * "Reconnect" + "Don't show this message again" + "Dismiss" don't all
+     * fit at DC_NC_WIDTH), Dismiss is the one that silently gives way --
+     * losing it costs nothing, losing an actual action button means the user
+     * can no longer invoke it at all. DMS additionally hides Dismiss outright
+     * once actionCount>=3 (NotificationCard.qml clearButton.visible:
+     * actionCount<3) regardless of space; mirrored here too. */
     const float row_y1 = y + DC_NC_CARD_H - 12.0f;
     const float row_h = 22.0f;
     const float row_y0 = row_y1 - row_h;
@@ -435,20 +459,6 @@ static void draw_card(dc_notif_center *nc, const dc_notification *n, float x, fl
     nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
 
     float b[4];
-    hit->has_dismiss = n->action_count < 3;
-    if (hit->has_dismiss) {
-        nvgTextBounds(vg, 0, 0, "Dismiss", NULL, b);
-        float dismiss_w = b[2] - b[0] + 18.0f;
-        float dismiss_x0 = cursor_x1 - dismiss_w;
-        nvgFillColor(vg, tc_alpha(t->surface_text, 190));
-        nvgText(vg, (dismiss_x0 + cursor_x1) / 2.0f, (row_y0 + row_y1) / 2.0f, "Dismiss", NULL);
-        hit->dismiss_x0 = dismiss_x0;
-        hit->dismiss_y0 = row_y0;
-        hit->dismiss_x1 = cursor_x1;
-        hit->dismiss_y1 = row_y1;
-        cursor_x1 = dismiss_x0 - 10.0f;
-    }
-
     hit->action_count = n->action_count;
     hit->action_y0 = row_y0;
     hit->action_y1 = row_y1;
@@ -468,6 +478,22 @@ static void draw_card(dc_notif_center *nc, const dc_notification *n, float x, fl
         hit->action_x0[i] = a_x0;
         hit->action_x1[i] = cursor_x1;
         cursor_x1 = a_x0 - 8.0f;
+    }
+
+    hit->has_dismiss = false;
+    if (n->action_count < 3) {
+        nvgTextBounds(vg, 0, 0, "Dismiss", NULL, b);
+        float dismiss_w = b[2] - b[0] + 18.0f;
+        float dismiss_x0 = cursor_x1 - dismiss_w;
+        if (dismiss_x0 >= row_min_x && cursor_x1 > row_min_x) {
+            nvgFillColor(vg, tc_alpha(t->surface_text, 190));
+            nvgText(vg, (dismiss_x0 + cursor_x1) / 2.0f, (row_y0 + row_y1) / 2.0f, "Dismiss", NULL);
+            hit->has_dismiss = true;
+            hit->dismiss_x0 = dismiss_x0;
+            hit->dismiss_y0 = row_y0;
+            hit->dismiss_x1 = cursor_x1;
+            hit->dismiss_y1 = row_y1;
+        }
     }
 }
 

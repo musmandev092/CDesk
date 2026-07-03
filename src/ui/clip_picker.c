@@ -573,23 +573,38 @@ static void draw_row(dc_clip_picker *p, const dc_clip_entry *e, int display_inde
     nvgSave(vg);
     nvgScissor(vg, text_x, y + 6.0f, text_w, DC_CP_ROW_H - 12.0f);
 
+    /* Tag line ("Text"/"Long Text"/"Image"), same small primary-colored line
+     * for both kinds -- an earlier version folded the image tag and body
+     * into one combined "Image \xe2\x80\xa2 [[ ... ]]" string here *and* drew
+     * the plain `body` again below via the textbox call, so every image row
+     * showed its "[[ image ... ]]" details twice (once truncated inline with
+     * the tag, once in full underneath). Just draw `tag` alone; `body` (set
+     * above for both kinds) is the one and only place the details appear. */
     nvgFontFaceId(vg, p->render->font_ui);
     nvgFontSize(vg, 11.0f);
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_TOP);
-    if (e->kind == DC_CLIP_IMAGE) {
-        char tag_line[300];
-        snprintf(tag_line, sizeof(tag_line), "%s \xe2\x80\xa2 %s", tag, body);
-        nvgFillColor(vg, tc(t->primary));
-        nvgText(vg, text_x, y + 10.0f, tag_line, NULL);
-    } else {
-        nvgFillColor(vg, tc(t->primary));
-        nvgText(vg, text_x, y + 10.0f, tag, NULL);
-    }
+    nvgFillColor(vg, tc(t->primary));
+    nvgText(vg, text_x, y + 10.0f, tag, NULL);
 
     nvgFontSize(vg, 13.0f);
     nvgFillColor(vg, tc(t->surface_text));
     nvgTextLineHeight(vg, 1.2f);
-    dc_shape_draw_textbox(p->render, text_x, y + 27.0f, text_w, body, NULL);
+    /* Clamp to 2 rows: at this line-height a 3rd wrapped row would only be
+     * half-visible before the scissor above cuts it off mid-glyph (seen with
+     * a real long clipboard entry -- "wrapping behavior in the preview row"
+     * sliced clean through the middle of the letters). Ellipsize the 2nd row
+     * instead of letting a partial 3rd row render at all. */
+    NVGtextRow rows[3];
+    int nrows = nvgTextBreakLines(vg, body, NULL, text_w, rows, 3);
+    if (nrows <= 2) {
+        dc_shape_draw_textbox(p->render, text_x, y + 27.0f, text_w, body, NULL);
+    } else {
+        dc_shape_draw_text(p->render, text_x, y + 27.0f, rows[0].start, rows[0].end);
+        char rest_buf[256], line2_buf[256];
+        snprintf(rest_buf, sizeof(rest_buf), "%s", rows[1].start);
+        dc_shape_ellipsize(p->render, rest_buf, text_w, line2_buf, sizeof(line2_buf));
+        dc_shape_draw_text(p->render, text_x, y + 27.0f + 13.0f * 1.2f, line2_buf, NULL);
+    }
 
     nvgRestore(vg);
 }

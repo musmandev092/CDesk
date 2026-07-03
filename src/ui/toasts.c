@@ -209,8 +209,20 @@ static void draw_card(dc_toasts *t, const dc_notification *n, float x, float y, 
         nvgFillColor(vg, nvgRGBA(th->surface_text.r, th->surface_text.g, th->surface_text.b, 170));
         nvgSave(vg);
         nvgScissor(vg, tx, y + 50.0f, tw, body_h);
-        nvgTextLineHeight(vg, 1.1f);
-        dc_shape_draw_textbox(t->render, tx, y + 51.0f, tw, n->body, NULL);
+        if (has_actions) {
+            /* body_h only budgets one line here -- word-wrapping via
+             * dc_shape_draw_textbox() would still lay out a 2nd line whose
+             * clipped remnant peeks out just above the action-button row
+             * right below (seen with a real 2-line NetworkManager Applet
+             * notification: a sliver of "BAIHQ." bled into the "Reconnect"
+             * pill). Ellipsize to a single line instead of wrapping. */
+            char body_buf[DC_NOTIF_BODY];
+            dc_shape_ellipsize(t->render, n->body, tw, body_buf, sizeof(body_buf));
+            dc_shape_draw_text(t->render, tx, y + 51.0f, body_buf, NULL);
+        } else {
+            nvgTextLineHeight(vg, 1.1f);
+            dc_shape_draw_textbox(t->render, tx, y + 51.0f, tw, n->body, NULL);
+        }
         nvgRestore(vg);
     }
 

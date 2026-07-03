@@ -487,16 +487,25 @@ static void draw_list_row(dc_launcher *l, const dc_app *app, float x, float y, f
     bool has_desc = app->desc[0] != '\0';
     float name_cy = has_desc ? y + 21.0f : row_cy;
 
+    /* Ellipsize name/description that overflow the available width instead
+     * of relying solely on the scissor clip to hide the overrun -- left-
+     * aligned text just gets an abrupt cutoff with no "..." affordance
+     * otherwise, unlike every other panel's row text (processes.c,
+     * controlcenter.c, notifcenter.c, keybinds_modal.c, dashboard.c). */
+    char name_buf[128], desc_buf[192];
+
     nvgFontFaceId(vg, l->render->font_ui);
     nvgFontSize(vg, 14.0f);
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
     nvgFillColor(vg, tc(t->surface_text));
-    dc_shape_draw_text(l->render, text_x, name_cy, app->name, NULL);
+    dc_shape_ellipsize(l->render, app->name, text_w, name_buf, sizeof(name_buf));
+    dc_shape_draw_text(l->render, text_x, name_cy, name_buf, NULL);
 
     if (has_desc) {
         nvgFontSize(vg, 12.0f);
         nvgFillColor(vg, tc_alpha(t->surface_text, 140));
-        dc_shape_draw_text(l->render, text_x, y + 40.0f, app->desc, NULL);
+        dc_shape_ellipsize(l->render, app->desc, text_w, desc_buf, sizeof(desc_buf));
+        dc_shape_draw_text(l->render, text_x, y + 40.0f, desc_buf, NULL);
     }
 
     nvgRestore(vg);
@@ -538,7 +547,15 @@ static void draw_grid_cell(dc_launcher *l, const dc_app *app, float x, float y, 
     nvgFontSize(vg, 12.0f);
     nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_TOP);
     nvgFillColor(vg, tc(t->surface_text));
-    dc_shape_draw_text(l->render, x + w / 2.0f, icy + isz + 6.0f, app->name, NULL);
+    /* Ellipsize first: a name wider than the cell must not just get scissor-
+     * clipped -- with NVG_ALIGN_CENTER that clips equal amounts off *both*
+     * ends and shows a meaningless middle slice of the string (e.g.
+     * "Advanced Network Configuration" -> "nced Network Configura"). Match
+     * the elide-right convention every other panel uses (processes.c,
+     * controlcenter.c, notifcenter.c, keybinds_modal.c, dashboard.c). */
+    char name_buf[128];
+    dc_shape_ellipsize(l->render, app->name, w - 8.0f, name_buf, sizeof(name_buf));
+    dc_shape_draw_text(l->render, x + w / 2.0f, icy + isz + 6.0f, name_buf, NULL);
     nvgRestore(vg);
 }
 
