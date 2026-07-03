@@ -53,6 +53,11 @@ static dc_config config = {
     .dnd_enabled = false,
 
     .launcher_grid_view = false,
+
+    .dock_enabled = false,
+    .dock_auto_hide = false,
+    .dock_icon_size = 40,
+    .dock_pinned_n = 0,
 };
 
 const dc_config *dc_config_current = &config;
@@ -272,6 +277,12 @@ void dc_config_load(void)
     get_bool(root, "dndEnabled", &config.dnd_enabled);
 
     get_bool(root, "launcherGridView", &config.launcher_grid_view);
+
+    get_bool(root, "dockEnabled", &config.dock_enabled);
+    get_bool(root, "dockAutoHide", &config.dock_auto_hide);
+    get_int(root, "dockIconSize", &config.dock_icon_size, 16, 96);
+    get_string_array(root, "dockPinned", config.dock_pinned, DC_CONFIG_DOCK_PINNED_MAX,
+                     &config.dock_pinned_n);
     cJSON_Delete(root);
 
     apply_theme();
@@ -370,6 +381,11 @@ void dc_config_save(void)
     cJSON_AddBoolToObject(root, "dndEnabled", config.dnd_enabled);
 
     cJSON_AddBoolToObject(root, "launcherGridView", config.launcher_grid_view);
+
+    cJSON_AddBoolToObject(root, "dockEnabled", config.dock_enabled);
+    cJSON_AddBoolToObject(root, "dockAutoHide", config.dock_auto_hide);
+    cJSON_AddNumberToObject(root, "dockIconSize", config.dock_icon_size);
+    add_string_array(root, "dockPinned", config.dock_pinned, config.dock_pinned_n);
 
     char *text = cJSON_Print(root);
     cJSON_Delete(root);

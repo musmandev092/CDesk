@@ -52,6 +52,16 @@ const dc_niri_workspace *dc_niri_workspaces(const dc_niri *niri, int *count);
 /* The currently focused window, or NULL if none. */
 const dc_niri_window *dc_niri_focused_window(const dc_niri *niri);
 
+/* Read-only snapshot of every tracked window, across all workspaces/outputs
+ * (ui/dock.c dedups this by app_id for the running-apps side of the dock). */
+const dc_niri_window *dc_niri_windows(const dc_niri *niri, int *count);
+
+/* Ask niri to focus a specific window by id (the app dock's click-to-focus,
+ * docs/11-UX-FLOW.md sec.5/docs/POLISH.md P5) -- `niri msg action
+ * focus-window --id <id>`. Same fire-and-forget shape as
+ * dc_niri_focus_workspace(). */
+void dc_niri_focus_window(uint64_t id);
+
 /* Ask niri to focus the workspace at 1-based per-output index `idx` (the bar's
  * workspaceSwitcher capsules; docs/12-BAR-SPEC.md sec.4/5). Fire-and-forget:
  * the live niri connection is pinned to the EventStream, so this spawns the

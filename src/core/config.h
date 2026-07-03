@@ -17,6 +17,9 @@
 #define DC_CONFIG_WIDGETS_MAX 12
 #define DC_CONFIG_WIDGET_ID_MAX 32
 
+/* App dock pinned-apps list (see dock_pinned below). */
+#define DC_CONFIG_DOCK_PINNED_MAX 16
+
 typedef enum {
     DC_BAR_POSITION_TOP = 0,
     DC_BAR_POSITION_BOTTOM,
@@ -69,6 +72,22 @@ typedef struct dc_config {
     /* launcher (docs/08-SETTINGS-UI.md DOCK & LAUNCHER): default view mode
      * used when the launcher (re)opens -- list (false) or grid (true). */
     bool launcher_grid_view;
+
+    /* App dock (docs/POLISH.md P5, docs/11-UX-FLOW.md sec.5): off by default
+     * so existing users aren't surprised by a new persistent surface -- see
+     * ui/dock.c. Position always mirrors bar_position (same edge, stacked
+     * just past the bar's outer edge -- matches DMS's default dockPosition
+     * == barPosition behavior, docs/11 sec.5 "Dock" + Modules/Dock/Dock.qml
+     * barSpacing computation). */
+    bool dock_enabled;    /* master switch; ui/dock.c only creates a surface when true */
+    bool dock_auto_hide;  /* hide unless hovered/revealed (DMS dockAutoHide, default off) */
+    int dock_icon_size;   /* px, DMS dockIconSize default 40 */
+    /* Pinned app ids (desktop-entry basenames), in display order. Reuses
+     * DC_CONFIG_WIDGET_ID_MAX-sized slots (get_string_array/add_string_array
+     * are already keyed to that width) -- comfortably fits real desktop ids.
+     * Default empty, matching DMS's own SessionData.pinnedApps: []. */
+    char dock_pinned[DC_CONFIG_DOCK_PINNED_MAX][DC_CONFIG_WIDGET_ID_MAX];
+    int dock_pinned_n;
 } dc_config;
 
 /* The active config. Read-only for the rest of the app. */
