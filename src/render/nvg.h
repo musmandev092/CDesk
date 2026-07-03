@@ -71,6 +71,52 @@ void dc_render_finish(dc_render *render);
  * positively rule out. */
 bool dc_render_font_has(uint32_t codepoint);
 
+/* docs/16-PERF2-PLAN.md T2.1: CJK/Devanagari/Thai/emoji fallback fonts are
+ * loaded LAZILY (on first use) instead of at startup, to shave ~46ms of
+ * cmap-parse time off first-frame latency for the common case (English/Urdu
+ * user who never triggers those scripts). Latin (Inter/icons), general Sans
+ * (Cyrillic/Greek) and Arabic/Urdu are still loaded eagerly at startup — Urdu
+ * must never show tofu on frame 1 per this shell's configured user.
+ *
+ * Returns true if `codepoint` belongs to one of those lazily-managed scripts
+ * AND that script's fallback isn't loaded yet — in which case the caller
+ * MUST NOT draw it via plain nvgText()/nvgTextBounds() this call. Reason:
+ * third_party/nanovg/fontstash.h's fons__getGlyph() permanently caches every
+ * codepoint lookup keyed on (font, codepoint, size) — including a "no glyph
+ * found" (g==0/notdef) result — the very first time it's asked, and
+ * nvgAddFallbackFontId() registering a new fallback LATER does not (and
+ * structurally cannot, from outside fontstash) invalidate that cache. So a
+ * codepoint drawn once via plain nvgText() before its real fallback loads
+ * would show wrong/blank glyphs FOREVER after, even once the correct font is
+ * registered — verified against fontstash.h directly, not assumed. Instead,
+ * while a codepoint's group is unloaded, render/shape.c's dc_shape_needed()
+ * (which calls this for every codepoint) forces the text through the
+ * BiDi/HarfBuzz-shaped nvgTextGlyphs() path, which looks glyphs up by
+ * explicit (font, glyph-index) via fons__getGlyphByIndex() — a completely
+ * different cache keyspace that can never collide with a later, correctly-
+ * resolved (different font id, different glyph index) draw once the real
+ * fallback has loaded. Once a group finishes loading, plain nvgText() is
+ * safe again for its codepoints (they were never looked up while unloaded,
+ * so there is nothing stale to collide with).
+ *
+ * Also flags the (still-unloaded) script for loading, serviced (font
+ * mmap'd + cmap parsed + registered via nvgAddFallbackFontId, and the
+ * shaped-text cache reset) at the START of `dc_render_ensure()`'s next call
+ * — which is BEFORE every single nvgBeginFrame() in this codebase (bar.c and
+ * every popout call dc_render_ensure() immediately before nvgBeginFrame()),
+ * never mid-frame. So this function itself only ever sets an in-memory
+ * bitmask and does a bitmask read — no nanovg/GL state touched — making it
+ * safe to call from inside an in-flight frame. The actual glyph draw may
+ * show a transient collapse-to-"..." (bar.c) or a one-frame .notdef miss (a
+ * run shaped against font_ui, which lacks the glyph, so HarfBuzz reports
+ * glyph 0 for it — via the safe glyph-index cache path, never plain
+ * nvgText's codepoint cache) on the very first appearance of a new script;
+ * every surface in this shell either re-measures fresh each draw pass
+ * (bar.c) or is refreshed at least once per second regardless
+ * (toasts.h/notifcenter.h's 1 Hz tick refresh), so the correct glyphs land
+ * within a second at worst, usually the very same frame or the next. */
+bool dc_render_note_codepoint(uint32_t codepoint);
+
 /* Which loaded font (font_ui first, then font_fallbacks[] in registered
  * order — the exact order/priority fontstash's own glyph-index fallback
  * search uses) actually has a glyph for `codepoint`. Returns the nvg font id
