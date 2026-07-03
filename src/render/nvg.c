@@ -285,7 +285,9 @@ typedef struct {
 
 static const fallback_spec FALLBACK_SPECS[] = {
     {"sans", 0x0410, NULL},          /* general: Cyrillic/Greek/... (Noto Sans) */
-    {"sans:lang=ar", 0x0627, NULL},  /* Arabic/Urdu (existing behavior) */
+    {"sans:lang=ur", 0x06C1, "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf"},
+    /* lang=ur (probe: heh-goal) — lang=ar can resolve to DejaVu, which lacks
+     * the Urdu-only letters (U+06C1/U+06D2); Urdu coverage implies Arabic. */
     {":lang=zh-cn", 0x4F60, "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"},
     {":lang=ja", 0x3053, "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"},
     {":lang=ko", 0xC548, "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"},
