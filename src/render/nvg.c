@@ -340,11 +340,16 @@ static int lazy_group_for_cp(uint32_t cp)
     return -1;
 }
 
-void dc_render_note_codepoint(uint32_t codepoint)
+bool dc_render_note_codepoint(uint32_t codepoint)
 {
     int g = lazy_group_for_cp(codepoint);
-    if (g >= 0 && !(g_lazy_loaded & (1u << g)))
-        g_lazy_pending |= (1u << g);
+    if (g < 0)
+        return false;
+    if (g_lazy_loaded & (1u << g))
+        return false; /* already loaded: plain nvgText's own fallback-chain lookup is safe */
+    g_lazy_pending |= (1u << g);
+    return true; /* not yet loaded: caller must NOT draw this via plain nvgText (fontstash's
+                  * fons__getGlyph() would cache the miss forever — see nvg.h's doc comment) */
 }
 
 typedef struct {

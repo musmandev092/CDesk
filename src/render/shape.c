@@ -66,7 +66,16 @@ static uint32_t utf8_decode(const unsigned char *s, const unsigned char *end, in
  * first) — so it doubles as the hook for lazy fallback-font loading: every
  * codepoint is reported to dc_render_note_codepoint() (nvg.c), which flags a
  * not-yet-loaded script (CJK/Devanagari/Thai/emoji) for loading before the
- * next frame. This means the scan can no longer return early on the first
+ * next frame AND returns true if that codepoint's fallback isn't loaded yet.
+ * That return value MUST force `needed = true` here (not just
+ * cp_needs_shaping()'s Arabic/Hebrew check): while a lazy fallback is still
+ * loading, its codepoints must go through the shaped nvgTextGlyphs()
+ * (glyph-index) draw path rather than plain nvgText()'s codepoint-keyed
+ * path, because fontstash's fons__getGlyph() permanently caches a "no glyph"
+ * result per (font, codepoint, size) the first time it's asked, and
+ * registering the real fallback font later can never retroactively fix an
+ * already-cached miss (see nvg.h's dc_render_note_codepoint() doc comment).
+ * This also means the scan can no longer return early on the first
  * shaping-needed codepoint (it needs to see the whole string to flag
  * everything), but the string lengths here (titles/toasts) are short enough
  * that this is not a measurable cost — same O(n) single pass as before. */
@@ -80,7 +89,8 @@ bool dc_shape_needed(const char *text, const char *end)
     while (s < e) {
         int len;
         uint32_t cp = utf8_decode(s, e, &len);
-        dc_render_note_codepoint(cp);
+        if (dc_render_note_codepoint(cp))
+            needed = true;
         if (cp_needs_shaping(cp))
             needed = true;
         s += len;
