@@ -275,3 +275,103 @@ int dc_display_list(dc_display_info out[DC_DISPLAY_MAX_OUTPUTS])
 
     return n;
 }
+
+/* --- write: niri msg output <name> <action> ------------------------------
+ *
+ * Fire-and-forget fork+execlp, identical shape to
+ * dc_niri_focus_workspace()/niri_spawn_action() in src/niri/niri.c. Reaped
+ * by main's SIGCHLD = SIG_IGN, same as those.
+ *
+ * DANKC_DISPLAY_DRYRUN=1 logs the argv instead of forking -- verification
+ * harness for this task uses it to confirm call shape without touching a
+ * live session.
+ */
+static bool dryrun_enabled(void)
+{
+    const char *v = getenv("DANKC_DISPLAY_DRYRUN");
+    return v && v[0] == '1';
+}
+
+/* argv must be NULL-terminated; argv[0] is conventionally "niri". */
+static void run_niri_output_cmd(const char *const argv[], int argc)
+{
+    if (dryrun_enabled()) {
+        char line[1024];
+        int off = snprintf(line, sizeof(line), "[dryrun] niri");
+        for (int i = 1; i < argc && argv[i]; i++)
+            off += snprintf(line + off, off < (int)sizeof(line) ? sizeof(line) - (size_t)off : 0,
+                    " %s", argv[i]);
+        dc_info("display: %s", line);
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        execvp("niri", (char *const *)argv);
+        _exit(127);
+    }
+    /* Parent: fire-and-forget, reaped by main's SIGCHLD = SIG_IGN. */
+}
+
+void dc_display_set_mode(const char *name, int width, int height, int refresh_mhz)
+{
+    char mode[64];
+    if (refresh_mhz > 0) {
+        char refresh[16];
+        dc_display_format_refresh(refresh_mhz, refresh, sizeof(refresh));
+        snprintf(mode, sizeof(mode), "%dx%d@%s", width, height, refresh);
+    } else {
+        snprintf(mode, sizeof(mode), "%dx%d", width, height);
+    }
+    const char *argv[] = {"niri", "msg", "output", name, "mode", mode, NULL};
+    run_niri_output_cmd(argv, 6);
+}
+
+void dc_display_set_mode_auto(const char *name)
+{
+    const char *argv[] = {"niri", "msg", "output", name, "mode", "auto", NULL};
+    run_niri_output_cmd(argv, 6);
+}
+
+void dc_display_set_scale(const char *name, double scale)
+{
+    char scale_str[32];
+    snprintf(scale_str, sizeof(scale_str), "%g", scale);
+    const char *argv[] = {"niri", "msg", "output", name, "scale", scale_str, NULL};
+    run_niri_output_cmd(argv, 6);
+}
+
+void dc_display_set_position(const char *name, int x, int y)
+{
+    char x_str[16], y_str[16];
+    snprintf(x_str, sizeof(x_str), "%d", x);
+    snprintf(y_str, sizeof(y_str), "%d", y);
+    const char *argv[] = {"niri", "msg", "output", name, "position", "set", x_str, y_str, NULL};
+    run_niri_output_cmd(argv, 8);
+}
+
+void dc_display_set_position_auto(const char *name)
+{
+    const char *argv[] = {"niri", "msg", "output", name, "position", "auto", NULL};
+    run_niri_output_cmd(argv, 6);
+}
+
+void dc_display_set_transform(const char *name, dc_display_transform transform)
+{
+    const char *argv[] = {
+            "niri", "msg", "output", name, "transform", dc_display_transform_name(transform), NULL};
+    run_niri_output_cmd(argv, 6);
+}
+
+void dc_display_set_enabled(const char *name, bool enabled)
+{
+    const char *argv[] = {"niri", "msg", "output", name, enabled ? "on" : "off", NULL};
+    run_niri_output_cmd(argv, 5);
+}
+
+void dc_display_set_vrr(const char *name, bool enabled)
+{
+    const char *argv[] = {"niri", "msg", "output", name, "vrr", enabled ? "on" : "off", NULL};
+    run_niri_output_cmd(argv, 6);
+}
+
