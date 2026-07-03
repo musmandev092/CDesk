@@ -2,12 +2,14 @@
 
 #include <string.h>
 
-/* A named built-in palette. The table below is generated from DMS's
- * StockThemes.js (see stock_themes.inc). */
+/* A named built-in palette, with both mode variants. The table below is
+ * generated from DMS's StockThemes.js (see stock_themes.inc /
+ * scripts/gen_stock_themes.py). */
 typedef struct {
     const char *id;
     const char *name;
-    dc_theme theme;
+    dc_theme dark;
+    dc_theme light;
 } dc_stock_theme;
 
 #include "stock_themes.inc"
@@ -18,6 +20,20 @@ typedef struct {
 /* Active palette (a copy so the pointer target stays stable across switches). */
 static dc_theme active_theme;
 const dc_theme *dc_theme_current = &active_theme;
+
+/* Whether dc_theme_set() resolves to the light variant. Config drives this via
+ * dc_theme_set_light() before (re)applying the theme. */
+static bool light_mode;
+
+void dc_theme_set_light(bool light)
+{
+    light_mode = light;
+}
+
+bool dc_theme_is_light(void)
+{
+    return light_mode;
+}
 
 static const dc_stock_theme *find_stock(const char *id)
 {
@@ -39,7 +55,7 @@ bool dc_theme_set(const char *id)
         stock = find_stock(DC_DEFAULT_THEME);
     if (!stock)
         return false;
-    active_theme = stock->theme;
+    active_theme = light_mode ? stock->light : stock->dark;
     return id && strcmp(stock->id, id) == 0;
 }
 
@@ -68,7 +84,10 @@ dc_color dc_theme_primary_at(int index)
         dc_color none = {0, 0, 0, 255};
         return none;
     }
-    return dc_stock_themes[index].theme.primary;
+    /* Swatch reflects the mode currently in use so the settings picker matches
+     * the live surfaces. */
+    return light_mode ? dc_stock_themes[index].light.primary
+                      : dc_stock_themes[index].dark.primary;
 }
 
 void dc_theme_set_custom(const dc_theme *theme)

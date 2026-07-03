@@ -9,12 +9,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include "cJSON.h"
 
 /* DMS-matching defaults. */
 static dc_config config = {
     .theme_id = "green",
+    .theme_mode = "dark",
     .clock_24h = true,
     .show_date = true,
     .show_seconds = false,
@@ -194,16 +196,40 @@ static void get_bar_position(const cJSON *root, const char *key, dc_bar_position
         *out = DC_BAR_POSITION_TOP;
 }
 
-/* Apply the selected stock palette, then overlay a wallpaper-derived palette
- * when dynamic color is enabled. */
+/* Resolve themeMode ("dark"|"light"|"auto") + the DANKC_THEME_MODE env
+ * override to a concrete light bool. "auto" follows the wall clock: light
+ * during the day (06:00-18:00), dark at night. (Chosen over a fixed default so
+ * "auto" is actually useful without a geoclue/sun-position dependency; can be
+ * upgraded to real sunrise/sunset later.) */
+bool dc_config_light_mode(void)
+{
+    const char *mode = config.theme_mode;
+    const char *env = getenv("DANKC_THEME_MODE");
+    if (env && *env)
+        mode = env;
+    if (strcmp(mode, "light") == 0)
+        return true;
+    if (strcmp(mode, "dark") == 0)
+        return false;
+    /* "auto" (or anything unrecognized) -> time of day. */
+    time_t now = time(NULL);
+    struct tm lt;
+    localtime_r(&now, &lt);
+    return lt.tm_hour >= 6 && lt.tm_hour < 18;
+}
+
+/* Apply the selected stock palette in the resolved mode, then overlay a
+ * wallpaper-derived palette (same mode) when dynamic color is enabled. */
 static void apply_theme(void)
 {
+    bool light = dc_config_light_mode();
+    dc_theme_set_light(light);
     dc_theme_set(config.theme_id);
     if (config.dynamic_color && config.wallpaper[0]) {
         dc_theme generated;
-        if (dc_dynamic_from_image(config.wallpaper, &generated)) {
+        if (dc_dynamic_from_image(config.wallpaper, light, &generated)) {
             dc_theme_set_custom(&generated);
-            dc_info("dynamic color from %s", config.wallpaper);
+            dc_info("dynamic color from %s (%s)", config.wallpaper, light ? "light" : "dark");
         } else {
             dc_warn("dynamic color: could not read %s", config.wallpaper);
         }
@@ -257,6 +283,7 @@ void dc_config_load(void)
     }
 
     get_string(root, "theme", config.theme_id, sizeof(config.theme_id));
+    get_string(root, "themeMode", config.theme_mode, sizeof(config.theme_mode));
     get_bool(root, "clock24h", &config.clock_24h);
     get_bool(root, "showDate", &config.show_date);
     get_bool(root, "showSeconds", &config.show_seconds);
@@ -367,6 +394,7 @@ void dc_config_save(void)
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "theme", config.theme_id);
+    cJSON_AddStringToObject(root, "themeMode", config.theme_mode);
     cJSON_AddBoolToObject(root, "clock24h", config.clock_24h);
     cJSON_AddBoolToObject(root, "showDate", config.show_date);
     cJSON_AddBoolToObject(root, "showSeconds", config.show_seconds);

@@ -44,9 +44,16 @@ extern const dc_theme *dc_theme_current;
 /* Select the default palette ("green"). Safe to call before rendering starts. */
 void dc_theme_init(void);
 
+/* Dark vs. light: which variant dc_theme_set() and the dynamic-color path
+ * resolve to. Set by config (themeMode -> resolved bool) before dc_theme_set().
+ * Persists across dc_theme_set() calls; default dark. */
+void dc_theme_set_light(bool light);
+bool dc_theme_is_light(void);
+
 /* Switch to the built-in palette with the given id (e.g. "blue", "green",
- * "monochrome"). Falls back to the default if `id` is unknown. Returns true iff
- * the requested id matched a known theme. */
+ * "monochrome"), in the currently-selected mode (see dc_theme_set_light).
+ * Falls back to the default if `id` is unknown. Returns true iff the requested
+ * id matched a known theme. */
 bool dc_theme_set(const char *id);
 
 /* Enumerate the built-in palettes (for config/settings UI). */

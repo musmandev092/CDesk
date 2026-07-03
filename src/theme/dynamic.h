@@ -16,9 +16,10 @@
 extern "C" {
 #endif
 
-/* Load `image_path`, pick a seed colour, and fill `out` with a generated dark
- * palette. Returns false if the image can't be read. */
-bool dc_dynamic_from_image(const char *image_path, dc_theme *out);
+/* Load `image_path`, pick a seed colour via MCU quantize+score, and fill `out`
+ * with a generated Material palette in the requested mode (`light` -> light
+ * variant, else dark). Returns false if the image can't be read. */
+bool dc_dynamic_from_image(const char *image_path, bool light, dc_theme *out);
 
 #ifdef __cplusplus
 }

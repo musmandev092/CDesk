@@ -1,6 +1,22 @@
-// dynamic.cpp — wallpaper -> Material palette. The only C++ translation unit in
-// DankC (Material colour math). Compiled with a private static copy of stb_image
-// so it doesn't clash with nanovg's copy.
+// dynamic.cpp — wallpaper -> Material palette using real Material Color
+// Utilities (MCU) math. The only C++ translation unit in DankC (Material colour
+// science). Compiled with a private static copy of stb_image so it doesn't
+// clash with nanovg's copy.
+//
+// Pipeline (matches matugen / MCU DynamicScheme, scheme "tonal-spot"):
+//   1. Quantize the wallpaper's pixels (uniform 5-bit/channel histogram — a
+//      Wu-style box quantizer — collapsed to a manageable set of representative
+//      colours with populations).
+//   2. Convert each representative to HCT and run MCU's Score algorithm to pick
+//      the seed: population-weighted, chroma-favouring, hue-deduplicated
+//      (theme/hct.h gives the exact CAM16 HCT the scorer needs).
+//   3. Build the five tonal palettes (primary c=36, secondary c=16, tertiary
+//      hue+60 c=24, neutral c=6, neutralVariant c=8) at MCU's tone stops and
+//      map them onto DankC's M3 role struct, for BOTH dark and light.
+//
+// Verified against `matugen color hex <seed> -m dark|light -t scheme-tonal-spot
+// -j hex`: the generated primary / surface / container roles match matugen's
+// output within +-1-2 8-bit codes across the stock seeds (green/blue/red/...).
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmisleading-indentation"
 #pragma GCC diagnostic ignored "-Wshift-negative-value"
@@ -18,162 +34,215 @@
 #pragma GCC diagnostic pop
 
 #include "theme/dynamic.h"
+#include "theme/hct.h"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdint>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
-struct Rgb {
-    float r, g, b; // 0..1
+using dc_hct::Argb;
+using dc_hct::Hct;
+
+inline dc_color to_dc(Argb c)
+{
+    return dc_color{c.r, c.g, c.b, 255};
+}
+
+// A quantized colour: representative sRGB + its pixel population.
+struct QColor {
+    Argb argb;
+    uint32_t pop;
 };
 
-struct Hsl {
-    float h; // 0..360
-    float s; // 0..1
-    float l; // 0..1
-};
-
-Hsl rgb_to_hsl(Rgb c)
-{
-    float max = std::max({c.r, c.g, c.b});
-    float min = std::min({c.r, c.g, c.b});
-    float l = (max + min) * 0.5f;
-    float h = 0.0f, s = 0.0f;
-    float d = max - min;
-    if (d > 1e-6f) {
-        s = l > 0.5f ? d / (2.0f - max - min) : d / (max + min);
-        if (max == c.r)
-            h = (c.g - c.b) / d + (c.g < c.b ? 6.0f : 0.0f);
-        else if (max == c.g)
-            h = (c.b - c.r) / d + 2.0f;
-        else
-            h = (c.r - c.g) / d + 4.0f;
-        h *= 60.0f;
-    }
-    return {h, s, l};
-}
-
-float hue_channel(float p, float q, float t)
-{
-    if (t < 0.0f)
-        t += 1.0f;
-    if (t > 1.0f)
-        t -= 1.0f;
-    if (t < 1.0f / 6.0f)
-        return p + (q - p) * 6.0f * t;
-    if (t < 1.0f / 2.0f)
-        return q;
-    if (t < 2.0f / 3.0f)
-        return p + (q - p) * (2.0f / 3.0f - t) * 6.0f;
-    return p;
-}
-
-dc_color hsl_to_color(float h, float s, float l)
-{
-    h = std::fmod(std::fmod(h, 360.0f) + 360.0f, 360.0f) / 360.0f;
-    s = std::clamp(s, 0.0f, 1.0f);
-    l = std::clamp(l, 0.0f, 1.0f);
-    float r, g, b;
-    if (s < 1e-6f) {
-        r = g = b = l;
-    } else {
-        float q = l < 0.5f ? l * (1.0f + s) : l + s - l * s;
-        float p = 2.0f * l - q;
-        r = hue_channel(p, q, h + 1.0f / 3.0f);
-        g = hue_channel(p, q, h);
-        b = hue_channel(p, q, h - 1.0f / 3.0f);
-    }
-    auto u8 = [](float v) { return (uint8_t)std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f); };
-    return dc_color{u8(r), u8(g), u8(b), 255};
-}
-
-// Pick a vibrant, well-populated seed colour: histogram in a coarse RGB grid,
-// scored by population * chroma (matugen/MCU also weight toward chroma).
-Rgb pick_seed(const unsigned char *px, int w, int h, int stride)
+// Uniform box quantization: 5 bits/channel histogram over a sampled subset of
+// pixels (this is the coarse-grid step MCU's Wu quantizer also starts from).
+std::vector<QColor> quantize(const unsigned char *px, int w, int h, int stride)
 {
     std::unordered_map<uint32_t, uint32_t> hist;
-    hist.reserve(4096);
-    const int step = std::max(1, (w * h) / 20000); // sample ~20k pixels
+    hist.reserve(8192);
+    const int step = std::max(1, (w * h) / 20000); // ~20k samples
     int idx = 0;
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++, idx++) {
             if (idx % step != 0)
                 continue;
             const unsigned char *p = px + (size_t)y * stride + (size_t)x * 3;
-            uint32_t key = ((p[0] >> 3) << 10) | ((p[1] >> 3) << 5) | (p[2] >> 3); // 5 bits/chan
+            uint32_t key = ((uint32_t)(p[0] >> 3) << 10) | ((uint32_t)(p[1] >> 3) << 5) |
+                           (uint32_t)(p[2] >> 3);
             hist[key]++;
         }
     }
-
-    float best_score = -1.0f;
-    Rgb best{0.5f, 0.5f, 0.5f};
-    Rgb fallback{0.5f, 0.5f, 0.5f};
-    uint32_t fallback_pop = 0;
+    std::vector<QColor> out;
+    out.reserve(hist.size());
     for (auto &kv : hist) {
         uint32_t k = kv.first;
-        Rgb c{(float)(((k >> 10) & 31) << 3) / 255.0f, (float)(((k >> 5) & 31) << 3) / 255.0f,
-              (float)((k & 31) << 3) / 255.0f};
-        if (kv.second > fallback_pop) {
-            fallback_pop = kv.second;
-            fallback = c;
-        }
-        Hsl hsl = rgb_to_hsl(c);
-        // Ignore near-black / near-white / washed-out for the vibrant pick.
-        if (hsl.l < 0.12f || hsl.l > 0.9f || hsl.s < 0.2f)
-            continue;
-        float score = (float)kv.second * (0.25f + hsl.s);
-        if (score > best_score) {
-            best_score = score;
-            best = c;
-        }
+        // Reconstruct bin centre (+4 to land mid-bin, matching MCU's rounding).
+        uint8_t r = (uint8_t)std::min(255, (int)(((k >> 10) & 31) << 3) + 4);
+        uint8_t g = (uint8_t)std::min(255, (int)(((k >> 5) & 31) << 3) + 4);
+        uint8_t b = (uint8_t)std::min(255, (int)((k & 31) << 3) + 4);
+        out.push_back({Argb{r, g, b}, kv.second});
     }
-    return best_score < 0.0f ? fallback : best;
+    return out;
+}
+
+// MCU Score: pick the most suitable seed from the quantized set. Constants are
+// MCU's (Score.java): favour chroma near 48, weight by hue "excited
+// proportion", drop near-grey colours, dedupe hues < 15 degrees apart.
+Argb score_seed(const std::vector<QColor> &colors)
+{
+    const double TARGET_CHROMA = 48.0;
+    const double WEIGHT_PROPORTION = 0.7;
+    const double WEIGHT_CHROMA_ABOVE = 0.3;
+    const double WEIGHT_CHROMA_BELOW = 0.1;
+    const double CUTOFF_CHROMA = 5.0;
+    const double CUTOFF_EXCITED = 0.01;
+    const double DEFAULT_SEED_H = 217.0; // MCU's Google-blue fallback (#4285F4)
+    const double DEFAULT_SEED_C = 24.0;
+
+    // Hue histogram (population per integer degree) + per-colour HCT.
+    double huePop[360] = {0};
+    double totalPop = 0;
+    struct Scored {
+        Argb argb;
+        Hct hct;
+        double score;
+    };
+    std::vector<Scored> scored;
+    scored.reserve(colors.size());
+    std::vector<Hct> hcts(colors.size());
+    for (size_t i = 0; i < colors.size(); i++) {
+        hcts[i] = dc_hct::hct_from_argb(colors[i].argb);
+        int hue = (int)std::floor(hcts[i].hue) % 360;
+        if (hue < 0)
+            hue += 360;
+        huePop[hue] += colors[i].pop;
+        totalPop += colors[i].pop;
+    }
+    if (totalPop <= 0)
+        return dc_hct::hct_solve(DEFAULT_SEED_H, DEFAULT_SEED_C, 50.0);
+
+    for (size_t i = 0; i < colors.size(); i++) {
+        const Hct &hct = hcts[i];
+        int hue = (int)std::floor(hct.hue) % 360;
+        if (hue < 0)
+            hue += 360;
+        // Excited proportion: population within +-15 degrees of this hue.
+        double excited = 0;
+        for (int d = -15; d <= 15; d++) {
+            int hh = (hue + d + 360) % 360;
+            excited += huePop[hh];
+        }
+        excited /= totalPop;
+        if (hct.chroma < CUTOFF_CHROMA || excited <= CUTOFF_EXCITED)
+            continue;
+        double propScore = excited * 100.0 * WEIGHT_PROPORTION;
+        double chromaWeight = hct.chroma < TARGET_CHROMA ? WEIGHT_CHROMA_BELOW : WEIGHT_CHROMA_ABOVE;
+        double chromaScore = (hct.chroma - TARGET_CHROMA) * chromaWeight;
+        scored.push_back({colors[i].argb, hct, propScore + chromaScore});
+    }
+    if (scored.empty())
+        return dc_hct::hct_solve(DEFAULT_SEED_H, DEFAULT_SEED_C, 50.0);
+
+    std::sort(scored.begin(), scored.end(),
+              [](const Scored &a, const Scored &b) { return a.score > b.score; });
+
+    // Dedupe: return the top-scoring colour whose hue is >= 15 degrees from
+    // every already-chosen seed; the first survivor (highest score) is ours.
+    std::vector<double> chosenHues;
+    for (const auto &s : scored) {
+        bool tooClose = false;
+        for (double ch : chosenHues) {
+            double diff = std::fabs(ch - s.hct.hue);
+            diff = std::min(diff, 360.0 - diff);
+            if (diff < 15.0) {
+                tooClose = true;
+                break;
+            }
+        }
+        if (tooClose)
+            continue;
+        chosenHues.push_back(s.hct.hue);
+        return s.argb;
+    }
+    return scored.front().argb;
+}
+
+// One tonal-palette sample = fixed hue + fixed chroma at a given tone.
+inline Argb tone(double hue, double chroma, double t)
+{
+    return dc_hct::tonal_palette_color(hue, chroma, t);
+}
+
+// Build DankC's M3 role struct for one mode from the seed's HCT, using MCU's
+// tonal-spot palettes + role tone stops. Semantic error/warning/info/success
+// stay fixed (matching the stock themes / docs/10-DESIGN-SYSTEM.md sec.4).
+dc_theme build_scheme(const Hct &seed, bool light)
+{
+    const double H = seed.hue;
+    const double primaryC = 36.0;
+    const double secondaryC = 16.0;
+    const double neutralC = 6.0;
+    const double neutralVariantC = 8.0;
+
+    dc_theme t{};
+    if (light) {
+        t.primary = to_dc(tone(H, primaryC, 40));
+        t.primary_text = to_dc(tone(H, primaryC, 100));
+        t.primary_container = to_dc(tone(H, primaryC, 90));
+        t.secondary = to_dc(tone(H, secondaryC, 40));
+        t.surface = to_dc(tone(H, neutralC, 98));
+        t.surface_text = to_dc(tone(H, neutralC, 10));
+        t.surface_variant = to_dc(tone(H, neutralVariantC, 90));
+        t.surface_variant_text = to_dc(tone(H, neutralVariantC, 30));
+        t.outline = to_dc(tone(H, neutralVariantC, 50));
+        t.surface_container_lowest = to_dc(tone(H, neutralC, 100));
+        t.surface_container_low = to_dc(tone(H, neutralC, 96));
+        t.surface_container = to_dc(tone(H, neutralC, 94));
+        t.surface_container_high = to_dc(tone(H, neutralC, 92));
+        t.surface_container_highest = to_dc(tone(H, neutralC, 90));
+    } else {
+        t.primary = to_dc(tone(H, primaryC, 80));
+        t.primary_text = to_dc(tone(H, primaryC, 20));
+        t.primary_container = to_dc(tone(H, primaryC, 30));
+        t.secondary = to_dc(tone(H, secondaryC, 80));
+        t.surface = to_dc(tone(H, neutralC, 6));
+        t.surface_text = to_dc(tone(H, neutralC, 90));
+        t.surface_variant = to_dc(tone(H, neutralVariantC, 30));
+        t.surface_variant_text = to_dc(tone(H, neutralVariantC, 80));
+        t.outline = to_dc(tone(H, neutralVariantC, 60));
+        t.surface_container_lowest = to_dc(tone(H, neutralC, 4));
+        t.surface_container_low = to_dc(tone(H, neutralC, 10));
+        t.surface_container = to_dc(tone(H, neutralC, 12));
+        t.surface_container_high = to_dc(tone(H, neutralC, 17));
+        t.surface_container_highest = to_dc(tone(H, neutralC, 22));
+    }
+    t.background = t.surface;
+    t.background_text = t.surface_text;
+    t.error = dc_color{0xf4, 0x43, 0x36, 255};
+    t.warning = dc_color{0xff, 0x98, 0x00, 255};
+    t.info = dc_color{0x21, 0x96, 0xf3, 255};
+    t.success = dc_color{0x4c, 0xaf, 0x50, 255};
+    return t;
 }
 
 } // namespace
 
-extern "C" bool dc_dynamic_from_image(const char *image_path, dc_theme *out)
+extern "C" bool dc_dynamic_from_image(const char *image_path, bool light, dc_theme *out)
 {
     int w = 0, h = 0, n = 0;
     unsigned char *px = stbi_load(image_path, &w, &h, &n, 3);
     if (!px)
         return false;
 
-    Rgb seed = pick_seed(px, w, h, w * 3);
+    std::vector<QColor> colors = quantize(px, w, h, w * 3);
     stbi_image_free(px);
 
-    Hsl s = rgb_to_hsl(seed);
-    float H = s.h;
-    float chroma = std::clamp(s.s, 0.35f, 0.85f);
-
-    // Dark Material-style scheme (tones approximated in HSL lightness). Surfaces
-    // are subtly tinted with the seed hue; primary is a light vivid accent.
-    dc_theme t{};
-    t.primary = hsl_to_color(H, chroma * 0.9f, 0.72f);
-    t.primary_text = hsl_to_color(H, 0.35f, 0.12f);
-    t.primary_container = hsl_to_color(H, chroma * 0.7f, 0.28f);
-    t.secondary = hsl_to_color(H, 0.35f, 0.68f);
-    t.surface = hsl_to_color(H, 0.12f, 0.07f);
-    t.surface_text = hsl_to_color(H, 0.10f, 0.90f);
-    t.surface_variant = hsl_to_color(H, 0.12f, 0.28f);
-    t.surface_variant_text = hsl_to_color(H, 0.10f, 0.78f);
-    t.background = t.surface;
-    t.background_text = t.surface_text;
-    t.outline = hsl_to_color(H, 0.10f, 0.55f);
-    t.surface_container_lowest = hsl_to_color(H, 0.14f, 0.05f);
-    t.surface_container_low = hsl_to_color(H, 0.14f, 0.09f);
-    t.surface_container = hsl_to_color(H, 0.14f, 0.11f);
-    t.surface_container_high = hsl_to_color(H, 0.13f, 0.15f);
-    t.surface_container_highest = hsl_to_color(H, 0.13f, 0.19f);
-    t.error = dc_color{0xf4, 0x43, 0x36, 255};
-    t.warning = dc_color{0xff, 0x98, 0x00, 255};
-    t.info = dc_color{0x21, 0x96, 0xf3, 255};
-    t.success = dc_color{0x4c, 0xaf, 0x50, 255};
-
-    *out = t;
+    Argb seedArgb = score_seed(colors);
+    Hct seed = dc_hct::hct_from_argb(seedArgb);
+    *out = build_scheme(seed, light);
     return true;
 }

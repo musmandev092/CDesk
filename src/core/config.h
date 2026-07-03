@@ -27,6 +27,12 @@ typedef enum {
 
 typedef struct dc_config {
     char theme_id[DC_CONFIG_THEME_MAX];   /* built-in palette id, e.g. "green" */
+    /* Dark/light selection. Config key "themeMode": "dark" | "light" | "auto".
+     * "auto" follows the wall clock (light 06:00-18:00, dark otherwise). The
+     * env var DANKC_THEME_MODE (dark|light|auto) overrides this at startup for
+     * testing. Applies to BOTH stock themes and wallpaper-derived dynamic
+     * color. Default "dark" (matches DMS's dark-first stock themes). */
+    char theme_mode[8];
     bool clock_24h;                       /* 24-hour vs 12-hour clock */
     bool show_date;                       /* show the date next to the clock */
     bool show_seconds;                    /* show seconds in the clock */
@@ -124,6 +130,10 @@ typedef struct dc_config {
 
 /* The active config. Read-only for the rest of the app. */
 extern const dc_config *dc_config_current;
+
+/* Resolve theme_mode ("dark"|"light"|"auto" + the DANKC_THEME_MODE env
+ * override) to a concrete light/dark bool (true = light). "auto" -> clock. */
+bool dc_config_light_mode(void);
 
 /* Load ~/.config/dankc/config.json (or defaults if absent/invalid) and apply
  * the theme selection. Call once at startup after dc_theme_init(). */
