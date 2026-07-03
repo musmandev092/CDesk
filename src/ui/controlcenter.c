@@ -204,12 +204,15 @@ struct dc_control_center {
      * dc_bluez_pair_poll() until the async Pair/Trust/Connect chain resolves,
      * since those replies arrive via the system bus's own event-loop
      * integration rather than anything this file drives directly.
-     * `bt_passkey_buf` is the digit buffer for a RequestPasskey agent prompt
-     * (dc_bluez_agent_poll()'s DC_BLUEZ_AGENT_PASSKEY kind) -- unlike the
-     * Wi-Fi password field, whether this is even showing is entirely driven
-     * by bluez.c's agent state, not a flag owned here. */
+     * `bt_passkey_buf` is the entry buffer for a RequestPasskey (digits only)
+     * or RequestPinCode (any printable char, legacy pre-SSP pairing) agent
+     * prompt (dc_bluez_agent_poll()'s DC_BLUEZ_AGENT_PASSKEY/PIN_CODE kinds,
+     * see cc_bt_agent_has_field()) -- unlike the Wi-Fi password field,
+     * whether this is even showing is entirely driven by bluez.c's agent
+     * state, not a flag owned here. Sized for the legacy PIN's up to 16
+     * chars (bluez.h), comfortably more than a 6-digit passkey needs. */
     bool bt_pairing_active;
-    char bt_passkey_buf[8];
+    char bt_passkey_buf[24];
 
     bool visible;
     bool configured;
@@ -218,6 +221,7 @@ struct dc_control_center {
 
 static void cc_render(dc_control_center *cc);
 static void cc_teardown(dc_control_center *cc);
+static bool cc_bt_agent_has_field(dc_bluez_agent_kind k);
 
 static void cc_frame_done(void *data, struct wl_callback *cb, uint32_t time);
 static const struct wl_callback_listener cc_frame_listener = {.done = cc_frame_done};
@@ -323,7 +327,7 @@ typedef struct {
     dc_bluez_agent_kind bt_agent_kind;
     float bt_agent_h;
     float bt_agent_text_y;
-    float bt_agent_field_y, bt_agent_field_h; /* only for DC_BLUEZ_AGENT_PASSKEY */
+    float bt_agent_field_y, bt_agent_field_h; /* only for PASSKEY/PIN_CODE, see cc_bt_agent_has_field() */
     float bt_agent_btn_y0, bt_agent_btn_h;
     float bt_agent_no_x0, bt_agent_no_x1;
     float bt_agent_yes_x0, bt_agent_yes_x1;
@@ -476,7 +480,7 @@ static cc_layout cc_get_layout(float w, bool media_active, int expand_kind, int 
                 float y = l.expand_row_y0 + (float)rows * l.expand_row_h + 6.0f;
                 l.bt_agent_text_y = y + 10.0f;
                 float cursor = y + 22.0f;
-                if (bt_agent_kind == DC_BLUEZ_AGENT_PASSKEY) {
+                if (cc_bt_agent_has_field(bt_agent_kind)) {
                     l.bt_agent_field_y = cursor;
                     l.bt_agent_field_h = CC_NET_PW_FIELD_H;
                     cursor = l.bt_agent_field_y + l.bt_agent_field_h + CC_NET_PW_GAP;
@@ -666,10 +670,10 @@ static cc_hover_id cc_hittest(const cc_layout *l, double x, double y)
         }
     }
 
-    /* Bluetooth pairing-agent panel (W3.1): field (passkey entry only) +
+    /* Bluetooth pairing-agent panel (W3.1): field (passkey/PIN entry only) +
      * Reject/Confirm (or Cancel/Submit) buttons. */
     if (l->bt_agent_active) {
-        if (l->bt_agent_kind == DC_BLUEZ_AGENT_PASSKEY && x >= (double)l->ix &&
+        if (cc_bt_agent_has_field(l->bt_agent_kind) && x >= (double)l->ix &&
             x <= (double)(l->ix + l->iw) && y >= (double)l->bt_agent_field_y &&
             y <= (double)(l->bt_agent_field_y + l->bt_agent_field_h))
             return CC_HOVER_BT_AGENT_FIELD;
@@ -1222,6 +1226,19 @@ static void draw_slider(dc_render *r, float x, float cy, float w, int icon, floa
     nvgText(vg, x + w, cy, pct, NULL);
 }
 
+/* Which pairing-agent request kinds (W3.1) need a typed-entry field in
+ * draw_bt_agent_panel(), as opposed to just Reject/Confirm buttons:
+ * RequestPasskey (digits only) and RequestPinCode (legacy pre-SSP pairing,
+ * any printable char, up to 16 per the Bluetooth spec) -- both answerable via
+ * a typed value, unlike RequestConfirmation/RequestAuthorization's plain
+ * yes/no. Shared by cc_get_layout()/cc_hittest()/draw_bt_agent_panel()/the
+ * click and key handlers so none of them can disagree about which kind gets
+ * the field. */
+static bool cc_bt_agent_has_field(dc_bluez_agent_kind k)
+{
+    return k == DC_BLUEZ_AGENT_PASSKEY || k == DC_BLUEZ_AGENT_PIN_CODE;
+}
+
 /* Map org.bluez.Device1.Icon (dc_bluez_device.icon) onto dankc's own icon set
  * (docs/18-WIFI-BT-PLAN.md W1 item 5) -- audio-headphones/audio-headset ->
  * headphones, input-mouse -> mouse, input-keyboard -> keyboard, phone ->
@@ -1411,10 +1428,12 @@ static void draw_net_pw_panel(dc_render *r, const cc_layout *l, const char *pw_b
 
 /* Bluetooth pairing-agent panel (W3.1): a one-line prompt ("Confirm code
  * NNNNNN with \"device\"?" / "Pair with \"device\"?" / "Enter the passkey
- * shown on \"device\"") plus either a masked numeric-entry field (RequestPasskey)
- * or nothing extra, then Reject/Confirm (or Cancel/Submit) buttons -- same
- * "layout owns geometry, this only draws" discipline as draw_net_pw_panel()
- * above, whose masked-field styling this reuses for the passkey-entry case. */
+ * shown on \"device\"" / "Enter the PIN for \"device\"") plus either a masked
+ * entry field (RequestPasskey: digits only; RequestPinCode: any printable
+ * char, legacy pre-SSP pairing -- see cc_bt_agent_has_field()) or nothing
+ * extra, then Reject/Confirm (or Cancel/Submit) buttons -- same "layout owns
+ * geometry, this only draws" discipline as draw_net_pw_panel() above, whose
+ * masked-field styling this reuses for both entry-field cases. */
 static void draw_bt_agent_panel(dc_render *r, const cc_layout *l, const char *device_name,
                                 const char *passkey_str, const char *entry_buf)
 {
@@ -1428,6 +1447,8 @@ static void draw_bt_agent_panel(dc_render *r, const cc_layout *l, const char *de
     else if (l->bt_agent_kind == DC_BLUEZ_AGENT_PASSKEY)
         snprintf(text, sizeof(text), "Enter the passkey shown on \"%s\"",
                  device_name ? device_name : "device");
+    else if (l->bt_agent_kind == DC_BLUEZ_AGENT_PIN_CODE)
+        snprintf(text, sizeof(text), "Enter the PIN for \"%s\"", device_name ? device_name : "device");
     else
         snprintf(text, sizeof(text), "Pair with \"%s\"?", device_name ? device_name : "device");
 
@@ -1439,9 +1460,10 @@ static void draw_bt_agent_panel(dc_render *r, const cc_layout *l, const char *de
     dc_shape_draw_text(r, l->ix, l->bt_agent_text_y, text, NULL);
 
     size_t entry_len = entry_buf ? strlen(entry_buf) : 0;
-    bool is_passkey = l->bt_agent_kind == DC_BLUEZ_AGENT_PASSKEY;
+    bool has_field = cc_bt_agent_has_field(l->bt_agent_kind);
+    const char *placeholder = l->bt_agent_kind == DC_BLUEZ_AGENT_PIN_CODE ? "PIN" : "Passkey";
 
-    if (is_passkey) {
+    if (has_field) {
         nvgBeginPath(vg);
         nvgRoundedRect(vg, l->ix, l->bt_agent_field_y, l->iw, l->bt_agent_field_h, 8.0f);
         nvgFillColor(vg, tc(t->surface_container_highest));
@@ -1454,11 +1476,11 @@ static void draw_bt_agent_panel(dc_render *r, const cc_layout *l, const char *de
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         if (entry_len == 0) {
             nvgFillColor(vg, tc_alpha(t->surface_variant_text, 170));
-            nvgText(vg, l->ix + 10.0f, l->bt_agent_field_y + l->bt_agent_field_h / 2.0f, "Passkey",
+            nvgText(vg, l->ix + 10.0f, l->bt_agent_field_y + l->bt_agent_field_h / 2.0f, placeholder,
                    NULL);
         } else {
-            char masked[3 * 8 + 1];
-            size_t shown = entry_len < 8 ? entry_len : 8;
+            char masked[3 * 16 + 1];
+            size_t shown = entry_len < 16 ? entry_len : 16;
             for (size_t i = 0; i < shown; i++)
                 memcpy(masked + i * 3, "\xe2\x80\xa2", 3);
             masked[shown * 3] = '\0';
@@ -1468,9 +1490,9 @@ static void draw_bt_agent_panel(dc_render *r, const cc_layout *l, const char *de
         }
     }
 
-    const char *no_label = is_passkey ? "Cancel" : "Reject";
-    const char *yes_label = is_passkey ? "Submit" : "Confirm";
-    bool yes_disabled = is_passkey && entry_len == 0;
+    const char *no_label = has_field ? "Cancel" : "Reject";
+    const char *yes_label = has_field ? "Submit" : "Confirm";
+    bool yes_disabled = has_field && entry_len == 0;
 
     nvgBeginPath(vg);
     nvgRoundedRect(vg, l->bt_agent_no_x0, l->bt_agent_btn_y0, l->bt_agent_no_x1 - l->bt_agent_no_x0,
@@ -2583,10 +2605,11 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
 
     /* Bluetooth pairing-agent panel (W3.1): field (no-op on click, same
      * "focus is implicit" contract as the Wi-Fi password field above) +
-     * Reject/Confirm (or Cancel/Submit for a passkey-entry request). */
+     * Reject/Confirm (or Cancel/Submit for a passkey/PIN-entry request). */
     if (l.bt_agent_active) {
-        bool in_field = l.bt_agent_kind == DC_BLUEZ_AGENT_PASSKEY && x >= (double)l.ix &&
-                        x <= (double)(l.ix + l.iw) && y >= (double)l.bt_agent_field_y &&
+        bool has_field = cc_bt_agent_has_field(l.bt_agent_kind);
+        bool in_field = has_field && x >= (double)l.ix && x <= (double)(l.ix + l.iw) &&
+                        y >= (double)l.bt_agent_field_y &&
                         y <= (double)(l.bt_agent_field_y + l.bt_agent_field_h);
         bool in_btn_row =
             y >= (double)l.bt_agent_btn_y0 && y <= (double)(l.bt_agent_btn_y0 + l.bt_agent_btn_h);
@@ -2595,6 +2618,8 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
         if (in_btn_row && x >= (double)l.bt_agent_no_x0 && x <= (double)l.bt_agent_no_x1) {
             if (l.bt_agent_kind == DC_BLUEZ_AGENT_PASSKEY)
                 dc_bluez_agent_respond_passkey(NULL);
+            else if (l.bt_agent_kind == DC_BLUEZ_AGENT_PIN_CODE)
+                dc_bluez_agent_respond_pin_code(NULL);
             else
                 dc_bluez_agent_respond_yesno(false);
             cc->bt_passkey_buf[0] = '\0';
@@ -2605,6 +2630,9 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
             if (l.bt_agent_kind == DC_BLUEZ_AGENT_PASSKEY) {
                 if (cc->bt_passkey_buf[0])
                     dc_bluez_agent_respond_passkey(cc->bt_passkey_buf);
+            } else if (l.bt_agent_kind == DC_BLUEZ_AGENT_PIN_CODE) {
+                if (cc->bt_passkey_buf[0])
+                    dc_bluez_agent_respond_pin_code(cc->bt_passkey_buf);
             } else {
                 dc_bluez_agent_respond_yesno(true);
             }
@@ -2678,8 +2706,8 @@ void dc_control_center_handle_leave(dc_control_center *cc)
 }
 
 /* True while dankc's bluetooth pairing agent (W3.1) has a pending
- * RequestPasskey request and the bluetooth section is open -- the only
- * agent-panel kind that needs typed input (RequestConfirmation/
+ * RequestPasskey/RequestPinCode request and the bluetooth section is open --
+ * the only agent-panel kinds that need typed input (RequestConfirmation/
  * RequestAuthorization only need the Yes/No buttons, handled entirely by
  * dc_control_center_handle_click()). Cheap to poll (bluez.c just returns a
  * static flag), safe to call from both wants_keyboard() and handle_key(). */
@@ -2689,12 +2717,12 @@ static bool bt_wants_passkey_keyboard(dc_control_center *cc, dc_bluez_agent_requ
         return false;
     if (!dc_bluez_agent_poll(out))
         return false;
-    return out->kind == DC_BLUEZ_AGENT_PASSKEY;
+    return cc_bt_agent_has_field(out->kind);
 }
 
-/* W1.1/W3.1: the inline Wi-Fi password field or a bluetooth RequestPasskey
- * prompt are the only two things that ever want keyboard input -- same
- * "keyboard on demand" contract as dc_settings_wants_keyboard(). */
+/* W1.1/W3.1: the inline Wi-Fi password field or a bluetooth RequestPasskey/
+ * RequestPinCode prompt are the only things that ever want keyboard input --
+ * same "keyboard on demand" contract as dc_settings_wants_keyboard(). */
 bool dc_control_center_wants_keyboard(dc_control_center *cc)
 {
     if (!cc->visible || cc->closing)
@@ -2749,17 +2777,28 @@ void dc_control_center_handle_key(dc_control_center *cc, uint32_t keysym, const 
     dc_bluez_agent_request req;
     if (!bt_wants_passkey_keyboard(cc, &req))
         return;
+    bool is_pin = req.kind == DC_BLUEZ_AGENT_PIN_CODE;
+    /* Legacy PIN codes are capped at 16 chars per the Bluetooth spec; a
+     * passkey is always exactly 6 digits -- either way, comfortably inside
+     * bt_passkey_buf's 24-byte capacity. */
+    size_t max_len = is_pin ? 16 : 6;
 
     switch (keysym) {
     case XKB_KEY_Escape:
-        dc_bluez_agent_respond_passkey(NULL);
+        if (is_pin)
+            dc_bluez_agent_respond_pin_code(NULL);
+        else
+            dc_bluez_agent_respond_passkey(NULL);
         cc->bt_passkey_buf[0] = '\0';
         cc_render(cc);
         return;
     case XKB_KEY_Return:
     case XKB_KEY_KP_Enter:
         if (cc->bt_passkey_buf[0]) {
-            dc_bluez_agent_respond_passkey(cc->bt_passkey_buf);
+            if (is_pin)
+                dc_bluez_agent_respond_pin_code(cc->bt_passkey_buf);
+            else
+                dc_bluez_agent_respond_passkey(cc->bt_passkey_buf);
             cc->bt_passkey_buf[0] = '\0';
         }
         cc_render(cc);
@@ -2772,10 +2811,14 @@ void dc_control_center_handle_key(dc_control_center *cc, uint32_t keysym, const 
         return;
     }
     default:
-        /* Digits only -- a BlueZ passkey is always a 6-digit decimal code. */
-        if (utf8 && utf8[0] && utf8[1] == '\0' && isdigit((unsigned char)utf8[0])) {
+        /* RequestPasskey: digits only (a BlueZ passkey is always a 6-digit
+         * decimal code). RequestPinCode (legacy pre-SSP pairing): any single
+         * printable, non-control ASCII char -- the Bluetooth spec allows an
+         * arbitrary PIN, not just digits. */
+        if (utf8 && utf8[0] && utf8[1] == '\0' &&
+            (is_pin ? (isprint((unsigned char)utf8[0]) != 0) : isdigit((unsigned char)utf8[0]))) {
             size_t n = strlen(cc->bt_passkey_buf);
-            if (n + 1 < sizeof(cc->bt_passkey_buf)) {
+            if (n < max_len && n + 1 < sizeof(cc->bt_passkey_buf)) {
                 cc->bt_passkey_buf[n] = utf8[0];
                 cc->bt_passkey_buf[n + 1] = '\0';
                 cc_render(cc);
