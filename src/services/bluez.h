@@ -8,6 +8,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 struct dc_dbus;
 
@@ -23,12 +24,29 @@ typedef struct dc_bluez_device {
     char name[64];
     bool paired;
     bool connected;
+    bool trusted; /* org.bluez.Device1.Trusted -- independent of `paired` */
+
+    /* org.bluez.Battery1.Percentage (0-100), auto-exposed by BlueZ for
+     * profiles it can decode battery from (HID, HFP, some LE devices) once
+     * the device is paired/connected -- no extra provider registration
+     * needed to read it. -1 if this device has no Battery1 interface
+     * (common for devices that don't report battery over BT at all). */
+    int battery_percent;
+
+    /* org.bluez.Device1.Icon, e.g. "audio-headset"/"input-mouse"/"phone" --
+     * empty string if BlueZ didn't report one. dankc doesn't interpret this
+     * string itself; it's for the UI to map onto its own icon set. */
+    char icon[32];
+    uint32_t device_class; /* Device1.Class (Bluetooth Class of Device bitfield), 0 if absent */
+    uint16_t appearance;   /* Device1.Appearance (BLE GAP appearance code), 0 if absent */
 } dc_bluez_device;
 
 typedef struct dc_bluez_info {
-    bool available; /* BlueZ answered */
-    bool powered;   /* an adapter is powered on */
-    bool connected; /* at least one device is connected */
+    bool available;    /* BlueZ answered */
+    bool powered;      /* an adapter is powered on */
+    bool connected;    /* at least one device is connected */
+    bool discoverable; /* org.bluez.Adapter1.Discoverable on the tracked adapter */
+    bool pairable;     /* org.bluez.Adapter1.Pairable on the tracked adapter */
 
     dc_bluez_device devices[DC_BLUEZ_MAX_DEVICES];
     /* Paired-or-connected devices always; while a discovery is active
@@ -47,12 +65,42 @@ void dc_bluez_init(struct dc_dbus *dbus);
  * if BlueZ is available. */
 bool dc_bluez_read(dc_bluez_info *out);
 
+/* Convenience wrapper around dc_bluez_read() for callers that just want the
+ * flat device list (name/mac/connected/paired/trusted/battery/icon) without
+ * the adapter-level fields -- the "clean device list" the UI renders rows
+ * from. Copies at most `max` devices into `out` and returns how many were
+ * copied. Same cache/refresh cadence as dc_bluez_read(). */
+int dc_bluez_devices(dc_bluez_device *out, int max);
+
 /* Connect/disconnect a device by MAC, fire-and-forget (`bluetoothctl connect|
  * disconnect <mac>`, detached -- same run-detached shape as
  * services/audio.c's dc_audio_set_volume()). Only meaningful for already-
  * paired devices -- see dc_bluez_pair() below for first-time pairing. */
 void dc_bluez_connect(const char *mac);
 void dc_bluez_disconnect(const char *mac);
+
+/* Remove/unpair a device (`Adapter1.RemoveDevice(object_path)`, derived from
+ * `mac` the same way dc_bluez_pair() does) -- BlueZ drops the Device1 object
+ * entirely (forgets pairing keys), it disappears from dc_bluez_read() until
+ * re-discovered/re-paired. Synchronous (a single local system-bus round
+ * trip), same precedent as this file's other quick property reads/writes.
+ * If DANKC_BT_DRYRUN is set, logs the call instead of making it. */
+void dc_bluez_remove(const char *mac);
+
+/* Read/write org.bluez.Device1.Trusted independent of pairing (dc_bluez_pair()
+ * already sets this internally as part of first-time pairing; this is for
+ * revoking/restoring trust on an already-paired device without unpairing).
+ * The current value is in dc_bluez_device.trusted from dc_bluez_read(). If
+ * DANKC_BT_DRYRUN is set, logs the call instead of making it. */
+void dc_bluez_set_trusted(const char *mac, bool trusted);
+
+/* Read/write org.bluez.Adapter1.Discoverable / .Pairable on the tracked
+ * adapter (mirrors the existing Powered toggle). Current values are in
+ * dc_bluez_info.discoverable/.pairable from dc_bluez_read(). No-op (warns)
+ * if no adapter has been seen yet. If DANKC_BT_DRYRUN is set, logs the call
+ * instead of making it. */
+void dc_bluez_set_discoverable(bool on);
+void dc_bluez_set_pairable(bool on);
 
 /* --- Discovery (control-center "Discover" affordance, W3.1) ---------------
  *
@@ -119,18 +167,30 @@ void dc_bluez_pair_reset(void);
  * need any agent interaction ("Just Works"), same graceful-degradation
  * contract as services/polkit.c's authentication agent.
  *
- * At most one agent request is ever pending at a time (BlueZ serializes
- * pairing attempts the same way dc_bluez_pair() does). The control center
- * polls dc_bluez_agent_poll() every render frame while the bluetooth section
- * is open and, on a pending request, shows an inline confirm/passkey-entry
- * panel (reusing the exact inline-field pattern from the Wi-Fi password
- * panel, W1.1) that calls one of the respond functions below once the user
- * answers. */
+ * At most one *answerable* agent request is ever pending at a time (BlueZ
+ * serializes pairing attempts the same way dc_bluez_pair() does). The
+ * control center polls dc_bluez_agent_poll() every render frame while the
+ * bluetooth section is open and, on a pending request, shows an inline
+ * confirm/passkey-entry panel (reusing the exact inline-field pattern from
+ * the Wi-Fi password panel, W1.1) that calls one of the respond functions
+ * below once the user answers.
+ *
+ * RequestPinCode (legacy pre-SSP PIN pairing) is now implemented for real
+ * (previously hard-rejected): it's answerable exactly like RequestPasskey,
+ * via dc_bluez_agent_respond_pin_code() below, reusing the same deferred-
+ * reply shape. DisplayPinCode/DisplayPasskey are BlueZ-initiated
+ * *notifications*, not requests -- there is nothing to answer (dankc replies
+ * to BlueZ immediately either way), they only exist so the code BlueZ chose
+ * can be shown to the user; they do not appear via dc_bluez_agent_poll(),
+ * only via the push callback below. */
 typedef enum {
     DC_BLUEZ_AGENT_NONE = 0,
-    DC_BLUEZ_AGENT_CONFIRM,    /* RequestConfirmation: "does NNNNNN match?" */
-    DC_BLUEZ_AGENT_AUTHORIZE,  /* RequestAuthorization: plain "pair with X?" */
-    DC_BLUEZ_AGENT_PASSKEY,    /* RequestPasskey: type the code shown on the device */
+    DC_BLUEZ_AGENT_CONFIRM,         /* RequestConfirmation: "does NNNNNN match?" (answerable) */
+    DC_BLUEZ_AGENT_AUTHORIZE,       /* RequestAuthorization: plain "pair with X?" (answerable) */
+    DC_BLUEZ_AGENT_PASSKEY,         /* RequestPasskey: type the code shown on the device (answerable) */
+    DC_BLUEZ_AGENT_PIN_CODE,        /* RequestPinCode: type a legacy PIN (answerable) */
+    DC_BLUEZ_AGENT_DISPLAY_PIN_CODE, /* DisplayPinCode: show this PIN on screen (notify only) */
+    DC_BLUEZ_AGENT_DISPLAY_PASSKEY,  /* DisplayPasskey: show this passkey on screen (notify only) */
 } dc_bluez_agent_kind;
 
 typedef struct dc_bluez_agent_request {
@@ -139,7 +199,9 @@ typedef struct dc_bluez_agent_request {
     char passkey_str[8]; /* "NNNNNN", only meaningful for DC_BLUEZ_AGENT_CONFIRM */
 } dc_bluez_agent_request;
 
-/* True (and `out` filled) while a request is awaiting a UI answer. */
+/* True (and `out` filled) while an *answerable* request is awaiting a UI
+ * answer (CONFIRM/AUTHORIZE/PASSKEY/PIN_CODE only -- see dc_bluez_agent_kind
+ * doc above for why the two DISPLAY_* kinds never appear here). */
 bool dc_bluez_agent_poll(dc_bluez_agent_request *out);
 
 /* Answer a pending DC_BLUEZ_AGENT_CONFIRM/DC_BLUEZ_AGENT_AUTHORIZE request.
@@ -149,5 +211,28 @@ void dc_bluez_agent_respond_yesno(bool accept);
 /* Answer a pending DC_BLUEZ_AGENT_PASSKEY request with the digits the user
  * typed, or NULL/"" to cancel. No-op if none is pending. */
 void dc_bluez_agent_respond_passkey(const char *digits);
+
+/* Answer a pending DC_BLUEZ_AGENT_PIN_CODE request with the (up to 16-char,
+ * per the Bluetooth spec) PIN the user typed, or NULL/"" to cancel. No-op if
+ * none is pending. */
+void dc_bluez_agent_respond_pin_code(const char *pin);
+
+/* Push-notification hook for the UI (Wave 1 service layer only exposes this;
+ * the actual dialog is a later UI task). Invoked synchronously, from inside
+ * dc_dbus's event-loop dispatch, whenever:
+ *   - a new answerable request starts (CONFIRM/AUTHORIZE/PASSKEY/PIN_CODE),
+ *     in addition to (not instead of) it becoming visible via
+ *     dc_bluez_agent_poll() -- `passkey_str` is the six-digit code for
+ *     CONFIRM, empty for the others (nothing to display yet);
+ *   - BlueZ asks dankc to *display* a code (DISPLAY_PIN_CODE/
+ *     DISPLAY_PASSKEY) -- `passkey_str` is the code to show; these never
+ *     show up via dc_bluez_agent_poll() since there's no reply to defer.
+ * `device_name` is always a best-effort display name (Alias, falling back to
+ * MAC). Pass NULL to unregister. Only one callback at a time (last writer
+ * wins), matching the "single UI owns the panel" shape everywhere else in
+ * this file. */
+typedef void (*dc_bluez_agent_cb)(dc_bluez_agent_kind kind, const char *device_name,
+                                  const char *passkey_str);
+void dc_bluez_set_agent_cb(dc_bluez_agent_cb cb);
 
 #endif /* DC_SERVICES_BLUEZ_H */

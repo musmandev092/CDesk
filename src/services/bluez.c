@@ -29,6 +29,7 @@ static bool g_discovering = false;
 
 static void bluez_register_agent(void);
 static void bluez_resolve_fake_pair(bool ok);
+static void mac_to_device_path(const char *mac, char *out, size_t out_sz);
 
 void dc_bluez_init(struct dc_dbus *dbus)
 {
@@ -81,11 +82,20 @@ static void scan_objects(dc_bluez_info *info)
          * folded into info->devices[] once the object is fully read (a
          * device's Name/Alias/Paired/Connected properties are all on the
          * single org.bluez.Device1 interface, but reading them incrementally
-         * as they stream by is simplest). */
+         * as they stream by is simplest). org.bluez.Battery1 is a *separate*
+         * interface BlueZ auto-adds to the same object path once it can
+         * decode battery level from the connected profile (HID/HFP/some LE),
+         * so its Percentage is folded in here too rather than requiring a
+         * second GetManagedObjects pass. */
         bool is_device_obj = false;
-        bool dev_paired = false, dev_connected = false;
+        bool dev_paired = false, dev_connected = false, dev_trusted = false;
+        bool dev_has_battery = false;
+        int dev_battery = -1;
         char dev_name[64] = {0};
         char dev_alias[64] = {0};
+        char dev_icon[32] = {0};
+        uint32_t dev_class = 0;
+        uint16_t dev_appearance = 0;
 
         if (sd_bus_message_enter_container(reply, 'a', "{sa{sv}}") < 0) {
             sd_bus_message_exit_container(reply);
@@ -97,12 +107,13 @@ static void scan_objects(dc_bluez_info *info)
 
             bool is_device = iface && strcmp(iface, "org.bluez.Device1") == 0;
             bool is_adapter = iface && strcmp(iface, "org.bluez.Adapter1") == 0;
+            bool is_battery = iface && strcmp(iface, "org.bluez.Battery1") == 0;
             if (is_device)
                 is_device_obj = true;
             if (is_adapter && path)
                 snprintf(g_adapter_path, sizeof(g_adapter_path), "%s", path);
 
-            if (is_device || is_adapter) {
+            if (is_device || is_adapter || is_battery) {
                 sd_bus_message_enter_container(reply, 'a', "{sv}");
                 while (sd_bus_message_enter_container(reply, 'e', "sv") > 0) {
                     const char *prop = NULL;
@@ -122,6 +133,12 @@ static void scan_objects(dc_bluez_info *info)
                         sd_bus_message_read_basic(reply, 'b', &paired);
                         sd_bus_message_exit_container(reply);
                         dev_paired = paired != 0;
+                    } else if (is_device && prop && strcmp(prop, "Trusted") == 0) {
+                        int trusted = 0;
+                        sd_bus_message_enter_container(reply, 'v', "b");
+                        sd_bus_message_read_basic(reply, 'b', &trusted);
+                        sd_bus_message_exit_container(reply);
+                        dev_trusted = trusted != 0;
                     } else if (is_device && prop && strcmp(prop, "Name") == 0) {
                         const char *val = NULL;
                         sd_bus_message_enter_container(reply, 'v', "s");
@@ -136,6 +153,32 @@ static void scan_objects(dc_bluez_info *info)
                         sd_bus_message_exit_container(reply);
                         if (val)
                             snprintf(dev_alias, sizeof(dev_alias), "%s", val);
+                    } else if (is_device && prop && strcmp(prop, "Icon") == 0) {
+                        const char *val = NULL;
+                        sd_bus_message_enter_container(reply, 'v', "s");
+                        sd_bus_message_read_basic(reply, 's', &val);
+                        sd_bus_message_exit_container(reply);
+                        if (val)
+                            snprintf(dev_icon, sizeof(dev_icon), "%s", val);
+                    } else if (is_device && prop && strcmp(prop, "Class") == 0) {
+                        uint32_t val = 0;
+                        sd_bus_message_enter_container(reply, 'v', "u");
+                        sd_bus_message_read_basic(reply, 'u', &val);
+                        sd_bus_message_exit_container(reply);
+                        dev_class = val;
+                    } else if (is_device && prop && strcmp(prop, "Appearance") == 0) {
+                        uint16_t val = 0;
+                        sd_bus_message_enter_container(reply, 'v', "q");
+                        sd_bus_message_read_basic(reply, 'q', &val);
+                        sd_bus_message_exit_container(reply);
+                        dev_appearance = val;
+                    } else if (is_battery && prop && strcmp(prop, "Percentage") == 0) {
+                        uint8_t val = 0;
+                        sd_bus_message_enter_container(reply, 'v', "y");
+                        sd_bus_message_read_basic(reply, 'y', &val);
+                        sd_bus_message_exit_container(reply);
+                        dev_has_battery = true;
+                        dev_battery = val;
                     } else if (is_adapter && prop && strcmp(prop, "Powered") == 0) {
                         int powered = 0;
                         sd_bus_message_enter_container(reply, 'v', "b");
@@ -143,6 +186,20 @@ static void scan_objects(dc_bluez_info *info)
                         sd_bus_message_exit_container(reply);
                         if (powered)
                             info->powered = true;
+                    } else if (is_adapter && prop && strcmp(prop, "Discoverable") == 0) {
+                        int discoverable = 0;
+                        sd_bus_message_enter_container(reply, 'v', "b");
+                        sd_bus_message_read_basic(reply, 'b', &discoverable);
+                        sd_bus_message_exit_container(reply);
+                        if (discoverable)
+                            info->discoverable = true;
+                    } else if (is_adapter && prop && strcmp(prop, "Pairable") == 0) {
+                        int pairable = 0;
+                        sd_bus_message_enter_container(reply, 'v', "b");
+                        sd_bus_message_read_basic(reply, 'b', &pairable);
+                        sd_bus_message_exit_container(reply);
+                        if (pairable)
+                            info->pairable = true;
                     } else {
                         sd_bus_message_skip(reply, "v");
                     }
@@ -170,12 +227,63 @@ static void scan_objects(dc_bluez_info *info)
             snprintf(d->name, sizeof(d->name), "%s", name);
             d->paired = dev_paired;
             d->connected = dev_connected;
+            d->trusted = dev_trusted;
+            d->battery_percent = dev_has_battery ? dev_battery : -1;
+            snprintf(d->icon, sizeof(d->icon), "%s", dev_icon);
+            d->device_class = dev_class;
+            d->appearance = dev_appearance;
             info->device_count++;
         }
     }
 
 done:
     sd_bus_message_unref(reply);
+}
+
+/* --- DANKC_BTSVC_TEST verification hook (Wave 1 service-layer testing) -----
+ *
+ * Env-gated (any value): logs the full device list (name/mac/connected/
+ * paired/trusted/battery/icon/class/appearance) plus adapter state once at
+ * startup and again every time dc_bluez_read()'s result changes, so this can
+ * be checked against `bluetoothctl devices`/`busctl introspect` reality
+ * without any UI. No effect on behaviour when unset. */
+static dc_bluez_info g_test_last_logged;
+static bool g_test_logged_once = false;
+
+static void bluez_test_log(const dc_bluez_info *info)
+{
+    dc_info("bluez: [DANKC_BTSVC_TEST] adapter available=%d powered=%d discoverable=%d "
+            "pairable=%d connected=%d devices=%d",
+            info->available, info->powered, info->discoverable, info->pairable, info->connected,
+            info->device_count);
+    for (int i = 0; i < info->device_count; i++) {
+        const dc_bluez_device *d = &info->devices[i];
+        char battery_buf[16];
+        if (d->battery_percent >= 0)
+            snprintf(battery_buf, sizeof(battery_buf), "%d%%", d->battery_percent);
+        else
+            snprintf(battery_buf, sizeof(battery_buf), "n/a");
+        dc_info("bluez: [DANKC_BTSVC_TEST]   %-17s %-24s connected=%d paired=%d trusted=%d "
+                "battery=%-4s icon=%-16s class=0x%06x appearance=0x%04x",
+                d->mac, d->name, d->connected, d->paired, d->trusted, battery_buf,
+                d->icon[0] ? d->icon : "-", (unsigned)d->device_class, (unsigned)d->appearance);
+    }
+}
+
+static void bluez_test_log_if_changed(const dc_bluez_info *info)
+{
+    if (!getenv("DANKC_BTSVC_TEST"))
+        return;
+    /* Byte-for-byte compare against the last-logged snapshot -- both sides
+     * are always fully zero-initialised before being filled (scan_objects()
+     * memsets g_cache, memsets each device slot), so padding is deterministic
+     * and this is a reliable (if slightly conservative) change check for a
+     * debug-only hook. */
+    if (g_test_logged_once && memcmp(info, &g_test_last_logged, sizeof(*info)) == 0)
+        return;
+    bluez_test_log(info);
+    g_test_last_logged = *info;
+    g_test_logged_once = true;
 }
 
 bool dc_bluez_read(dc_bluez_info *out)
@@ -205,11 +313,23 @@ bool dc_bluez_read(dc_bluez_info *out)
         snprintf(d->name, sizeof(d->name), "%s", fake);
         d->paired = false;
         d->connected = false;
+        d->battery_percent = -1; /* no Battery1 interface on the synthetic device */
         out->device_count++;
         out->available = true;
     }
 
+    bluez_test_log_if_changed(out);
     return out->available;
+}
+
+int dc_bluez_devices(dc_bluez_device *out, int max)
+{
+    dc_bluez_info info;
+    dc_bluez_read(&info);
+    int n = info.device_count < max ? info.device_count : max;
+    for (int i = 0; i < n; i++)
+        out[i] = info.devices[i];
+    return n;
 }
 
 /* Fire-and-forget `bluetoothctl <verb> <mac>`, detached (same run-detached
@@ -242,6 +362,134 @@ void dc_bluez_connect(const char *mac)
 void dc_bluez_disconnect(const char *mac)
 {
     run_bluetoothctl("disconnect", mac);
+}
+
+/* Synchronous org.freedesktop.DBus.Properties.Set with a boolean value --
+ * shared by the Discoverable/Pairable/Trusted toggles below. A single local
+ * system-bus round trip for a settings toggle is fine to do synchronously
+ * (same precedent as agent_device_display_name()'s blocking property get and
+ * scan_objects()'s blocking GetManagedObjects call, both already in this
+ * file); async is reserved for the multi-step pairing chain where blocking
+ * would stall the UI for as long as real pairing takes. Returns the sd-bus
+ * return code (negative on failure, already logged). */
+static int bluez_set_bool_property(const char *path, const char *iface, const char *prop, bool value)
+{
+    sd_bus_message *m = NULL;
+    int r = sd_bus_message_new_method_call(g_system, &m, "org.bluez", path,
+                                           "org.freedesktop.DBus.Properties", "Set");
+    if (r < 0) {
+        dc_warn("bluez: Properties.Set %s %s.%s: message_new failed: %s", path, iface, prop,
+                strerror(-r));
+        return r;
+    }
+    sd_bus_message_append(m, "ss", iface, prop);
+    sd_bus_message_open_container(m, 'v', "b");
+    sd_bus_message_append(m, "b", (int)value);
+    sd_bus_message_close_container(m);
+
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    r = sd_bus_call(g_system, m, 0, &err, NULL);
+    if (r < 0)
+        dc_warn("bluez: Properties.Set %s %s.%s=%s failed: %s", path, iface, prop,
+                value ? "true" : "false", err.message ? err.message : strerror(-r));
+    sd_bus_error_free(&err);
+    sd_bus_message_unref(m);
+    return r;
+}
+
+/* --- Adapter settings: Discoverable / Pairable (Wave 1) --------------------
+ *
+ * Mirrors the existing Powered toggle (which the UI currently drives via
+ * `bluetoothctl power on|off`, see ui/settings.c) but as a native
+ * Properties.Set, since there's no bluetoothctl-mediated agent/pairing
+ * fallback concern for a plain adapter property the way there is for
+ * connect/disconnect. */
+
+void dc_bluez_set_discoverable(bool on)
+{
+    if (!g_adapter_path[0]) {
+        dc_warn("bluez: set_discoverable: no adapter known yet");
+        return;
+    }
+    if (getenv("DANKC_BT_DRYRUN")) {
+        dc_info("bluez: [DANKC_BT_DRYRUN] would Properties.Set %s org.bluez.Adapter1.Discoverable=%s",
+                g_adapter_path, on ? "true" : "false");
+        return;
+    }
+    if (!g_system)
+        return;
+    if (bluez_set_bool_property(g_adapter_path, "org.bluez.Adapter1", "Discoverable", on) >= 0)
+        g_last_refresh = 0;
+}
+
+void dc_bluez_set_pairable(bool on)
+{
+    if (!g_adapter_path[0]) {
+        dc_warn("bluez: set_pairable: no adapter known yet");
+        return;
+    }
+    if (getenv("DANKC_BT_DRYRUN")) {
+        dc_info("bluez: [DANKC_BT_DRYRUN] would Properties.Set %s org.bluez.Adapter1.Pairable=%s",
+                g_adapter_path, on ? "true" : "false");
+        return;
+    }
+    if (!g_system)
+        return;
+    if (bluez_set_bool_property(g_adapter_path, "org.bluez.Adapter1", "Pairable", on) >= 0)
+        g_last_refresh = 0;
+}
+
+/* --- Device settings: Trust / Remove (Wave 1) ------------------------------
+ *
+ * Independent of dc_bluez_pair() (which already sets Trusted=true internally
+ * as part of first-time pairing) -- these let an already-paired device's
+ * trust be viewed/revoked without unpairing, and let a device be forgotten
+ * entirely. Both take a MAC, same as dc_bluez_connect()/dc_bluez_pair() --
+ * mac_to_device_path() derives the object path from it and the tracked
+ * adapter, so the UI never needs to know raw D-Bus paths. */
+
+void dc_bluez_set_trusted(const char *mac, bool trusted)
+{
+    if (!mac || !mac[0])
+        return;
+    char path[128];
+    mac_to_device_path(mac, path, sizeof(path));
+
+    if (getenv("DANKC_BT_DRYRUN")) {
+        dc_info("bluez: [DANKC_BT_DRYRUN] would Properties.Set %s org.bluez.Device1.Trusted=%s",
+                path, trusted ? "true" : "false");
+        return;
+    }
+    if (!g_system || !g_adapter_path[0])
+        return;
+    if (bluez_set_bool_property(path, "org.bluez.Device1", "Trusted", trusted) >= 0)
+        g_last_refresh = 0;
+}
+
+void dc_bluez_remove(const char *mac)
+{
+    if (!mac || !mac[0])
+        return;
+    char path[128];
+    mac_to_device_path(mac, path, sizeof(path));
+
+    if (getenv("DANKC_BT_DRYRUN")) {
+        dc_info("bluez: [DANKC_BT_DRYRUN] would Adapter1.RemoveDevice(%s) on %s", path,
+                g_adapter_path[0] ? g_adapter_path : "(no adapter yet)");
+        return;
+    }
+    if (!g_system || !g_adapter_path[0]) {
+        dc_warn("bluez: remove: no adapter known yet");
+        return;
+    }
+
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    int r = sd_bus_call_method(g_system, "org.bluez", g_adapter_path, "org.bluez.Adapter1",
+                               "RemoveDevice", &err, NULL, "o", path);
+    if (r < 0)
+        dc_warn("bluez: RemoveDevice(%s) failed: %s", path, err.message ? err.message : strerror(-r));
+    sd_bus_error_free(&err);
+    g_last_refresh = 0; /* drop the (now unpaired) device from the list promptly */
 }
 
 /* --- Discovery (W3.1) ------------------------------------------------------
@@ -315,6 +563,17 @@ typedef struct {
 
 static bluez_agent_state g_agent;
 
+/* Push-notification hook for the UI (dc_bluez_set_agent_cb()); NULL until a
+ * caller registers one. Invoked from the same request/display handlers that
+ * drive g_agent above, so the UI can react immediately instead of only ever
+ * polling dc_bluez_agent_poll() once per frame. */
+static dc_bluez_agent_cb g_agent_cb = NULL;
+
+void dc_bluez_set_agent_cb(dc_bluez_agent_cb cb)
+{
+    g_agent_cb = cb;
+}
+
 /* Best-effort human-readable name for a Device1 object path -- Alias (falls
  * back to Name-less devices' MAC, same fallback order as scan_objects()'s
  * dev_name/dev_alias/mac chain). Used only for the agent dialog's device
@@ -349,10 +608,23 @@ static int agent_method_request_pin_code(sd_bus_message *m, void *userdata, sd_b
 {
     DC_UNUSED(userdata);
     DC_UNUSED(ret_error);
-    /* Legacy PIN-code pairing (pre-SSP devices) has no dankc UI yet -- reject
-     * rather than silently hanging BlueZ's request. */
-    return sd_bus_reply_method_errorf(m, "org.bluez.Error.Rejected",
-                                      "PIN code entry not supported");
+    /* Legacy pre-SSP PIN pairing: answerable exactly like RequestPasskey,
+     * just with a string reply (up to 16 ASCII chars per the Bluetooth
+     * spec) instead of a uint32 -- reuses the same deferred-reply shape via
+     * dc_bluez_agent_respond_pin_code() below. */
+    if (g_agent.pending_msg || g_agent.fake_pending)
+        return sd_bus_reply_method_errorf(m, "org.bluez.Error.Rejected", "busy");
+
+    const char *device = NULL;
+    sd_bus_message_read(m, "o", &device);
+
+    g_agent.kind = DC_BLUEZ_AGENT_PIN_CODE;
+    agent_device_display_name(device, g_agent.device_name, sizeof(g_agent.device_name));
+    g_agent.passkey_str[0] = '\0';
+    g_agent.pending_msg = sd_bus_message_ref(m);
+    if (g_agent_cb)
+        g_agent_cb(g_agent.kind, g_agent.device_name, g_agent.passkey_str);
+    return 1; /* handled; reply deferred until dc_bluez_agent_respond_pin_code() */
 }
 
 static int agent_method_display_pin_code(sd_bus_message *m, void *userdata, sd_bus_error *ret_error)
@@ -362,6 +634,15 @@ static int agent_method_display_pin_code(sd_bus_message *m, void *userdata, sd_b
     const char *device = NULL, *pincode = NULL;
     sd_bus_message_read(m, "os", &device, &pincode);
     dc_info("bluez: DisplayPinCode %s: %s", device ? device : "?", pincode ? pincode : "?");
+    /* Notification only (BlueZ doesn't wait for a UI decision here, dankc
+     * replies immediately below either way) -- pushed straight to the
+     * callback rather than through g_agent/dc_bluez_agent_poll(), since
+     * there is nothing to answer. */
+    if (g_agent_cb) {
+        char name[64];
+        agent_device_display_name(device, name, sizeof(name));
+        g_agent_cb(DC_BLUEZ_AGENT_DISPLAY_PIN_CODE, name, pincode ? pincode : "");
+    }
     return sd_bus_reply_method_return(m, "");
 }
 
@@ -379,6 +660,8 @@ static int agent_method_request_passkey(sd_bus_message *m, void *userdata, sd_bu
     agent_device_display_name(device, g_agent.device_name, sizeof(g_agent.device_name));
     g_agent.passkey_str[0] = '\0';
     g_agent.pending_msg = sd_bus_message_ref(m);
+    if (g_agent_cb)
+        g_agent_cb(g_agent.kind, g_agent.device_name, g_agent.passkey_str);
     return 1; /* handled; reply deferred until dc_bluez_agent_respond_passkey() */
 }
 
@@ -392,6 +675,14 @@ static int agent_method_display_passkey(sd_bus_message *m, void *userdata, sd_bu
     sd_bus_message_read(m, "ouq", &device, &passkey, &entered);
     dc_debug("bluez: DisplayPasskey %s: %06u (%u digits entered)", device ? device : "?",
             (unsigned)passkey, (unsigned)entered);
+    /* Notification only, same shape as DisplayPinCode above. */
+    if (g_agent_cb) {
+        char name[64];
+        char passkey_str[8];
+        agent_device_display_name(device, name, sizeof(name));
+        snprintf(passkey_str, sizeof(passkey_str), "%06u", (unsigned)passkey);
+        g_agent_cb(DC_BLUEZ_AGENT_DISPLAY_PASSKEY, name, passkey_str);
+    }
     return sd_bus_reply_method_return(m, "");
 }
 
@@ -411,6 +702,8 @@ static int agent_method_request_confirmation(sd_bus_message *m, void *userdata,
     agent_device_display_name(device, g_agent.device_name, sizeof(g_agent.device_name));
     snprintf(g_agent.passkey_str, sizeof(g_agent.passkey_str), "%06u", (unsigned)passkey);
     g_agent.pending_msg = sd_bus_message_ref(m);
+    if (g_agent_cb)
+        g_agent_cb(g_agent.kind, g_agent.device_name, g_agent.passkey_str);
     return 1; /* handled; reply deferred until dc_bluez_agent_respond_yesno() */
 }
 
@@ -429,6 +722,8 @@ static int agent_method_request_authorization(sd_bus_message *m, void *userdata,
     agent_device_display_name(device, g_agent.device_name, sizeof(g_agent.device_name));
     g_agent.passkey_str[0] = '\0';
     g_agent.pending_msg = sd_bus_message_ref(m);
+    if (g_agent_cb)
+        g_agent_cb(g_agent.kind, g_agent.device_name, g_agent.passkey_str);
     return 1; /* handled; reply deferred until dc_bluez_agent_respond_yesno() */
 }
 
@@ -574,6 +869,19 @@ void dc_bluez_agent_respond_passkey(const char *digits)
     } else {
         sd_bus_reply_method_errorf(g_agent.pending_msg, "org.bluez.Error.Rejected", "Cancelled");
     }
+    sd_bus_message_unref(g_agent.pending_msg);
+    g_agent.pending_msg = NULL;
+    g_agent.kind = DC_BLUEZ_AGENT_NONE;
+}
+
+void dc_bluez_agent_respond_pin_code(const char *pin)
+{
+    if (!g_agent.pending_msg)
+        return;
+    if (pin && pin[0])
+        sd_bus_reply_method_return(g_agent.pending_msg, "s", pin);
+    else
+        sd_bus_reply_method_errorf(g_agent.pending_msg, "org.bluez.Error.Rejected", "Cancelled");
     sd_bus_message_unref(g_agent.pending_msg);
     g_agent.pending_msg = NULL;
     g_agent.kind = DC_BLUEZ_AGENT_NONE;
