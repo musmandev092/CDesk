@@ -31,6 +31,7 @@
 #include "ui/dashboard.h"
 #include "ui/dock.h"
 #include "ui/frame.h"
+#include "ui/keybinds_modal.h"
 #include "ui/launcher.h"
 #include "ui/lock.h"
 #include "ui/notifcenter.h"
@@ -299,6 +300,7 @@ struct click_ctx {
     dc_tray *tray;
     dc_tray_menu *tray_menu;
     dc_dock *dock;
+    dc_keybinds_modal *keybinds_modal;
 };
 
 /* logind asked us to lock (pre-sleep / lock-session). */
@@ -315,6 +317,7 @@ struct kbd_ctx {
     dc_lock *lock;
     dc_settings *settings;
     dc_powermenu *powermenu;
+    dc_keybinds_modal *keybinds_modal;
 };
 
 static void handle_key(uint32_t keysym, const char *utf8, void *data)
@@ -330,6 +333,8 @@ static void handle_key(uint32_t keysym, const char *utf8, void *data)
         dc_processes_handle_key(k->processes, keysym, utf8);
     else if (dc_powermenu_visible(k->powermenu))
         dc_powermenu_handle_key(k->powermenu, keysym, utf8);
+    else if (dc_keybinds_modal_visible(k->keybinds_modal))
+        dc_keybinds_modal_handle_key(k->keybinds_modal, keysym, utf8);
     else
         dc_launcher_handle_key(k->launcher, keysym, utf8);
 }
@@ -349,6 +354,7 @@ struct control_ctx {
     dc_notifications *notifications;
     dc_powermenu *powermenu;
     dc_dock *dock;
+    dc_keybinds_modal *keybinds_modal;
 };
 
 static struct dc_output *first_output(struct dc_wayland *wl)
@@ -425,6 +431,12 @@ static void control_dispatch(const char *cmd, void *data)
         dc_lock_engage(c->lock);
     else if (strcmp(cmd, "power-menu") == 0 || strcmp(cmd, "power-menu toggle") == 0)
         dc_powermenu_toggle(c->powermenu, out);
+    else if (strcmp(cmd, "keybinds-overlay") == 0 || strcmp(cmd, "keybinds-overlay toggle") == 0)
+        /* Distinct from `dankc keybinds` (main.c's print_keybinds() CLI,
+         * below) -- that prints a KDL snippet for dankc's own binds; this
+         * opens a visual, on-screen cheat sheet of the user's real binds
+         * (ui/keybinds_modal.c parses config.kdl live). */
+        dc_keybinds_modal_toggle(c->keybinds_modal, out);
     else if (strcmp(cmd, "unlock") == 0 && getenv("DANKC_LOCK_ESCAPE"))
         dc_lock_force_unlock(c->lock); /* testing-only, env-gated */
     else if (strcmp(cmd, "screenshot") == 0)
@@ -497,6 +509,12 @@ static void handle_left_click(struct wl_surface *surface, double x, double y, st
 
     if (dc_powermenu_visible(ctx->powermenu) && surface == dc_powermenu_surface(ctx->powermenu)) {
         dc_powermenu_handle_click(ctx->powermenu, x, y);
+        return;
+    }
+
+    if (dc_keybinds_modal_visible(ctx->keybinds_modal) &&
+        surface == dc_keybinds_modal_surface(ctx->keybinds_modal)) {
+        dc_keybinds_modal_handle_click(ctx->keybinds_modal, x, y);
         return;
     }
 
@@ -753,6 +771,7 @@ struct axis_ctx {
     dc_launcher *launcher;
     dc_settings *settings;
     dc_dashboard *dashboard;
+    dc_keybinds_modal *keybinds_modal;
 };
 
 /* Scroll on a bar surface: vertical wheel -> workspace focus, horizontal ->
@@ -785,6 +804,11 @@ static void handle_bar_axis(struct wl_surface *surface, int steps_v, int steps_h
     }
     if (dc_processes_visible(actx->processes) && surface == dc_processes_surface(actx->processes)) {
         dc_processes_handle_scroll(actx->processes, steps_v);
+        return;
+    }
+    if (dc_keybinds_modal_visible(actx->keybinds_modal) &&
+        surface == dc_keybinds_modal_surface(actx->keybinds_modal)) {
+        dc_keybinds_modal_handle_scroll(actx->keybinds_modal, steps_v);
         return;
     }
     if (dc_launcher_visible(actx->launcher) && surface == dc_launcher_surface(actx->launcher)) {
@@ -915,6 +939,7 @@ int main(int argc, char **argv)
     dc_lock *lock = dc_lock_create(wl, &egl, &render);
     dc_processes *processes = dc_processes_create(wl, &egl, &render);
     dc_powermenu *powermenu = dc_powermenu_create(wl, &egl, &render, dbus, lock);
+    dc_keybinds_modal *keybinds_modal = dc_keybinds_modal_create(wl, &egl, &render);
     struct tick_ctx tick = {.set = &set,
                             .osd = osd,
                             .wl = wl,
@@ -945,7 +970,8 @@ int main(int argc, char **argv)
         .processes = processes,
         .lock = lock,
         .settings = settings,
-        .powermenu = powermenu};
+        .powermenu = powermenu,
+        .keybinds_modal = keybinds_modal};
     dc_wayland_set_key_cb(wl, handle_key, &kbd);
     struct config_change_ctx cfg_ctx = {.bars = &set, .frames = &frames, .dock = dock, .wl = wl};
     dc_config_set_change_cb(config_changed, &cfg_ctx);
@@ -964,7 +990,8 @@ int main(int argc, char **argv)
                              .powermenu = powermenu,
                              .tray = tray,
                              .tray_menu = tray_menu,
-                             .dock = dock};
+                             .dock = dock,
+                             .keybinds_modal = keybinds_modal};
     dc_wayland_set_click_cb(wl, handle_bar_click, &cctx);
     dc_wayland_set_motion_cb(wl, handle_bar_motion, &cctx);
     dc_wayland_set_leave_cb(wl, handle_bar_leave, &cctx);
@@ -975,7 +1002,8 @@ int main(int argc, char **argv)
                             .processes = processes,
                             .launcher = launcher,
                             .settings = settings,
-                            .dashboard = dashboard};
+                            .dashboard = dashboard,
+                            .keybinds_modal = keybinds_modal};
     dc_wayland_set_axis_cb(wl, handle_bar_axis, &actx);
 
     struct control_ctx control_ctx = {.wl = wl,
@@ -990,7 +1018,8 @@ int main(int argc, char **argv)
                                       .lock = lock,
                                       .notifications = notifications,
                                       .powermenu = powermenu,
-                                      .dock = dock};
+                                      .dock = dock,
+                                      .keybinds_modal = keybinds_modal};
     dc_control *control = dc_control_create(g_loop, control_dispatch, &control_ctx);
     dc_logind *logind = dc_logind_create(dbus, logind_lock, lock);
 
@@ -1023,6 +1052,13 @@ int main(int argc, char **argv)
             break;
         }
         dc_powermenu_toggle(powermenu, first);
+    }
+    if (getenv("DANKC_KEYBINDS_DEMO")) {
+        dc_output *first = NULL;
+        wl_list_for_each(first, &wl->outputs, link) {
+            break;
+        }
+        dc_keybinds_modal_toggle(keybinds_modal, first);
     }
     /* DANKC_POWERMENU_FIRE=lock|logout|suspend|reboot|shutdown: open the menu
      * and arm+confirm that action via dc_powermenu_debug_fire() -- the same
@@ -1101,6 +1137,7 @@ int main(int argc, char **argv)
     dc_tray_menu_destroy(tray_menu);
     dc_tray_destroy(tray);
     dc_powermenu_destroy(powermenu);
+    dc_keybinds_modal_destroy(keybinds_modal);
     dc_lock_destroy(lock);
     dc_dashboard_destroy(dashboard);
     dc_settings_destroy(settings);
