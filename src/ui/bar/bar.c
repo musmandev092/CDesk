@@ -1376,22 +1376,45 @@ static bool bar_ac_online(void)
     return online;
 }
 
-/* Pick the Material Symbols battery glyph for this level/charging state
- * (docs/12-BAR-SPEC.md sec.4 + sec.6). DMS's BatteryService.getBatteryIcon()
- * has a numbered battery_1_bar..battery_6_bar glyph per ~15% band, but the
- * bundled font (assets/fonts/MaterialSymbolsRounded.ttf, a build-time
- * subset) doesn't include those codepoints — verified by parsing its cmap,
- * they render as blank space, not tofu. Collapsed to the three tiers that
- * are actually present in the font: full, low (0_bar), and alert. */
+/* Pick the Material Symbols battery glyph for this level/charging state --
+ * exact thresholds/codepoints as DMS's Theme.getBatteryIcon() (docs/12-BAR-
+ * SPEC.md sec.4 + sec.6). Previously collapsed to 3 tiers (full/0_bar/alert)
+ * because the numbered battery_1_bar..6_bar glyphs weren't in icons.h yet,
+ * so the build-time font subset never carried them and they rendered blank
+ * -- that's fixed now (icons.h has the full set), so match DMS's ~15%-band
+ * granularity for real. */
 static int battery_icon_codepoint(bool charging, int percent)
 {
-    if (charging)
-        return DC_ICON_BATTERY_CHARGING_FULL;
-    if (percent <= 10)
-        return DC_ICON_BATTERY_ALERT;
-    if (percent <= 25)
-        return DC_ICON_BATTERY_0_BAR;
-    return DC_ICON_BATTERY_FULL;
+    if (charging) {
+        if (percent >= 90)
+            return DC_ICON_BATTERY_CHARGING_FULL;
+        if (percent >= 80)
+            return DC_ICON_BATTERY_CHARGING_90;
+        if (percent >= 60)
+            return DC_ICON_BATTERY_CHARGING_80;
+        if (percent >= 50)
+            return DC_ICON_BATTERY_CHARGING_60;
+        if (percent >= 30)
+            return DC_ICON_BATTERY_CHARGING_50;
+        if (percent >= 20)
+            return DC_ICON_BATTERY_CHARGING_30;
+        return DC_ICON_BATTERY_CHARGING_20;
+    }
+    if (percent >= 95)
+        return DC_ICON_BATTERY_FULL;
+    if (percent >= 85)
+        return DC_ICON_BATTERY_6_BAR;
+    if (percent >= 70)
+        return DC_ICON_BATTERY_5_BAR;
+    if (percent >= 55)
+        return DC_ICON_BATTERY_4_BAR;
+    if (percent >= 40)
+        return DC_ICON_BATTERY_3_BAR;
+    if (percent >= 25)
+        return DC_ICON_BATTERY_2_BAR;
+    if (percent >= 10)
+        return DC_ICON_BATTERY_1_BAR;
+    return DC_ICON_BATTERY_ALERT;
 }
 
 /* Material Symbols glyph + "NN%", left-to-right (docs/12-BAR-SPEC.md sec.4 —

@@ -237,13 +237,38 @@ static bp_layout bp_get_layout(float w, int icon_mode)
  * duplication is cheaper than widening battery.h's touch-scope for this). */
 static int bp_battery_icon(bool charging, bool full, int percent)
 {
-    if (charging || full)
+    if (full)
         return DC_ICON_BATTERY_CHARGING_FULL;
-    if (percent <= 10)
-        return DC_ICON_BATTERY_ALERT;
-    if (percent <= 25)
-        return DC_ICON_BATTERY_0_BAR;
-    return DC_ICON_BATTERY_FULL;
+    if (charging) {
+        if (percent >= 90)
+            return DC_ICON_BATTERY_CHARGING_FULL;
+        if (percent >= 80)
+            return DC_ICON_BATTERY_CHARGING_90;
+        if (percent >= 60)
+            return DC_ICON_BATTERY_CHARGING_80;
+        if (percent >= 50)
+            return DC_ICON_BATTERY_CHARGING_60;
+        if (percent >= 30)
+            return DC_ICON_BATTERY_CHARGING_50;
+        if (percent >= 20)
+            return DC_ICON_BATTERY_CHARGING_30;
+        return DC_ICON_BATTERY_CHARGING_20;
+    }
+    if (percent >= 95)
+        return DC_ICON_BATTERY_FULL;
+    if (percent >= 85)
+        return DC_ICON_BATTERY_6_BAR;
+    if (percent >= 70)
+        return DC_ICON_BATTERY_5_BAR;
+    if (percent >= 55)
+        return DC_ICON_BATTERY_4_BAR;
+    if (percent >= 40)
+        return DC_ICON_BATTERY_3_BAR;
+    if (percent >= 25)
+        return DC_ICON_BATTERY_2_BAR;
+    if (percent >= 10)
+        return DC_ICON_BATTERY_1_BAR;
+    return DC_ICON_BATTERY_ALERT;
 }
 
 /* Health card value color, tiered by degradation (docs/13-POPOUTS-SPEC.md

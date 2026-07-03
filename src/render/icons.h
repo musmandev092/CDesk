@@ -12,15 +12,28 @@
 #define DC_ICON_SIGNAL_WIFI_4_BAR 0xf065
 #define DC_ICON_BLUETOOTH 0xe1a7
 #define DC_ICON_BATTERY_FULL 0xe1a5
-/* NOTE: the bundled font is a build-time subset and does NOT include the
- * numbered battery_1_bar..battery_6_bar glyphs (0xf09c-0xf0a1) that DMS's
- * full variable font ships — confirmed by parsing the TTF's cmap directly
- * (they're simply absent, rendering as blank space, not tofu). battery_0_bar
- * is the only "low" tier actually present, so that's what low-but-not-
- * critical battery falls back to (docs/12-BAR-SPEC.md sec.4/6). */
+/* Full per-~15% tier set, matching DMS's Theme.getBatteryIcon() exactly
+ * (quickshell/Common/Theme.qml). These codepoints are all present in the
+ * full vendored font (assets/fonts/MaterialSymbolsRounded.ttf) — verified
+ * directly via its cmap — they just weren't in icons.h yet, so the build-
+ * time subset (scripts/subset-fonts.sh, which derives its codepoint list
+ * from this file) never carried them. Re-run that script after editing
+ * this list. */
 #define DC_ICON_BATTERY_0_BAR 0xebdc
+#define DC_ICON_BATTERY_1_BAR 0xebd9
+#define DC_ICON_BATTERY_2_BAR 0xebe0
+#define DC_ICON_BATTERY_3_BAR 0xebdd
+#define DC_ICON_BATTERY_4_BAR 0xebe2
+#define DC_ICON_BATTERY_5_BAR 0xebd4
+#define DC_ICON_BATTERY_6_BAR 0xebd2
 #define DC_ICON_BATTERY_ALERT 0xe19c
 #define DC_ICON_BATTERY_CHARGING_FULL 0xe1a3
+#define DC_ICON_BATTERY_CHARGING_90 0xf0a7
+#define DC_ICON_BATTERY_CHARGING_80 0xf0a6
+#define DC_ICON_BATTERY_CHARGING_60 0xf0a5
+#define DC_ICON_BATTERY_CHARGING_50 0xf0a4
+#define DC_ICON_BATTERY_CHARGING_30 0xf0a3
+#define DC_ICON_BATTERY_CHARGING_20 0xf0a2
 #define DC_ICON_VOLUME_UP 0xe050
 #define DC_ICON_VOLUME_DOWN 0xe04d
 #define DC_ICON_VOLUME_OFF 0xe04f

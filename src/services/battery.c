@@ -103,5 +103,23 @@ bool dc_battery_read(dc_battery_info *out)
     }
 
     closedir(dir);
+
+    /* DANKC_FAKE_BATTERY=<percent> (debug-only, env-gated -- same convention
+     * as DANKC_MARQUEE_TEST): override the real percent so the bar/popout
+     * battery glyph's per-level tiering can be screenshotted at any level
+     * without needing to actually run the laptop down. DANKC_FAKE_BATTERY_
+     * CHARGING=1 additionally fakes the charging flag. No-op when unset. */
+    if (found) {
+        const char *fake = getenv("DANKC_FAKE_BATTERY");
+        if (fake) {
+            int v = atoi(fake);
+            out->percent = v < 0 ? 0 : (v > 100 ? 100 : v);
+            out->full = out->percent >= 100;
+        }
+        const char *fake_chg = getenv("DANKC_FAKE_BATTERY_CHARGING");
+        if (fake_chg)
+            out->charging = atoi(fake_chg) != 0;
+    }
+
     return found;
 }
