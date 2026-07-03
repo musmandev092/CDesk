@@ -19,6 +19,7 @@
 #include "services/logind.h"
 #include "services/mpris.h"
 #include "services/notifications.h"
+#include "services/polkit.h"
 #include "services/power.h"
 #include "services/sysmon.h"
 #include "services/tray.h"
@@ -36,6 +37,7 @@
 #include "ui/lock.h"
 #include "ui/notifcenter.h"
 #include "ui/osd.h"
+#include "ui/polkit_modal.h"
 #include "ui/powermenu.h"
 #include "ui/processes.h"
 #include "ui/settings.h"
@@ -301,6 +303,7 @@ struct click_ctx {
     dc_tray_menu *tray_menu;
     dc_dock *dock;
     dc_keybinds_modal *keybinds_modal;
+    dc_polkit_modal *polkit_modal;
 };
 
 /* logind asked us to lock (pre-sleep / lock-session). */
@@ -318,6 +321,7 @@ struct kbd_ctx {
     dc_settings *settings;
     dc_powermenu *powermenu;
     dc_keybinds_modal *keybinds_modal;
+    dc_polkit_modal *polkit_modal;
 };
 
 static void handle_key(uint32_t keysym, const char *utf8, void *data)
@@ -325,6 +329,8 @@ static void handle_key(uint32_t keysym, const char *utf8, void *data)
     struct kbd_ctx *k = data;
     if (dc_lock_active(k->lock)) /* lock takes all input while engaged */
         dc_lock_handle_key(k->lock, keysym, utf8);
+    else if (dc_polkit_modal_visible(k->polkit_modal)) /* auth prompt: also exclusive */
+        dc_polkit_modal_handle_key(k->polkit_modal, keysym, utf8);
     else if (dc_settings_wants_keyboard(k->settings))
         dc_settings_handle_key(k->settings, keysym, utf8);
     else if (dc_clip_picker_visible(k->clip_picker))
@@ -512,6 +518,12 @@ static void handle_left_click(struct wl_surface *surface, double x, double y, st
         return;
     }
 
+    if (dc_polkit_modal_visible(ctx->polkit_modal) &&
+        surface == dc_polkit_modal_surface(ctx->polkit_modal)) {
+        dc_polkit_modal_handle_click(ctx->polkit_modal, x, y);
+        return;
+    }
+
     if (dc_keybinds_modal_visible(ctx->keybinds_modal) &&
         surface == dc_keybinds_modal_surface(ctx->keybinds_modal)) {
         dc_keybinds_modal_handle_click(ctx->keybinds_modal, x, y);
@@ -671,6 +683,12 @@ static void handle_bar_motion(struct wl_surface *surface, double x, double y, vo
 
     if (dc_powermenu_visible(ctx->powermenu) && surface == dc_powermenu_surface(ctx->powermenu)) {
         dc_powermenu_handle_motion(ctx->powermenu, x, y);
+        return;
+    }
+
+    if (dc_polkit_modal_visible(ctx->polkit_modal) &&
+        surface == dc_polkit_modal_surface(ctx->polkit_modal)) {
+        dc_polkit_modal_handle_motion(ctx->polkit_modal, x, y);
         return;
     }
 
@@ -847,6 +865,27 @@ static void handle_bar_axis(struct wl_surface *surface, int steps_v, int steps_h
         dc_niri_focus_column_left();
 }
 
+/* DANKC_POLKIT_DEMO: exercise the password modal's look/typing/Cancel path
+ * without a live polkitd round-trip (docs/14-COMPLETION-PLAN.md W3.5
+ * verification -- driving a *real* pkexec prompt on a shared session risks
+ * either fighting the user's real polkit agent for the registration or
+ * actually authenticating a privileged action, so this demo shows the exact
+ * same dc_polkit_modal_show() call services/polkit.c makes on a real
+ * BeginAuthentication, just with a fixed message/identity and callbacks that
+ * only log). */
+static void polkit_demo_submit(const char *password, void *user_data)
+{
+    DC_UNUSED(user_data);
+    dc_info("[DEMO] polkit: submitted a %zu-character password (not checked against anything)",
+            password ? strlen(password) : 0);
+}
+static void polkit_demo_cancel(void *user_data)
+{
+    dc_polkit_modal *m = user_data;
+    dc_info("[DEMO] polkit: cancelled");
+    dc_polkit_modal_hide(m);
+}
+
 int main(int argc, char **argv)
 {
     /* Client modes exit immediately without starting the shell. */
@@ -940,6 +979,7 @@ int main(int argc, char **argv)
     dc_processes *processes = dc_processes_create(wl, &egl, &render);
     dc_powermenu *powermenu = dc_powermenu_create(wl, &egl, &render, dbus, lock);
     dc_keybinds_modal *keybinds_modal = dc_keybinds_modal_create(wl, &egl, &render);
+    dc_polkit_modal *polkit_modal = dc_polkit_modal_create(wl, &egl, &render);
     struct tick_ctx tick = {.set = &set,
                             .osd = osd,
                             .wl = wl,
@@ -971,7 +1011,8 @@ int main(int argc, char **argv)
         .lock = lock,
         .settings = settings,
         .powermenu = powermenu,
-        .keybinds_modal = keybinds_modal};
+        .keybinds_modal = keybinds_modal,
+        .polkit_modal = polkit_modal};
     dc_wayland_set_key_cb(wl, handle_key, &kbd);
     struct config_change_ctx cfg_ctx = {.bars = &set, .frames = &frames, .dock = dock, .wl = wl};
     dc_config_set_change_cb(config_changed, &cfg_ctx);
@@ -991,7 +1032,8 @@ int main(int argc, char **argv)
                              .tray = tray,
                              .tray_menu = tray_menu,
                              .dock = dock,
-                             .keybinds_modal = keybinds_modal};
+                             .keybinds_modal = keybinds_modal,
+                             .polkit_modal = polkit_modal};
     dc_wayland_set_click_cb(wl, handle_bar_click, &cctx);
     dc_wayland_set_motion_cb(wl, handle_bar_motion, &cctx);
     dc_wayland_set_leave_cb(wl, handle_bar_leave, &cctx);
@@ -1022,6 +1064,12 @@ int main(int argc, char **argv)
                                       .keybinds_modal = keybinds_modal};
     dc_control *control = dc_control_create(g_loop, control_dispatch, &control_ctx);
     dc_logind *logind = dc_logind_create(dbus, logind_lock, lock);
+    /* docs/14-COMPLETION-PLAN.md W3.5: register as the session's polkit
+     * authentication agent so privileged GUI actions (mount a drive, a
+     * package-manager GUI, ...) prompt via polkit_modal instead of silently
+     * failing. Non-fatal if another agent already owns this session (logged,
+     * see services/polkit.c's register_agent()). */
+    dc_polkit *polkit = dc_polkit_create(dbus, g_loop, wl, polkit_modal);
 
     struct sigaction sa = {.sa_handler = handle_signal};
     sigaction(SIGINT, &sa, NULL);
@@ -1128,11 +1176,22 @@ int main(int argc, char **argv)
          * demo assumes at least one item is registered. */
         dc_tray_menu_open(tray_menu, first, 0, 0, 0);
     }
+    if (getenv("DANKC_POLKIT_DEMO")) {
+        dc_output *first = NULL;
+        wl_list_for_each(first, &wl->outputs, link) {
+            break;
+        }
+        dc_polkit_modal_show(polkit_modal, first,
+                             "Authentication is required to install or remove software",
+                             "root", polkit_demo_submit, polkit_demo_cancel, polkit_modal);
+    }
 
     dc_info("entering event loop (%d bar%s)", set.count, set.count == 1 ? "" : "s");
     dc_loop_run(g_loop);
 
     dc_info("shutting down");
+    dc_polkit_destroy(polkit);
+    dc_polkit_modal_destroy(polkit_modal);
     dc_logind_destroy(logind);
     dc_tray_menu_destroy(tray_menu);
     dc_tray_destroy(tray);
