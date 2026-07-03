@@ -120,6 +120,35 @@ typedef struct dc_config {
      * whole session/DE and a fresh install should behave like any other DE
      * out of the box. */
     bool autostart_enabled;
+
+    /* OSD (docs/14-COMPLETION-PLAN.md W2.3, ui/osd.c): auto-hide timeout and
+     * screen position for the volume/brightness overlay. DMS's osdPosition
+     * enumerates 8 corners/edges (docs/09 "OSD Position"); dankc's layer-
+     * shell anchoring only implements the 4 that don't require horizontal
+     * centering math beyond what dc_popout_bar_adjacent-style anchors give
+     * for free -- see osd.c's dc_osd_position enum for the mapping. */
+    int osd_position;    /* dc_osd_position */
+    int osd_timeout_ms;  /* auto-hide delay, ms */
+
+    /* Typography (docs/14-COMPLETION-PLAN.md W2.4): scales UI text sizes.
+     * NOTE: only wired into ui/settings.c's own text so the slider has a
+     * visible live effect without touching every nvgFontSize() call site
+     * across bar/panels (see settings.c's ui_font_size() comment) -- full
+     * shell-wide propagation is deferred, matching the task's own escape
+     * hatch for this item. */
+    float font_scale;
+
+    /* Locale (docs/14-COMPLETION-PLAN.md W2 "Locale"): first day of week for
+     * the dashboard calendar grid (0=Sunday .. 6=Saturday, matching struct
+     * tm's tm_wday numbering used by ui/dashboard.c's draw_calendar_card()). */
+    int first_day_of_week;
+
+    /* Theme & Colors (docs/14-COMPLETION-PLAN.md W2 "Theme & Colors deep
+     * tab"): light/dark mode preference. UI-only for now -- dankc's theme
+     * engine (under src/theme) is dark-only; a separate agent owns adding
+     * real light-theme variants and will consume this key. Defaults "dark"
+     * so nothing changes visually until that lands. */
+    char theme_mode[8];
 } dc_config;
 
 /* The active config. Read-only for the rest of the app. */
