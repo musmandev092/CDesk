@@ -125,6 +125,8 @@ struct dc_settings {
     int focus_field; /* 0 none, 1 latitude, 2 longitude, 3 weather location,
                       * 4 wallpaper path, 5 dock pinned-app id (add) */
     char edit_buf[256];
+
+    bool test_clicks_done; /* DANKC_SETTINGS_CLICK consumed (see s_show) */
 };
 
 /* Bounded string copy without gcc's -Wformat-truncation firing: several text
@@ -550,9 +552,17 @@ static int ui_list_row(uictx *c, const char *title, const char *status, int trai
  * window) because build_tab() runs on every render AND hit pass. */
 
 /* Run a shell command detached (children auto-reaped via main.c's SIG_IGN on
- * SIGCHLD) -- same shape as controlcenter.c's run_detached(). */
+ * SIGCHLD) -- same shape as controlcenter.c's run_detached(). With
+ * DANKC_SETTINGS_DRYRUN set, log the command instead of running it (same
+ * offline-verification pattern as powermenu.c's DANKC_POWER_DRYRUN), so
+ * destructive toggles (Wi-Fi/Bluetooth off) can be exercised safely. */
 static void run_detached(const char *cmd)
 {
+    if (getenv("DANKC_SETTINGS_DRYRUN")) {
+        dc_info("[DRYRUN] settings: would run: %s", cmd);
+        return;
+    }
+    dc_debug("settings: run: %s", cmd);
     pid_t pid = fork();
     if (pid == 0) {
         setsid();
@@ -1768,6 +1778,26 @@ static void layer_surface_handle_configure(void *data, struct zwlr_layer_surface
     s->configured = true;
     recompute_physical(s);
     s_render(s);
+
+    /* TEMP(verify)-style hook, like DANKC_SETTINGS_TAB above: scripted
+     * surface-local clicks ("x,y[;x,y...]") applied once after the first
+     * configure, so live-apply paths can be exercised deterministically
+     * offline (ydotool absolute coords are unreliable on this mixed-DPI
+     * setup -- see the project's input-synthesis notes). */
+    if (!s->test_clicks_done) {
+        s->test_clicks_done = true;
+        const char *spec = getenv("DANKC_SETTINGS_CLICK");
+        while (spec && *spec) {
+            double cx = 0, cy = 0;
+            if (sscanf(spec, "%lf,%lf", &cx, &cy) == 2) {
+                dc_info("settings: scripted click at %.0f,%.0f", cx, cy);
+                dc_settings_handle_click(s, cx, cy);
+            }
+            spec = strchr(spec, ';');
+            if (spec)
+                spec++;
+        }
+    }
 }
 static void layer_surface_handle_closed(void *data, struct zwlr_layer_surface_v1 *surface)
 {
@@ -1809,6 +1839,7 @@ static void s_show(dc_settings *s, dc_output *output)
     s->content_h = 0;
     s->focus_field = 0;
     s->edit_buf[0] = '\0';
+    s->test_clicks_done = false;
     s->scale120 = (output && output->scale > 0 ? output->scale : 1) * DC_SCALE_BASE;
     dc_anim_start(&s->anim, DC_DUR_MEDIUM, DC_EASE_EXPRESSIVE);
 
