@@ -785,8 +785,17 @@ static void draw_calendar_card(dc_dashboard *d, float x, float y, float w, float
         } else {
             nvgFillColor(vg, tc(t->surface_text));
         }
-        nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
-        nvgText(vg, ccx, ccy, ds, NULL);
+        /* NVG_ALIGN_MIDDLE centers on the font's line-box (ascender+
+         * descender)/2, not the digit's actual ink -- same class of bug as
+         * dc_render_icon's icon glyphs (see render/nvg.c). Most visible on
+         * the "today" pill where it reads ~1px left+high of true center;
+         * measure real ink bounds and center that instead, same fix. */
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_BASELINE);
+        float dbounds[4];
+        nvgTextInkBounds(vg, 0.0f, 0.0f, ds, NULL, dbounds);
+        float dcy = ccy - (dbounds[1] + dbounds[3]) / 2.0f;
+        float dcx = ccx - (dbounds[0] + dbounds[2]) / 2.0f;
+        nvgText(vg, dcx, dcy, ds, NULL);
     }
 }
 
