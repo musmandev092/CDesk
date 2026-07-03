@@ -29,6 +29,7 @@ static bool g_discovering = false;
 
 static void bluez_register_agent(void);
 static void bluez_resolve_fake_pair(bool ok);
+static void mac_to_device_path(const char *mac, char *out, size_t out_sz);
 
 void dc_bluez_init(struct dc_dbus *dbus)
 {
@@ -436,6 +437,59 @@ void dc_bluez_set_pairable(bool on)
         return;
     if (bluez_set_bool_property(g_adapter_path, "org.bluez.Adapter1", "Pairable", on) >= 0)
         g_last_refresh = 0;
+}
+
+/* --- Device settings: Trust / Remove (Wave 1) ------------------------------
+ *
+ * Independent of dc_bluez_pair() (which already sets Trusted=true internally
+ * as part of first-time pairing) -- these let an already-paired device's
+ * trust be viewed/revoked without unpairing, and let a device be forgotten
+ * entirely. Both take a MAC, same as dc_bluez_connect()/dc_bluez_pair() --
+ * mac_to_device_path() derives the object path from it and the tracked
+ * adapter, so the UI never needs to know raw D-Bus paths. */
+
+void dc_bluez_set_trusted(const char *mac, bool trusted)
+{
+    if (!mac || !mac[0])
+        return;
+    char path[128];
+    mac_to_device_path(mac, path, sizeof(path));
+
+    if (getenv("DANKC_BT_DRYRUN")) {
+        dc_info("bluez: [DANKC_BT_DRYRUN] would Properties.Set %s org.bluez.Device1.Trusted=%s",
+                path, trusted ? "true" : "false");
+        return;
+    }
+    if (!g_system || !g_adapter_path[0])
+        return;
+    if (bluez_set_bool_property(path, "org.bluez.Device1", "Trusted", trusted) >= 0)
+        g_last_refresh = 0;
+}
+
+void dc_bluez_remove(const char *mac)
+{
+    if (!mac || !mac[0])
+        return;
+    char path[128];
+    mac_to_device_path(mac, path, sizeof(path));
+
+    if (getenv("DANKC_BT_DRYRUN")) {
+        dc_info("bluez: [DANKC_BT_DRYRUN] would Adapter1.RemoveDevice(%s) on %s", path,
+                g_adapter_path[0] ? g_adapter_path : "(no adapter yet)");
+        return;
+    }
+    if (!g_system || !g_adapter_path[0]) {
+        dc_warn("bluez: remove: no adapter known yet");
+        return;
+    }
+
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    int r = sd_bus_call_method(g_system, "org.bluez", g_adapter_path, "org.bluez.Adapter1",
+                               "RemoveDevice", &err, NULL, "o", path);
+    if (r < 0)
+        dc_warn("bluez: RemoveDevice(%s) failed: %s", path, err.message ? err.message : strerror(-r));
+    sd_bus_error_free(&err);
+    g_last_refresh = 0; /* drop the (now unpaired) device from the list promptly */
 }
 
 /* --- Discovery (W3.1) ------------------------------------------------------
