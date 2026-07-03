@@ -45,7 +45,27 @@
 
 bool dc_printers_available(void)
 {
-    return system("command -v lpstat >/dev/null 2>&1") == 0;
+    /* PATH search for lpstat via access(X_OK), NOT system(): main.c sets
+     * SIGCHLD to SIG_IGN process-wide, which makes system()'s internal
+     * waitpid() fail and return -1 even when the command exists. */
+    const char *path = getenv("PATH");
+    if (!path)
+        path = "/usr/bin:/bin:/usr/local/bin";
+    char buf[512];
+    const char *p = path;
+    while (*p) {
+        const char *sep = strchr(p, ':');
+        size_t len = sep ? (size_t)(sep - p) : strlen(p);
+        if (len > 0 && len < sizeof(buf) - 8) {
+            snprintf(buf, sizeof(buf), "%.*s/lpstat", (int)len, p);
+            if (access(buf, X_OK) == 0)
+                return true;
+        }
+        if (!sep)
+            break;
+        p = sep + 1;
+    }
+    return false;
 }
 
 const char *dc_printer_state_name(dc_printer_state s)
