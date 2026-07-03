@@ -6,6 +6,7 @@
 #include "dc.h"
 #include "render/icons.h"
 #include "render/nvg.h"
+#include "services/apps.h"
 #include "services/audio.h"
 #include "services/bluez.h"
 #include "services/net.h"
@@ -18,11 +19,13 @@
 #include "wayland/wl.h"
 
 #include <GLES2/gl2.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -43,6 +46,13 @@
 #define DC_SIDEBAR_W 196.0f
 #define DC_CONTENT_INSET 24.0f
 #define DC_SET_THEME_COLS 5
+
+/* Sidebar tab-list geometry (docs/14-COMPLETION-PLAN.md W2 added 6 more
+ * tabs, 20 total -- no longer all fit in DC_SET_HEIGHT at once, so the
+ * sidebar scrolls independently of the content pane; see sidebar_scroll_y
+ * below and dc_settings_handle_scroll()'s x-position routing). */
+#define DC_SIDEBAR_ITEM_H 42.0f
+#define DC_SIDEBAR_ITEMS_TOP (DC_SET_PAD + 56.0f)
 
 /* Sidebar/control icon aliases -- render/icons.h owns the actual codepoints
  * (see its "Settings window" block) so scripts/subset-fonts.sh keeps the
@@ -65,10 +75,19 @@
 #define IC_AUDIO DC_ICON_VOLUME_UP
 #define IC_NETWORK DC_ICON_WIFI
 #define IC_BLUETOOTH DC_ICON_BLUETOOTH
+/* docs/14-COMPLETION-PLAN.md W2 new tabs. Default Apps reuses IC_GRID_VIEW's
+ * sibling APPS glyph (distinct from the launcher's grid-view icon). */
+#define IC_TUNE DC_ICON_TUNE
+#define IC_TEXT_FORMAT DC_ICON_TEXT_FORMAT
+#define IC_COMPUTER DC_ICON_COMPUTER
+#define IC_LANGUAGE DC_ICON_LANGUAGE
+#define IC_APPS DC_ICON_APPS
+#define IC_COLOR_LENS DC_ICON_COLOR_LENS
 
 typedef enum {
     TAB_PERSONALIZATION = 0,
     TAB_TIME,
+    TAB_TYPOGRAPHY,
     TAB_BAR,
     TAB_WIDGETS,
     TAB_WEATHER,
@@ -79,6 +98,11 @@ typedef enum {
     TAB_BLUETOOTH,
     TAB_NOTIFICATIONS,
     TAB_LAUNCHER,
+    TAB_DEFAULT_APPS,
+    TAB_LOCALE,
+    TAB_SYSTEM,
+    TAB_OSD,
+    TAB_THEME_COLORS,
     TAB_POWER,
     TAB_ABOUT,
     TAB_COUNT,
@@ -90,13 +114,16 @@ typedef struct {
 } s_tab_def;
 
 static const s_tab_def TABS[TAB_COUNT] = {
-    {IC_PALETTE, "Personalization"}, {IC_SCHEDULE, "Time & Date"},
-    {IC_TOOLBAR, "Bar"},             {IC_WIDGETS, "Widgets"},
-    {IC_CLOUD, "Weather"},           {IC_DOCK, "Dock"},
-    {IC_MONITOR, "Displays"},        {IC_AUDIO, "Audio"},
-    {IC_NETWORK, "Network"},         {IC_BLUETOOTH, "Bluetooth"},
-    {IC_NOTIFICATIONS, "Notifications"}, {IC_GRID_VIEW, "Launcher"},
-    {IC_POWER, "Power"},             {IC_INFO, "About"},
+    {IC_PALETTE, "Personalization"},     {IC_SCHEDULE, "Time & Date"},
+    {IC_TEXT_FORMAT, "Typography & Motion"}, {IC_TOOLBAR, "Bar"},
+    {IC_WIDGETS, "Widgets"},              {IC_CLOUD, "Weather"},
+    {IC_DOCK, "Dock"},                    {IC_MONITOR, "Displays"},
+    {IC_AUDIO, "Audio"},                  {IC_NETWORK, "Network"},
+    {IC_BLUETOOTH, "Bluetooth"},          {IC_NOTIFICATIONS, "Notifications"},
+    {IC_GRID_VIEW, "Launcher"},           {IC_APPS, "Default Apps"},
+    {IC_LANGUAGE, "Locale"},              {IC_COMPUTER, "System"},
+    {IC_TUNE, "OSD"},                     {IC_COLOR_LENS, "Theme & Colors"},
+    {IC_POWER, "Power"},                  {IC_INFO, "About"},
 };
 
 struct dc_settings {
@@ -121,12 +148,18 @@ struct dc_settings {
     int active_tab;
     float scroll_y;
     float content_h; /* recomputed each render, drives scroll clamp */
+    float sidebar_scroll_y; /* independent scroll for the (now 20-tab) sidebar list */
 
     int focus_field; /* 0 none, 1 latitude, 2 longitude, 3 weather location,
                       * 4 wallpaper path, 5 dock pinned-app id (add) */
     char edit_buf[256];
 
     bool test_clicks_done; /* DANKC_SETTINGS_CLICK consumed (see s_show) */
+
+    /* Lazily loaded on first visit to the Default Apps tab (docs/14-
+     * COMPLETION-PLAN.md W2.8) -- most sessions never open it, so this
+     * avoids scanning every applications/ dir on every settings open. */
+    dc_apps *apps;
 };
 
 /* Bounded string copy without gcc's -Wformat-truncation firing: several text
@@ -180,6 +213,28 @@ static float body_top(const dc_settings *s)
 static float body_height(const dc_settings *s)
 {
     return (float)s->logical_height - DC_SET_PAD - 12.0f - body_top(s);
+}
+
+/* Sidebar tab-list scroll geometry (mirrors content's body_top/body_height
+ * pair above). Visible height is whatever's left below the "Settings"
+ * header down to the card's bottom inset. */
+static float sidebar_body_top(const dc_settings *s)
+{
+    DC_UNUSED(s);
+    return DC_SIDEBAR_ITEMS_TOP;
+}
+static float sidebar_body_height(const dc_settings *s)
+{
+    return (float)s->logical_height - DC_SET_PAD - 8.0f - sidebar_body_top(s);
+}
+static float sidebar_items_total_h(void)
+{
+    return TAB_COUNT * DC_SIDEBAR_ITEM_H;
+}
+static float sidebar_scroll_max(const dc_settings *s)
+{
+    float m = sidebar_items_total_h() - sidebar_body_height(s);
+    return m > 0.0f ? m : 0.0f;
 }
 
 /* ============================ immediate-mode UI ============================ */
@@ -590,6 +645,135 @@ static void run_detached(const char *cmd)
 }
 
 #define SYS_CACHE_SECONDS 3
+
+/* --- Default Apps (docs/14-COMPLETION-PLAN.md W2.8): browser/file-manager
+ * via xdg-settings/xdg-mime, terminal via $XDG_CONFIG_HOME/xdg-terminals.list
+ * (matching DMS's own DefaultAppsTab.qml -- xdg-settings has no "terminal"
+ * category, xdg-terminal-exec is what actually reads that file). Reads run
+ * unconditionally (side-effect-free, like wifi_radio_read() etc. above); the
+ * mutating "set" commands additionally honor DANKC_XDG_DRYRUN so this tab can
+ * be exercised offline without touching the user's real default apps (kept
+ * as its own var per this task's explicit ask, on top of run_detached()'s
+ * existing DANKC_SETTINGS_DRYRUN gate -- both are honored). */
+static void run_xdg_detached(const char *cmd)
+{
+    if (getenv("DANKC_XDG_DRYRUN")) {
+        dc_info("[XDG DRYRUN] settings: would run: %s", cmd);
+        return;
+    }
+    run_detached(cmd);
+}
+
+/* Run `cmd`, capture its first line (trimmed) into `out`. Read-only helper
+ * shared by the three xdg_default_*() readers below. */
+static bool xdg_query(const char *cmd, char *out, size_t outsz)
+{
+    out[0] = '\0';
+    FILE *pipe = popen(cmd, "r");
+    if (!pipe)
+        return false;
+    if (fgets(out, (int)outsz, pipe)) {
+        size_t n = strlen(out);
+        while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r'))
+            out[--n] = '\0';
+    }
+    pclose(pipe);
+    return out[0] != '\0';
+}
+
+#define DC_XDG_ID_MAX 128
+
+static bool xdg_default_browser(char *out, size_t n)
+{
+    static char cache[DC_XDG_ID_MAX];
+    static bool cache_ok;
+    static time_t cache_time;
+    time_t now = time(NULL);
+    if (cache_time && now - cache_time < SYS_CACHE_SECONDS) {
+        snprintf(out, n, "%s", cache);
+        return cache_ok;
+    }
+    cache_time = now;
+    cache_ok = xdg_query("xdg-settings get default-web-browser 2>/dev/null", cache, sizeof(cache));
+    snprintf(out, n, "%s", cache);
+    return cache_ok;
+}
+
+static bool xdg_default_filemanager(char *out, size_t n)
+{
+    static char cache[DC_XDG_ID_MAX];
+    static bool cache_ok;
+    static time_t cache_time;
+    time_t now = time(NULL);
+    if (cache_time && now - cache_time < SYS_CACHE_SECONDS) {
+        snprintf(out, n, "%s", cache);
+        return cache_ok;
+    }
+    cache_time = now;
+    cache_ok = xdg_query("xdg-mime query default inode/directory 2>/dev/null", cache,
+                         sizeof(cache));
+    snprintf(out, n, "%s", cache);
+    return cache_ok;
+}
+
+static bool xdg_default_terminal(char *out, size_t n)
+{
+    static char cache[DC_XDG_ID_MAX];
+    static bool cache_ok;
+    static time_t cache_time;
+    time_t now = time(NULL);
+    if (cache_time && now - cache_time < SYS_CACHE_SECONDS) {
+        snprintf(out, n, "%s", cache);
+        return cache_ok;
+    }
+    cache_time = now;
+    cache_ok = xdg_query("cat \"${XDG_CONFIG_HOME:-$HOME/.config}/xdg-terminals.list\" 2>/dev/null",
+                         cache, sizeof(cache));
+    snprintf(out, n, "%s", cache);
+    return cache_ok;
+}
+
+static void xdg_set_browser(const char *desktop_id)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "xdg-settings set default-web-browser %s", desktop_id);
+    run_xdg_detached(cmd);
+}
+
+static void xdg_set_filemanager(const char *desktop_id)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "xdg-mime default %s inode/directory", desktop_id);
+    run_xdg_detached(cmd);
+}
+
+static void xdg_set_terminal(const char *desktop_id)
+{
+    char cmd[320];
+    snprintf(cmd, sizeof(cmd),
+             "mkdir -p \"${XDG_CONFIG_HOME:-$HOME/.config}\" && echo %s > "
+             "\"${XDG_CONFIG_HOME:-$HOME/.config}/xdg-terminals.list\"",
+             desktop_id);
+    run_xdg_detached(cmd);
+}
+
+/* Heuristic category match against a desktop-entry id/exec (apps.c doesn't
+ * parse Categories=; matching DMS's exact category-based filtering would
+ * need extending that shared service, so this stays local to the tab --
+ * see docs/14-COMPLETION-PLAN.md W2.8). Case-insensitive substring match on
+ * a short curated keyword list per role. */
+static bool id_matches_any(const char *id, const char *const *needles, int n)
+{
+    char lower[DC_APP_ID];
+    size_t i = 0;
+    for (; id[i] && i + 1 < sizeof(lower); i++)
+        lower[i] = (char)tolower((unsigned char)id[i]);
+    lower[i] = '\0';
+    for (int k = 0; k < n; k++)
+        if (strstr(lower, needles[k]))
+            return true;
+    return false;
+}
 
 /* --- backlight: read sysfs directly (controlcenter.c's read_brightness
  * pattern), set via logind's Session.SetBrightness (works unprivileged,
@@ -1068,16 +1252,9 @@ static void tab_personalization(uictx *c)
         }
     }
 
-    ui_section(c, "MOTION");
-    if (ui_toggle(c, "Animations", "Panel entrance/exit animations",
-                  c->cfg->animations_enabled)) {
-        c->cfg->animations_enabled = !c->cfg->animations_enabled;
-        c->changed = true;
-    }
-    char sv[16];
-    snprintf(sv, sizeof(sv), "%.2fx", (double)c->cfg->animation_speed);
-    if (ui_slider(c, "Animation speed", &c->cfg->animation_speed, 0.25f, 4.0f, sv))
-        c->changed = true;
+    /* MOTION moved to its own "Typography & Motion" tab (docs/14-COMPLETION-
+     * PLAN.md W2.4, matches DMS's TypographyMotionTab.qml grouping) -- see
+     * tab_typography() below. */
 }
 
 static void tab_time(uictx *c)
@@ -1099,6 +1276,33 @@ static void tab_time(uictx *c)
         c->changed = true;
         c->bars = true;
     }
+}
+
+/* docs/14-COMPLETION-PLAN.md W2.4 -- consolidates the MOTION section that
+ * used to live at the bottom of Personalization (animations toggle + speed
+ * slider, unchanged) with a new TYPOGRAPHY section, matching DMS's
+ * TypographyMotionTab.qml grouping. */
+static void tab_typography(uictx *c)
+{
+    ui_section(c, "TYPOGRAPHY");
+    char fsv[16];
+    snprintf(fsv, sizeof(fsv), "%.0f%%", (double)c->cfg->font_scale * 100.0);
+    if (ui_slider(c, "Font scale", &c->cfg->font_scale, 0.8f, 1.5f, fsv)) {
+        c->changed = true;
+    }
+    ui_hint(c, "Applies live to this Settings window; other panels/bar text");
+    ui_hint(c, "keep their fixed size for now (full propagation deferred).");
+
+    ui_section(c, "MOTION");
+    if (ui_toggle(c, "Animations", "Panel entrance/exit animations",
+                  c->cfg->animations_enabled)) {
+        c->cfg->animations_enabled = !c->cfg->animations_enabled;
+        c->changed = true;
+    }
+    char sv[16];
+    snprintf(sv, sizeof(sv), "%.2fx", (double)c->cfg->animation_speed);
+    if (ui_slider(c, "Animation speed", &c->cfg->animation_speed, 0.25f, 4.0f, sv))
+        c->changed = true;
 }
 
 static void tab_bar(uictx *c)
@@ -1264,6 +1468,227 @@ static void tab_launcher(uictx *c)
         c->cfg->launcher_grid_view = clicked == 1;
         c->changed = true;
     }
+}
+
+/* Strip a trailing ".desktop" suffix for comparison against apps.c's
+ * dc_app.id (which is stored without it -- see apps.c's parse comment). */
+static const char *strip_desktop_suffix(const char *id, char *buf, size_t bufsz)
+{
+    copy_trunc(buf, bufsz, id);
+    size_t n = strlen(buf);
+    if (n > 8 && strcmp(buf + n - 8, ".desktop") == 0)
+        buf[n - 8] = '\0';
+    return buf;
+}
+
+/* One Default Apps role: current value (read-only, live xdg query) + a
+ * scrollable pick-list of installed apps heuristically matching `keywords`
+ * (apps.c doesn't parse Categories=, docs/14-COMPLETION-PLAN.md W2.8 --
+ * matching DMS's category-based dropdown exactly would need extending that
+ * shared service). Clicking a row calls `set_fn` with the ".desktop"-suffixed
+ * id xdg-settings/xdg-mime expect. */
+static void default_app_role(uictx *c, const char *label, bool (*get_fn)(char *, size_t),
+                             void (*set_fn)(const char *), const char *const *keywords, int nkw)
+{
+    char cur[DC_XDG_ID_MAX];
+    bool have = get_fn(cur, sizeof(cur));
+    char cur_stripped[DC_XDG_ID_MAX];
+    if (have)
+        strip_desktop_suffix(cur, cur_stripped, sizeof(cur_stripped));
+    else
+        cur_stripped[0] = '\0';
+
+    char valline[64];
+    snprintf(valline, sizeof(valline), "%s", have ? cur_stripped : "(none set)");
+    ui_value(c, label, valline);
+
+    const dc_app *apps[300];
+    int n = dc_apps_search(c->s->apps, "", apps, 300);
+    int shown = 0;
+    for (int i = 0; i < n && shown < 6; i++) {
+        if (!id_matches_any(apps[i]->id, keywords, nkw))
+            continue;
+        bool active = have && strcmp(apps[i]->id, cur_stripped) == 0;
+        if (ui_list_row(c, apps[i]->name, active ? "Default" : NULL, 0, active) == 1 &&
+            !active) {
+            char withdesktop[DC_APP_ID + 16];
+            snprintf(withdesktop, sizeof(withdesktop), "%s.desktop", apps[i]->id);
+            set_fn(withdesktop);
+        }
+        shown++;
+    }
+    if (shown == 0)
+        ui_hint(c, "No installed apps matched (heuristic name match; try DANKC_XDG_DRYRUN=1)");
+}
+
+/* docs/14-COMPLETION-PLAN.md W2.8: browser/file-manager/terminal pickers.
+ * Reads are always live (xdg-settings/xdg-mime/xdg-terminals.list); writes
+ * are detached shell commands gated by DANKC_XDG_DRYRUN for offline
+ * verification (see run_xdg_detached() above) -- this tab never has its own
+ * config.json keys, same pattern as the Audio/Network/Bluetooth tabs (the
+ * xdg databases and $XDG_CONFIG_HOME/xdg-terminals.list ARE the persisted
+ * state; dc_config_save() has nothing to add). */
+static void tab_default_apps(uictx *c)
+{
+    if (!c->s->apps)
+        c->s->apps = dc_apps_load();
+
+    static const char *const browser_kw[] = {"firefox",  "chromium", "chrome",     "brave",
+                                             "librewolf", "vivaldi",  "opera",      "epiphany",
+                                             "falkon",    "qutebrowser", "waterfox", "thorium"};
+    static const char *const filemgr_kw[] = {"nautilus", "files",  "dolphin", "thunar",
+                                             "nemo",      "pcmanfm", "krusader", "caja",
+                                             "doublecmd", "ranger"};
+    static const char *const term_kw[] = {"alacritty", "kitty",   "foot",       "konsole",
+                                         "xterm",     "wezterm", "terminal",   "terminator",
+                                         "tilix",     "urxvt",   "ghostty",    "contour",
+                                         "xterm"};
+
+    ui_section(c, "INTERNET");
+    default_app_role(c, "Web Browser", xdg_default_browser, xdg_set_browser, browser_kw,
+                     (int)(sizeof(browser_kw) / sizeof(browser_kw[0])));
+
+    ui_section(c, "UTILITIES");
+    default_app_role(c, "File Manager", xdg_default_filemanager, xdg_set_filemanager, filemgr_kw,
+                     (int)(sizeof(filemgr_kw) / sizeof(filemgr_kw[0])));
+    default_app_role(c, "Terminal", xdg_default_terminal, xdg_set_terminal, term_kw,
+                     (int)(sizeof(term_kw) / sizeof(term_kw[0])));
+    ui_hint(c, "Terminal uses xdg-terminals.list (read by xdg-terminal-exec); the");
+    ui_hint(c, "others use xdg-settings/xdg-mime, same as DMS's Default Apps tab.");
+}
+
+/* docs/14-COMPLETION-PLAN.md W2 "Locale": first day of week for the
+ * dashboard calendar (real config key, live-applies + persists) plus a
+ * read-only locale/timezone display -- full interface translation stays
+ * deferred per docs/07 G10 (this tab is UI plumbing only). */
+static void tab_locale(uictx *c)
+{
+    ui_section(c, "CALENDAR");
+    static const char *const dow_opts[2] = {"Sunday", "Monday"};
+    int cur = c->cfg->first_day_of_week == 1 ? 1 : 0;
+    int clicked = ui_segmented(c, "First day of week", dow_opts, 2, cur);
+    if (clicked >= 0 && clicked != cur) {
+        c->cfg->first_day_of_week = clicked == 1 ? 1 : 0;
+        c->changed = true;
+    }
+    ui_hint(c, "Applies to the dashboard's calendar card");
+
+    ui_section(c, "SYSTEM LOCALE");
+    const char *lang = getenv("LANG");
+    ui_value(c, "Interface language (LANG)", lang && lang[0] ? lang : "(unset)");
+    const char *tz = getenv("TZ");
+    if (!tz || !tz[0]) {
+        static char tzbuf[64];
+        ssize_t len = readlink("/etc/localtime", tzbuf, sizeof(tzbuf) - 1);
+        if (len > 0) {
+            tzbuf[len] = '\0';
+            const char *zoneinfo = strstr(tzbuf, "zoneinfo/");
+            tz = zoneinfo ? zoneinfo + 9 : tzbuf;
+        }
+    }
+    ui_value(c, "Timezone", tz && tz[0] ? tz : "(unknown)");
+    ui_hint(c, "Read-only -- change via the system locale/timezone (localectl)");
+}
+
+/* docs/14-COMPLETION-PLAN.md W2 "System": read-only host info + the handful
+ * of process-lifetime toggles that are trivially available (RSS already
+ * lives in About; this tab covers hostname/uptime/kernel like DMS's system
+ * info rows plus the two session-wide switches that don't have a better
+ * home yet). */
+static void tab_system(uictx *c)
+{
+    ui_section(c, "HOST");
+    char hostname[256] = "(unknown)";
+    gethostname(hostname, sizeof(hostname) - 1);
+    ui_value(c, "Hostname", hostname);
+
+    struct utsname uts;
+    if (uname(&uts) == 0) {
+        char kv[192];
+        snprintf(kv, sizeof(kv), "%s %s", uts.sysname, uts.release);
+        ui_value(c, "Kernel", kv);
+    }
+
+    FILE *f = fopen("/proc/uptime", "r");
+    if (f) {
+        double secs = 0;
+        if (fscanf(f, "%lf", &secs) == 1) {
+            int days = (int)(secs / 86400.0);
+            int hours = (int)fmod(secs / 3600.0, 24.0);
+            int mins = (int)fmod(secs / 60.0, 60.0);
+            char up[64];
+            if (days > 0)
+                snprintf(up, sizeof(up), "%dd %dh %dm", days, hours, mins);
+            else
+                snprintf(up, sizeof(up), "%dh %dm", hours, mins);
+            ui_value(c, "Uptime", up);
+        }
+        fclose(f);
+    }
+
+    ui_section(c, "SESSION");
+    if (ui_toggle(c, "Launch autostart apps",
+                  "Run ~/.config/autostart + /etc/xdg/autostart entries at login",
+                  c->cfg->autostart_enabled)) {
+        c->cfg->autostart_enabled = !c->cfg->autostart_enabled;
+        c->changed = true;
+    }
+    ui_hint(c, "Takes effect on the next login (autostart already ran this session)");
+}
+
+/* docs/14-COMPLETION-PLAN.md W2.3: OSD position + auto-hide timeout,
+ * live-applying to the next volume/brightness overlay (ui/osd.c reads these
+ * two config keys directly on every show/re-arm). */
+static void tab_osd(uictx *c)
+{
+    ui_section(c, "POSITION");
+    static const char *const pos_opts[4] = {"Bottom Center", "Bottom Left", "Bottom Right",
+                                            "Top Center"};
+    int cur = c->cfg->osd_position;
+    if (cur < 0 || cur > 3)
+        cur = 0;
+    int clicked = ui_segmented(c, "OSD position", pos_opts, 4, cur);
+    if (clicked >= 0 && clicked != cur) {
+        c->cfg->osd_position = clicked;
+        c->changed = true;
+    }
+
+    ui_section(c, "TIMING");
+    float secs = (float)c->cfg->osd_timeout_ms / 1000.0f;
+    char sv[16];
+    snprintf(sv, sizeof(sv), "%.1fs", (double)secs);
+    if (ui_slider(c, "Auto-hide timeout", &secs, 0.5f, 8.0f, sv)) {
+        c->cfg->osd_timeout_ms = (int)lroundf(secs * 1000.0f);
+        c->changed = true;
+    }
+    ui_hint(c, "Applies to the next volume/brightness OSD popup");
+}
+
+/* docs/14-COMPLETION-PLAN.md W2 "Theme & Colors deep tab": UI-plumbing-only
+ * light/dark mode preference. dankc's theme engine (under src/theme) is
+ * currently dark-only -- a separate agent owns adding real light-theme
+ * variants and will consume the themeMode config key added here; this tab
+ * intentionally does NOT touch any theme engine source file, matching this
+ * task's explicit coordination boundary. Dynamic color itself stays on the
+ * Personalization tab (unchanged) since it already existed there. */
+static void tab_theme_colors(uictx *c)
+{
+    ui_section(c, "MODE");
+    static const char *const mode_opts[2] = {"Dark", "Light"};
+    int cur = strcmp(c->cfg->theme_mode, "light") == 0 ? 1 : 0;
+    int clicked = ui_segmented(c, "Theme mode", mode_opts, 2, cur);
+    if (clicked >= 0 && clicked != cur) {
+        copy_trunc(c->cfg->theme_mode, sizeof(c->cfg->theme_mode), clicked == 1 ? "light" : "dark");
+        c->changed = true;
+    }
+    if (cur == 1)
+        ui_hint(c, "Light theme rendering isn't implemented yet -- this only");
+    if (cur == 1)
+        ui_hint(c, "records the preference for when it lands.");
+
+    ui_section(c, "PALETTE");
+    ui_hint(c, "Pick a color scheme and enable dynamic (wallpaper-derived)");
+    ui_hint(c, "color on the Personalization tab.");
 }
 
 static void tab_dock(uictx *c)
@@ -1541,6 +1966,9 @@ static void build_tab(uictx *c)
     case TAB_TIME:
         tab_time(c);
         break;
+    case TAB_TYPOGRAPHY:
+        tab_typography(c);
+        break;
     case TAB_BAR:
         tab_bar(c);
         break;
@@ -1570,6 +1998,21 @@ static void build_tab(uictx *c)
         break;
     case TAB_LAUNCHER:
         tab_launcher(c);
+        break;
+    case TAB_DEFAULT_APPS:
+        tab_default_apps(c);
+        break;
+    case TAB_LOCALE:
+        tab_locale(c);
+        break;
+    case TAB_SYSTEM:
+        tab_system(c);
+        break;
+    case TAB_OSD:
+        tab_osd(c);
+        break;
+    case TAB_THEME_COLORS:
+        tab_theme_colors(c);
         break;
     case TAB_POWER:
         tab_power(c);
@@ -1671,9 +2114,15 @@ static void draw_sidebar(dc_settings *s, NVGcontext *vg, const dc_theme *t)
     nvgFillColor(vg, tc(t->surface_text));
     nvgText(vg, x0 + 16.0f, DC_SET_PAD + 28.0f, "Settings", NULL);
 
-    const float item_h = 42.0f, top = DC_SET_PAD + 56.0f, mx = x0 + 8.0f, mw = w - 16.0f;
+    const float item_h = DC_SIDEBAR_ITEM_H, top = sidebar_body_top(s), mx = x0 + 8.0f,
+                mw = w - 16.0f;
+    float sb_top = sidebar_body_top(s), sb_h = sidebar_body_height(s);
+    nvgSave(vg);
+    nvgScissor(vg, x0, sb_top, w, sb_h);
     for (int i = 0; i < TAB_COUNT; i++) {
-        float y = top + i * item_h;
+        float y = top + i * item_h - s->sidebar_scroll_y;
+        if (y + item_h < sb_top || y > sb_top + sb_h)
+            continue; /* scrolled out of the visible sidebar range */
         bool active = i == s->active_tab;
         if (active) {
             nvgBeginPath(vg);
@@ -1689,6 +2138,22 @@ static void draw_sidebar(dc_settings *s, NVGcontext *vg, const dc_theme *t)
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, active ? tc(t->primary) : tc(t->surface_text));
         nvgText(vg, mx + 36.0f, y + item_h / 2.0f, TABS[i].label, NULL);
+    }
+    nvgRestore(vg);
+
+    /* Scrollbar hint, same visual language as the content pane's (s_render
+     * below) -- only drawn when the tab list actually overflows. */
+    float smax = sidebar_scroll_max(s);
+    if (smax > 0.0f) {
+        float track_x = x0 + w - 5.0f;
+        float thumb_h = sb_h * (sb_h / sidebar_items_total_h());
+        if (thumb_h < 20.0f)
+            thumb_h = 20.0f;
+        float thumb_y = sb_top + (sb_h - thumb_h) * (s->sidebar_scroll_y / smax);
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, track_x, thumb_y, 3.0f, thumb_h, 1.5f);
+        nvgFillColor(vg, tc_a(t->outline, 120));
+        nvgFill(vg);
     }
 }
 
@@ -1875,6 +2340,27 @@ static void s_show(dc_settings *s, dc_output *output)
     s->egl_ready = false;
     s->scroll_y = 0;
     s->content_h = 0;
+    /* Scroll the (now 20-tab) sidebar so the initially-selected tab is
+     * visible -- matters for DANKC_SETTINGS_TAB screenshot verification of
+     * tabs low in the list (logical_height is already DC_SET_HEIGHT at this
+     * point; it's only overridden once the first configure event arrives). */
+    {
+        float item_h = DC_SIDEBAR_ITEM_H;
+        float body_h = (float)s->logical_height - DC_SET_PAD - 8.0f - DC_SIDEBAR_ITEMS_TOP;
+        float total_h = TAB_COUNT * item_h;
+        float max_scroll = total_h - body_h;
+        if (max_scroll < 0.0f)
+            max_scroll = 0.0f;
+        float iy = s->active_tab * item_h;
+        if (iy < s->sidebar_scroll_y)
+            s->sidebar_scroll_y = iy;
+        else if (iy + item_h > s->sidebar_scroll_y + body_h)
+            s->sidebar_scroll_y = iy + item_h - body_h;
+        if (s->sidebar_scroll_y > max_scroll)
+            s->sidebar_scroll_y = max_scroll;
+        if (s->sidebar_scroll_y < 0.0f)
+            s->sidebar_scroll_y = 0.0f;
+    }
     s->focus_field = 0;
     s->edit_buf[0] = '\0';
     s->test_clicks_done = false;
@@ -1976,10 +2462,24 @@ struct wl_surface *dc_settings_surface(dc_settings *s)
     return s->surface;
 }
 
-void dc_settings_handle_scroll(dc_settings *s, int steps_v)
+/* `x` (surface-local, same space as dc_settings_handle_click) picks which
+ * pane the wheel scrolls: over the sidebar it scrolls the (now 20-tab) tab
+ * list, otherwise the active tab's content, matching the two independently-
+ * scrollable regions drawn by s_render()/draw_sidebar(). */
+void dc_settings_handle_scroll(dc_settings *s, double x, int steps_v)
 {
     if (!s->visible || s->closing)
         return;
+    if (x >= DC_SET_PAD && x <= DC_SET_PAD + DC_SIDEBAR_W) {
+        s->sidebar_scroll_y += steps_v * 48.0f;
+        float smax = sidebar_scroll_max(s);
+        if (s->sidebar_scroll_y > smax)
+            s->sidebar_scroll_y = smax;
+        if (s->sidebar_scroll_y < 0)
+            s->sidebar_scroll_y = 0;
+        s_render(s);
+        return;
+    }
     s->scroll_y += steps_v * 48.0f;
     float scroll_max = s->content_h - body_height(s);
     if (scroll_max < 0)
@@ -1998,9 +2498,14 @@ void dc_settings_handle_click(dc_settings *s, double x, double y)
 
     /* Sidebar tab switch. */
     if (x >= DC_SET_PAD && x <= DC_SET_PAD + DC_SIDEBAR_W) {
-        const float item_h = 42.0f, top = DC_SET_PAD + 56.0f;
+        const float item_h = DC_SIDEBAR_ITEM_H, top = DC_SIDEBAR_ITEMS_TOP;
+        float sb_top = sidebar_body_top(s), sb_h = sidebar_body_height(s);
+        if (y < sb_top || y > sb_top + sb_h)
+            return; /* click on the header/outside the scrolled tab list */
         for (int i = 0; i < TAB_COUNT; i++) {
-            float iy = top + i * item_h;
+            float iy = top + i * item_h - s->sidebar_scroll_y;
+            if (iy + item_h < sb_top || iy > sb_top + sb_h)
+                continue; /* scrolled out of view */
             if (y >= iy && y <= iy + item_h) {
                 commit_edit(s);
                 if (i != s->active_tab) {
@@ -2115,5 +2620,7 @@ void dc_settings_destroy(dc_settings *s)
         return;
     if (s->visible)
         s_teardown(s);
+    if (s->apps)
+        dc_apps_destroy(s->apps);
     free(s);
 }

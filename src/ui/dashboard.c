@@ -719,8 +719,14 @@ static void draw_calendar_card(dc_dashboard *d, float x, float y, float w, float
     nvgFillColor(vg, tc(t->surface_text));
     nvgText(vg, x + w / 2.0f, hdr_y, title, NULL);
 
-    /* Weekday header + day grid, 7 columns. */
+    /* Weekday header + day grid, 7 columns. Column 0 starts at the config's
+     * first_day_of_week (docs/14-COMPLETION-PLAN.md W2 "Locale" tab; 0=Sunday
+     * .. 6=Saturday, same tm_wday numbering), defaulting to Sunday so this
+     * matches the previous hardcoded layout when unset. */
     static const char *dow[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    int fdow = dc_config_current->first_day_of_week;
+    if (fdow < 0 || fdow > 6)
+        fdow = 0;
     const float grid_x = x + pad;
     const float grid_w = w - 2.0f * pad;
     const float col_w = grid_w / 7.0f;
@@ -728,14 +734,14 @@ static void draw_calendar_card(dc_dashboard *d, float x, float y, float w, float
     nvgFontSize(vg, 12.0f);
     for (int c = 0; c < 7; c++) {
         nvgFillColor(vg, tc(t->surface_variant_text));
-        nvgText(vg, grid_x + col_w * ((float)c + 0.5f), dow_y, dow[c], NULL);
+        nvgText(vg, grid_x + col_w * ((float)c + 0.5f), dow_y, dow[(c + fdow) % 7], NULL);
     }
 
     /* First weekday + day count of the displayed month. */
     struct tm first = disp;
     first.tm_mday = 1;
     mktime(&first);
-    int start_dow = first.tm_wday; /* 0=Sun */
+    int start_dow = (first.tm_wday - fdow + 7) % 7; /* column offset for day 1 */
     int mon = disp.tm_mon;
     struct tm probe = disp;
     int days_in_month = 0;
