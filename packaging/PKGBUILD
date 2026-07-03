@@ -30,4 +30,6 @@ build() {
 
 package() {
   meson install -C build --destdir "$pkgdir"
+  # T1.3: strip the installed binary to reduce disk footprint (debug_info only, no RAM impact)
+  strip "$pkgdir/usr/local/bin/dankc" || strip "$pkgdir/usr/bin/dankc" 2>/dev/null || true
 }
