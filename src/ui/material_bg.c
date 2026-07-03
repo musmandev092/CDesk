@@ -8,6 +8,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "nanovg.h"
 
@@ -181,7 +182,13 @@ static int ensure_image(dc_render *render)
         nvgDeleteImage(cached_vg, cached_image);
     cached_image = 0;
 
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     int img = build_image(render, cfg->wallpaper);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+    dc_debug("material bg: built from %s in %.1fms (image=%d)", cfg->wallpaper, ms, img);
+
     cached_vg = render->vg;
     snprintf(cached_path, sizeof(cached_path), "%s", cfg->wallpaper);
     if (img <= 0) {

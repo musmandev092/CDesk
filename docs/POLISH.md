@@ -22,12 +22,27 @@ Reference DMS live (it's running): read its QML at
 - **Fonts**: confirm Inter weight ramp (400/500/600) + FiraCode for mono; DMS
   font sizes 12/14/16/20. render/nvg.c currently loads one Inter face.
 
-## P2 — Material background + frame (DMS signature look)
-- **Blurred wallpaper "material" background** behind panels (DMS BlurService,
-  3-layer, wp_* shaders, 1000ms InOutCubic transitions). Panels are currently
-  transparent-over-wallpaper; add the blur layer. docs/11 §material bg.
-- **Rounded screen corners** (DMS Frame): overlay layer drawing screen-corner
-  radius. New ui/frame.c.
+## P2 — Material background + frame (DMS signature look) — DONE 2026-07-03 (wt/frame)
+- ~~**Rounded screen corners** (DMS Frame)~~ ✅ new `ui/frame.c/.h`: one
+  click-through layer-shell overlay per output (Top layer, anchor all edges,
+  zero exclusive zone, empty input region) painting 4 opaque black
+  rect-minus-rounded-hole corner "bites"; repainted only on configure/config
+  change, never per-frame. Config `frameEnabled` (default off, matches DMS)
+  + `frameRadius` (default 12, docs/10 base cornerRadius token — not DMS's
+  separate connected-chrome `frameRounding`=23, which dankc doesn't
+  implement). Simplified vs. DMS's full connected-chrome Frame system
+  (docs/11 §4) — corner-rounding only, no bar/popout/dock fusion.
+- ~~**Blurred wallpaper "material" background** behind panels~~ ✅ new
+  `ui/material_bg.c/.h`: decodes the configured wallpaper once, box-samples
+  it down ~1/8 (capped 200px) + two box-blur passes, caches as one
+  process-wide nvg image; `dc_material_bg_fill_card()` stretches it into a
+  panel's rounded card rect with a themed scrim on top, falling back to the
+  flat surfaceContainer fill when disabled/no wallpaper/decode failure.
+  Wired into dashboard, control center, launcher, settings, notification
+  center (all 5 popout cards). Config `materialBlur` (default on). CPU
+  approximation of DMS's compositor-blur BlurredWallpaperBackground
+  (docs/11 §2) — simpler and cheaper, no 3-layer background surface or
+  wp_* transition shaders.
 
 ## P3 — Bar polish — DONE 2026-07-02 (S1–S6, see docs/12-BAR-SPEC.md)
 - ~~Hover states~~ ✅ (tooltips: DMS bar pills mostly have none — matched behavior).
