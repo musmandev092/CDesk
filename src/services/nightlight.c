@@ -60,6 +60,12 @@ static pid_t g_child_pid = -1; /* the backend process WE forked, -1 if none */
 
 /* --- backend probe ---------------------------------------------------------- */
 
+/* NOTE: uses system(), which needs a working waitpid() internally -- it
+ * gives wrong answers if called after the process has set SIGCHLD to
+ * SIG_IGN (the child is auto-reaped before system() can collect its exit
+ * status, so it looks like the command failed even when it exists). Callers
+ * must make sure dc_nightlight_backend_get() runs (and caches its result)
+ * before main.c's `signal(SIGCHLD, SIG_IGN)` -- see the call site there. */
 static bool have_cmd(const char *name)
 {
     char cmd[128];

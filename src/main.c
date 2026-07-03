@@ -947,6 +947,17 @@ int main(int argc, char **argv)
     dc_net_init(dbus);
     dc_mpris_init(dbus);
     dc_power_init(dbus);
+    /* Probe the Night Light backend (wlsunset/gammastep/none) here, BEFORE
+     * signal(SIGCHLD, SIG_IGN) below -- dc_nightlight_backend_get() shells
+     * out via system("command -v ...") to detect it, and system(3)'s
+     * internal waitpid() breaks once SIGCHLD is SIG_IGN (the child gets
+     * auto-reaped out from under it, so system() can't retrieve the exit
+     * status and reports "not found" even when the binary exists -- bit us
+     * during verification). The cached result is reused by
+     * dc_nightlight_init() further down, which only forks the actual
+     * long-lived backend child via raw fork()+execvp (no waitpid needed,
+     * matching every other detached spawn in this file). */
+    dc_nightlight_backend_get();
     dc_notifications *notifications = dc_notifications_create(dbus);
     dc_tray *tray = dc_tray_create(dbus);
 
