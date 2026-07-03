@@ -249,3 +249,188 @@ fonts)** — it alone accounts for ~20 of the ~23 MB Pss reduction. RSS below
 ~150 MB is not reachable without leaving Mesa GLES (out of scope). Idle CPU and
 idle GPU are already effectively optimal from P7; Wave 2 improves them at the
 margin (fewer forks) rather than in the aggregate percentage.
+
+---
+
+## Deep-dive addendum (2026-07-03) — chasing a bigger win than Wave 1
+
+T1.1 (mmap fonts), T1.3 (strip), and T2.3 (audio cache widen) are now merged to
+main (`7f36d58`, `d4e2b23`, `3d10033`). This addendum re-measures the *current*
+main build (own PID, nested niri on the live session, real `iris` hardware
+node, idle bar, 10+ s settle) and then goes after every lever Wave 3 deferred
+or the first pass dismissed too quickly — Vulkan/ANV, EGL device-selection
+tricks, jemalloc/tcmalloc, and a byte-level re-audit of what's left in the
+heap. Verdict up front: **nothing found beats T1.1, and three of the four
+"aggressive" levers are dead ends for a documented, measured reason.**
+
+### Current baseline (post-T1.1, main @ `7f36d58`)
+
+3 samples, flat, idle bar, nested niri on real Intel/iris:
+
+| Metric | Value |
+|---|---:|
+| VmRSS | **161.6 MB** |
+| Pss | **~39 MB** (36.4–39.4 MB across samples — within the same noise band P8 already documented) |
+| Private_Dirty | **19.0 MB** |
+| Private_Clean | 1.4 MB |
+| Shared_Clean | **141.1 MB** |
+| `[heap]` | 11.4 MB, 100 % Private_Dirty (down from 31.9 MB pre-T1.1 — confirms the merged win) |
+| Pure-anon non-heap (GL/EGL scratch, nanovg VBOs, 38 small VMAs) | **2.8 MB total** — no region over ~1 MB |
+| Threads | 5 |
+
+This matches the shipped commit's own note (`cf91f8c`: "Pss −18.9 MB (55→36)")
+to within measurement noise. **T1.1 already banked the only double-digit-MB
+win available in this codebase.**
+
+### 1. Shared vs private — the reframing, verified two ways
+
+The existing plan already flagged Pss over RSS as "the honest number." This
+pass goes one step further and checks whether even *Pss* overstates dankc's
+true marginal cost, by testing the shared pages against **niri's own
+process**, not just smaps bookkeeping:
+
+- `grep libLLVM /proc/<niri-pid>/maps` on **both** the nested test compositor
+  and the real outer `niri --session` (PID 1048): both map `libLLVM.so.22.1`
+  and `libgallium-26.1.3.so` **independently of dankc**.
+- Diffed the full library list dankc maps against niri's own maps: of ~30
+  shared objects (libc, libstdc++, libEGL_mesa, libgallium, **libLLVM**,
+  libicudata/uc, libharfbuzz, libfreetype, libfontconfig, libxkbcommon,
+  libGLdispatch, libxml2, libX11, libSPIRV-Tools, libexpat, libpng16,
+  libdrm_intel, libxcb, libz, libgcc_s, libelf, …), **every one of them is
+  already mapped by niri itself** — the only dankc-unique shared-file mappings
+  are its own 4 non-Latin fallback fonts (CJK/Devanagari/Arabic + the two
+  bundled UI/emoji faces) and `libaudit`.
+- Killed the dankc test client while leaving the (otherwise idle) nested niri
+  running: niri's own `libLLVM`/`libgallium` mapping count was **unchanged**
+  after the client disconnected. niri needs Mesa/GLES for its own compositing
+  regardless of any client.
+
+**Conclusion: the ~121 MB of Shared_Clean Mesa/library pages are not just
+"shared" in the smaps bookkeeping sense (mapcount > 1) — they are pages niri
+was going to hold resident anyway.** If dankc did not exist, that memory would
+still be paid by the system the moment niri starts. So even Pss (39 MB), which
+is *supposed* to be the fair per-process share, overstates dankc's true
+marginal cost: Pss still allocates dankc a "fair share" of pages that would be
+100% on niri's tab in a dankc-less world. **The genuinely marginal,
+attributable-to-dankc cost is closer to Private_Dirty + Private_Clean ≈ 19–20
+MB** — the memory that appears *only because dankc is running* and would be
+freed *and not re-absorbed by anything else* if dankc quit. RSS (161.6 MB) is
+mostly not real in any accounting sense that matters for "what does running
+dankc cost me on this desktop"; even Pss (39 MB) is generous. The number to
+actually optimize is the ~19–20 MB private figure, and T1.1 already took that
+from ~40 MB to ~19 MB.
+
+### 2. LLVM-free render path (Vulkan/ANV) — REJECT
+
+- The vendored nanovg (`third_party/nanovg/`) has **no Vulkan backend** —
+  only `nanovg_gl.h`/`nanovg_gl_impl.c`. Getting an LLVM-free render path means
+  either porting to a community nanovg-Vulkan fork or hand-rolling a custom 2D
+  renderer over ANV. That's a render-layer rewrite, not a tuning pass —
+  effort **XL**, high regression risk (every panel/animation/blur path
+  retested).
+- Even granting the rewrite were done: built and ran a **from-scratch EGL
+  test program** (`/tmp/egl_device_test.c`) that does the most minimal
+  possible GLES init — `EGL_PLATFORM_DEVICE_EXT` directly against
+  `/dev/dri/renderD128`, no Wayland platform, no window, no swrast fallback
+  path involved at all. The instant `eglCreateContext(GLES3)` succeeds,
+  `libLLVM.so` and `libgallium-*.so` are mapped (confirmed via
+  `/proc/<pid>/maps`) — proving LLVM is pulled in by the **iris driver itself**
+  (NIR→LLVM shader compilation), not by any enumeration/fallback path a
+  Vulkan rewrite could dodge.
+- And per finding #1: niri keeps libLLVM+libgallium resident **regardless**
+  of what dankc does. A Vulkan rewrite of dankc would not free a single page
+  of that ~121 MB system-wide — niri still needs it. It would only *reduce
+  dankc's own Pss line* by reassigning its "fair share" of those pages to
+  niri's Pss column — a pure accounting shift with **zero actual system RAM
+  freed**.
+- **Verdict: REJECT.** Large effort, high risk, and the honest payoff is a
+  cosmetic ~20 MB drop in dankc's own Pss reading with **0 MB saved
+  system-wide**. Not worth pursuing.
+
+### 3. EGL device selection to dodge llvmpipe — REJECT (there is nothing to dodge)
+
+- Confirmed via `/proc/<pid>/maps` that Arch's Mesa ships **one unified
+  megadriver `.so`** (`libgallium-26.1.3-arch1.2.so`) containing iris,
+  llvmpipe, zink, etc. all compiled into the same binary, dispatched at
+  runtime — there is no separate `swrast_dri.so`/`libllvmpipe.so` mapped
+  alongside it to avoid loading. `grep -i 'swrast\|llvmpipe\|softpipe'` on a
+  live dankc process returns nothing (confirms dankc already only touches the
+  hardware iris path, matching the original P8 baseline note).
+- The device-selection EGL test in #2 also answers this directly: explicit
+  device binding still loads the exact same libLLVM + libgallium regardless of
+  platform (`EGL_PLATFORM_DEVICE_EXT` vs `EGL_PLATFORM_WAYLAND_KHR`) — Mesa's
+  driver loader dlopens the megadriver for the GPU, full stop, independent of
+  how EGL was asked to find the display.
+- **Verdict: REJECT.** No configuration of EGL init changes what gets mapped;
+  this was already effectively answered by T3.1's speculation but is now
+  measured, not assumed.
+
+### 4. Remaining private-memory levers (atlas / buffers / FreeType cache) — mostly DONE, residual DEFER
+
+- `[heap]` is now 11.4 MB (was 31.9 MB pre-T1.1) — no further mmap-able chunk
+  left; this is genuinely small application state now (nanovg atlas, cmap
+  coverage tables, cJSON config, app index, service caches — as the original
+  doc predicted).
+- Walked every non-heap anonymous VMA (38 total, 2.8 MB combined): the two
+  largest (972 KB, 816 KB) are **not** dankc buffers — they're glibc/ld.so
+  bss-continuation pages sitting immediately after `libicuuc.so` and
+  `libLLVM.so`'s data segments (linker/loader artifacts). No oversized nanovg
+  glyph atlas, no leaked per-panel buffer, no duplicated back-buffer found.
+  `anon_inode:i915.gem` (GPU dma-buf) entries are also small (~128 KB range).
+- **Verdict: DEFER.** T1.1 already captured the only big number here.
+  Whatever remains in the 11.4 MB heap is diffuse (many small allocations,
+  not one big culprit) — shaving it further would need a real `malloc`-hook
+  trace (unavailable on this host: `perf_event_paranoid=2`, no BPF) for
+  maybe 1–3 MB at disproportionate effort. Not worth prioritizing over the
+  Wave 2 backlog.
+
+### 5. Malloc allocator swap (jemalloc / tcmalloc) — REJECT, measured
+
+Same binary, same nested-niri harness, `LD_PRELOAD`, 10+ s settle, 3 samples
+each (glibc baseline re-quoted from above):
+
+| Allocator | Rss | Pss | Private_Dirty | Δ Pss vs glibc |
+|---|---:|---:|---:|---:|
+| **glibc (baseline)** | 161.5 MB | 39.3 MB | 19.0 MB | — |
+| **jemalloc** (`libjemalloc.so.2`) | 161.8 MB | 39.2 MB | 18.6 MB | **−0.1 MB (noise)** |
+| **tcmalloc_minimal** (`libtcmalloc_minimal.so.4`) | 191.2 MB | 68.9 MB | 48.4 MB | **+29.5 MB (+75 %, WORSE)** |
+
+- jemalloc: statistically neutral. Makes sense — post-T1.1 the heap is only
+  ~11 MB of diffuse small allocations; there's no fragmentation/arena problem
+  large enough for a smarter allocator to reclaim anything material.
+- tcmalloc_minimal: **actively regresses memory by ~30 MB.** tcmalloc reserves
+  per-thread caches, size-class spans, and a central pagemap up front,
+  independent of actual live-object size — overhead that dominates for a
+  small, mostly single-threaded process like dankc. This directly contradicts
+  the intuition that "a better allocator always helps"; measured, it's the
+  single worst thing tried in this whole investigation.
+- **Verdict: REJECT.** Do not LD_PRELOAD any alternate allocator. glibc's
+  default is already at or near the floor for this workload's allocation
+  profile.
+
+### Revised honest target
+
+| | RSS (headline) | Pss (smaps fair-share) | **True marginal cost** |
+|---|---:|---:|---:|
+| Current (post-T1.1) | 161.6 MB | ~39 MB | **~19–20 MB** (Private_Dirty+Clean) |
+| Realistically reducible to | ~161 MB (unchanged — Mesa stays resident regardless) | ~37–38 MB (T2.1 lazy-load trims a little more) | **~17–18 MB** |
+| Hard floor without leaving Mesa/GLES (out of scope, and per #2 wouldn't help anyway) | ~150 MB | ~35 MB | ~15 MB |
+
+**The RSS number (161.6 MB / originally reported as up to 176 MB) is 87 %
+shared-noise — Shared_Clean pages niri holds resident independent of dankc.**
+It is real physical RAM in the sense that it's mapped and touched, but it is
+**not dankc's cost**: it would be paid by the system the instant niri starts,
+with or without dankc. Pss (~39 MB) is the standard "honest" per-process
+number and is a reasonable one to publish, but this deep-dive shows it is
+*still* generous by ~20 MB, because it fair-shares pages niri would hold
+regardless. **The number that actually moves when you change dankc's code is
+Private_Dirty+Clean, currently ~19–20 MB, and T1.1 is responsible for
+essentially all of the reduction achieved so far** (~40 MB → ~19 MB).
+
+No lever investigated in this pass — Vulkan/ANV, EGL device tricks, malloc
+swap — moves that number further. All three are rejected with a measured
+reason, not a guess. The only realistically remaining moves are the Wave 2
+items already in the backlog (T2.1 lazy fallback fonts, T2.2 NM D-Bus) and
+those are fork-count/CPU wins, not memory wins. **Pss ~39 MB / true marginal
+~19–20 MB is at or very near the floor for a Mesa-GLES nanovg client on this
+stack.**
