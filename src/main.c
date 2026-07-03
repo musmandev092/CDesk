@@ -449,6 +449,17 @@ static void control_dispatch(const char *cmd, void *data)
         dc_keybinds_modal_toggle(c->keybinds_modal, out);
     else if (strcmp(cmd, "unlock") == 0 && getenv("DANKC_LOCK_ESCAPE"))
         dc_lock_force_unlock(c->lock); /* testing-only, env-gated */
+    else if (strncmp(cmd, "cc-click ", 9) == 0 && getenv("DANKC_CC_TEST_CLICK")) {
+        /* TEMP(verify-only): inject a click at surface-local (x,y) into the
+         * control center directly, bypassing the real pointer pipeline --
+         * ydotool's absolute coordinates proved unreliable against this
+         * multi-output/mixed-DPI desktop (see memory
+         * dankc-input-synthesis-ydotool.md). "ctl cc-click <x> <y>". Not part
+         * of the shipped diff. */
+        double cx = 0, cy = 0;
+        if (sscanf(cmd + 9, "%lf %lf", &cx, &cy) == 2)
+            dc_control_center_handle_click(c->control_center, cx, cy);
+    }
     else if (strcmp(cmd, "screenshot") == 0)
         /* Full screen -> ~/Pictures + clipboard (needs grim + wl-copy). */
         run_sh("f=\"${XDG_PICTURES_DIR:-$HOME/Pictures}/screenshot-$(date +%Y%m%d-%H%M%S).png\"; "

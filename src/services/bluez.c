@@ -318,6 +318,28 @@ bool dc_bluez_read(dc_bluez_info *out)
         out->available = true;
     }
 
+    /* TEMP(verify-only, docs/18-WIFI-BT-PLAN.md UI verification): a second
+     * synthetic *paired* device with a battery %, so the control center's
+     * row polish (device-type icon, battery label, trust/remove icons) can
+     * be screenshotted on this machine (real hci0 exists but has no paired
+     * devices, and the DANKC_BT_FAKE_DEVICE fixture above is unpaired-only
+     * by design). Reverted before this branch is done -- not part of the
+     * shipped diff. */
+    const char *fake_paired = getenv("DANKC_BT_FAKE_PAIRED_DEVICE");
+    if (fake_paired && fake_paired[0] && out->device_count < DC_BLUEZ_MAX_DEVICES) {
+        dc_bluez_device *d = &out->devices[out->device_count];
+        memset(d, 0, sizeof(*d));
+        snprintf(d->mac, sizeof(d->mac), "AA:BB:CC:DD:EE:FF");
+        snprintf(d->name, sizeof(d->name), "%s", fake_paired);
+        d->paired = true;
+        d->connected = true;
+        d->trusted = true;
+        d->battery_percent = 67;
+        snprintf(d->icon, sizeof(d->icon), "audio-headset");
+        out->device_count++;
+        out->available = true;
+    }
+
     bluez_test_log_if_changed(out);
     return out->available;
 }

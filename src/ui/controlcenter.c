@@ -1756,6 +1756,9 @@ static void cc_render(dc_control_center *cc)
                                 st.expand_rows, cc_find_pw_row(cc, &st), st.bt_agent_kind,
                                 net_row_saved, bt_row_paired);
 
+    dc_info("TEMPDBG cc_render: logical_width=%d net_expanded=%d bt_expanded=%d expand_kind=%d "
+           "expand_rows=%d total_h=%f", cc->logical_width, cc->net_expanded, cc->bt_expanded,
+           l.expand_kind, l.expand_rows, (double)l.total_h);
     int desired_h = (int)ceilf(l.total_h);
     if (desired_h != cc->logical_height && cc->layer_surface) {
         cc->logical_height = desired_h;
@@ -2404,6 +2407,9 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
      * inside the wifi/bluetooth tile's own bounds (top-right corner). Only
      * one panel is ever open: picking one closes the other and clears any
      * pending password hint. */
+    dc_info("TEMPDBG click x=%f y=%f wifi_cx=%f wifi_cy=%f bt_cx=%f bt_cy=%f r=%f", x, y,
+           (double)l.wifi_chevron_cx, (double)l.wifi_chevron_cy, (double)l.bt_chevron_cx,
+           (double)l.bt_chevron_cy, (double)l.chevron_r);
     {
         double dx = x - (double)l.wifi_chevron_cx, dy = y - (double)l.wifi_chevron_cy;
         if (dx * dx + dy * dy <= (double)(l.chevron_r * l.chevron_r)) {
