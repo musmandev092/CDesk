@@ -20,6 +20,7 @@
 #include "services/logind.h"
 #include "services/mpris.h"
 #include "services/net.h"
+#include "services/nightlight.h"
 #include "services/notifications.h"
 #include "services/polkit.h"
 #include "services/power.h"
@@ -465,9 +466,11 @@ static void control_dispatch(const char *cmd, void *data)
         run_sh("g=$(slurp -p) || exit; px=$(grim -g \"$g\" -t ppm - | tail -c3 | od -An -tu1); "
                "set -- $px; printf '#%02x%02x%02x' \"$1\" \"$2\" \"$3\" | wl-copy");
     else if (strcmp(cmd, "night") == 0)
-        /* Toggle a warm night filter (gammastep one-shot). */
-        run_sh("if pgrep -x gammastep >/dev/null; then pkill -x gammastep; "
-               "else gammastep -O 4000 >/dev/null 2>&1 & fi");
+        /* Night Light on/off, routed through services/nightlight.c (docs/19-
+         * SETTINGS-COMPLETENESS-PLAN.md sec.4) -- replaces the old
+         * pgrep/pkill/gammastep-O-4000 one-shot. Persists + re-applies the
+         * configured temperature/schedule instead of a hardcoded 4000K. */
+        dc_nightlight_toggle();
     else if (strcmp(cmd, "quit") == 0)
         dc_loop_stop(g_loop);
     else
@@ -1023,6 +1026,17 @@ int main(int argc, char **argv)
     dc_net_init(dbus);
     dc_mpris_init(dbus);
     dc_power_init(dbus);
+    /* Probe the Night Light backend (wlsunset/gammastep/none) here, BEFORE
+     * signal(SIGCHLD, SIG_IGN) below -- dc_nightlight_backend_get() shells
+     * out via system("command -v ...") to detect it, and system(3)'s
+     * internal waitpid() breaks once SIGCHLD is SIG_IGN (the child gets
+     * auto-reaped out from under it, so system() can't retrieve the exit
+     * status and reports "not found" even when the binary exists -- bit us
+     * during verification). The cached result is reused by
+     * dc_nightlight_init() further down, which only forks the actual
+     * long-lived backend child via raw fork()+execvp (no waitpid needed,
+     * matching every other detached spawn in this file). */
+    dc_nightlight_backend_get();
     dc_notifications *notifications = dc_notifications_create(dbus);
     dc_tray *tray = dc_tray_create(dbus);
 
@@ -1209,6 +1223,13 @@ int main(int argc, char **argv)
      * process in this file already is. */
     dc_audio_init(g_loop);
 
+    /* Night Light (docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.4,
+     * services/nightlight.c): re-apply the persisted enabled/temp/schedule
+     * state. Placed after SIGCHLD=SIG_IGN above so the backend child it may
+     * fork here is reaped the same way every other fire-and-forget process
+     * in this file is -- same reasoning as dc_audio_init() just above. */
+    dc_nightlight_init();
+
     /* TEMP(verify): auto-open a popup to screenshot it. */
     if (getenv("DANKC_CC_DEMO") || getenv("DANKC_OSD_DEMO")) {
         dc_output *first = NULL;
@@ -1323,6 +1344,10 @@ int main(int argc, char **argv)
     dc_loop_run(g_loop);
 
     dc_info("shutting down");
+    /* Kill our own Night Light backend child (if any) and restore neutral
+     * gamma -- don't leave the user's screen tinted just because dankc
+     * quit. Only ever touches the pid we ourselves forked. */
+    dc_nightlight_shutdown();
     dc_polkit_destroy(polkit);
     dc_polkit_modal_destroy(polkit_modal);
     dc_logind_destroy(logind);

@@ -38,6 +38,14 @@ static dc_config config = {
     .weather_fahrenheit = false,
     .weather_location = "New York",
 
+    /* Night Light (services/nightlight.c): off by default, matching the old
+     * toggle's off-at-startup behavior; 4000K matches the old hardcoded
+     * one-shot value so upgrading doesn't change anyone's expectation of
+     * what "on" looks like. Schedule 0 = manual/fixed. */
+    .nightlight_enabled = false,
+    .nightlight_temp = 4000,
+    .nightlight_schedule_mode = 0,
+
     /* User's live DMS layout (docs/12-BAR-SPEC.md sec.0). */
     .bar_left_widgets = {"launcherButton", "workspaceSwitcher", "focusedWindow"},
     .bar_left_widgets_n = 3,
@@ -320,6 +328,12 @@ void dc_config_load(void)
     get_bool(root, "weatherFahrenheit", &config.weather_fahrenheit);
     get_string(root, "weatherLocation", config.weather_location, sizeof(config.weather_location));
 
+    get_bool(root, "nightlightEnabled", &config.nightlight_enabled);
+    get_int(root, "nightlightTemp", &config.nightlight_temp, 2500, 6500);
+    get_int(root, "nightlightScheduleMode", &config.nightlight_schedule_mode, 0, 2);
+    get_string(root, "nightlightFrom", config.nightlight_from, sizeof(config.nightlight_from));
+    get_string(root, "nightlightTo", config.nightlight_to, sizeof(config.nightlight_to));
+
     get_string_array(root, "barLeftWidgets", config.bar_left_widgets, DC_CONFIG_WIDGETS_MAX,
                      &config.bar_left_widgets_n);
     get_string_array(root, "barCenterWidgets", config.bar_center_widgets, DC_CONFIG_WIDGETS_MAX,
@@ -443,6 +457,14 @@ void dc_config_save(void)
     cJSON_AddBoolToObject(root, "weatherFahrenheit", config.weather_fahrenheit);
     if (config.weather_location[0])
         cJSON_AddStringToObject(root, "weatherLocation", config.weather_location);
+
+    cJSON_AddBoolToObject(root, "nightlightEnabled", config.nightlight_enabled);
+    cJSON_AddNumberToObject(root, "nightlightTemp", config.nightlight_temp);
+    cJSON_AddNumberToObject(root, "nightlightScheduleMode", config.nightlight_schedule_mode);
+    if (config.nightlight_from[0])
+        cJSON_AddStringToObject(root, "nightlightFrom", config.nightlight_from);
+    if (config.nightlight_to[0])
+        cJSON_AddStringToObject(root, "nightlightTo", config.nightlight_to);
 
     add_string_array(root, "barLeftWidgets", config.bar_left_widgets, config.bar_left_widgets_n);
     add_string_array(root, "barCenterWidgets", config.bar_center_widgets,
