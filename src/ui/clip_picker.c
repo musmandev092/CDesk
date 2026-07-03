@@ -21,6 +21,13 @@
 
 #include <xkbcommon/xkbcommon-keysyms.h>
 
+/* Declarations only (implementation lives once in third_party/nanovg/nanovg.c,
+ * same convention as services/clipboard.c) -- used to decode+downscale
+ * thumbnails ourselves instead of nvgCreateImageMem's full-resolution
+ * texture, so a multi-megapixel screenshot doesn't become a multi-megapixel
+ * GL texture just to show a 96px row thumbnail. */
+#include "stb_image.h"
+
 #include "fractional-scale-v1-client-protocol.h"
 #include "nanovg.h"
 #include "viewporter-client-protocol.h"
@@ -52,6 +59,10 @@
 #define DC_CP_ROW_GAP 8.0f
 #define DC_CP_THUMB_W 56.0f
 #define DC_CP_THUMB_H 48.0f
+/* Decoded-thumbnail texture cap (longest side, px) -- task: "downscale to
+ * ~96px" so the GL texture stays small regardless of the source image's
+ * resolution. */
+#define DC_CP_THUMB_MAX_PX 96
 
 #define DC_CP_MAX_ENTRIES 32 /* mirrors DC_CLIP_MAX in services/clipboard.c */
 #define DC_CP_QUERY_MAX 128
@@ -320,8 +331,61 @@ static void format_size(size_t bytes, char *out, size_t cap)
         snprintf(out, cap, "%.1f MiB", (double)bytes / (1024.0 * 1024.0));
 }
 
-/* Look up (or lazily decode + cache) the GL texture for an image entry.
- * Returns 0 if decoding failed or the entry isn't an image. */
+/* Box-filter downscale of an RGBA buffer from (sw,sh) to (dw,dh). Every
+ * destination pixel is the average of its source footprint, which for a
+ * large shrink (e.g. a 4000px screenshot down to 96px) looks far better than
+ * nearest-neighbor / lets the GPU's own mip/linear filtering do less work.
+ * Returns a malloc'd dw*dh*4 buffer, or NULL on allocation failure. */
+static unsigned char *downscale_rgba(const unsigned char *src, int sw, int sh, int dw, int dh)
+{
+    unsigned char *dst = malloc((size_t)dw * (size_t)dh * 4);
+    if (!dst)
+        return NULL;
+    for (int y = 0; y < dh; y++) {
+        int sy0 = (int)((int64_t)y * sh / dh);
+        int sy1 = (int)((int64_t)(y + 1) * sh / dh);
+        if (sy1 <= sy0)
+            sy1 = sy0 + 1;
+        if (sy1 > sh)
+            sy1 = sh;
+        for (int x = 0; x < dw; x++) {
+            int sx0 = (int)((int64_t)x * sw / dw);
+            int sx1 = (int)((int64_t)(x + 1) * sw / dw);
+            if (sx1 <= sx0)
+                sx1 = sx0 + 1;
+            if (sx1 > sw)
+                sx1 = sw;
+            long r = 0, g = 0, b = 0, a = 0, n = 0;
+            for (int yy = sy0; yy < sy1; yy++) {
+                const unsigned char *row = src + (size_t)yy * (size_t)sw * 4;
+                for (int xx = sx0; xx < sx1; xx++) {
+                    const unsigned char *px = row + (size_t)xx * 4;
+                    r += px[0];
+                    g += px[1];
+                    b += px[2];
+                    a += px[3];
+                    n++;
+                }
+            }
+            if (n == 0)
+                n = 1;
+            unsigned char *o = dst + ((size_t)y * (size_t)dw + (size_t)x) * 4;
+            o[0] = (unsigned char)(r / n);
+            o[1] = (unsigned char)(g / n);
+            o[2] = (unsigned char)(b / n);
+            o[3] = (unsigned char)(a / n);
+        }
+    }
+    return dst;
+}
+
+/* Look up (or lazily decode + downscale + cache) the GL texture for an image
+ * entry. Returns 0 if decoding failed or the entry isn't an image. Decodes
+ * to full-res RGBA via stb_image, then downscales to DC_CP_THUMB_MAX_PX on
+ * the longest side (task: "downscale to ~96px, nvgCreateImageRGBA lazily")
+ * before uploading, so history entries with large source images (e.g. a
+ * multi-megapixel screenshot) don't each cost a multi-megapixel GL texture
+ * just to render a 56x48 row thumbnail. */
 static int cp_get_thumbnail(dc_clip_picker *p, const dc_clip_entry *e)
 {
     if (e->kind != DC_CLIP_IMAGE || !e->image_data || e->image_len == 0)
@@ -330,15 +394,46 @@ static int cp_get_thumbnail(dc_clip_picker *p, const dc_clip_entry *e)
         if (p->thumbs[i].id == e->id)
             return p->thumbs[i].handle;
 
-    int handle = nvgCreateImageMem(p->render->vg, 0, (unsigned char *)e->image_data,
-                                   (int)e->image_len);
+    int sw = 0, sh = 0, n = 0;
+    unsigned char *img =
+        stbi_load_from_memory(e->image_data, (int)e->image_len, &sw, &sh, &n, 4);
+    if (!img)
+        return 0;
+
+    int dw = sw, dh = sh;
+    int longest = sw > sh ? sw : sh;
+    if (longest > DC_CP_THUMB_MAX_PX) {
+        float scale = (float)DC_CP_THUMB_MAX_PX / (float)longest;
+        dw = (int)((float)sw * scale + 0.5f);
+        dh = (int)((float)sh * scale + 0.5f);
+        if (dw < 1)
+            dw = 1;
+        if (dh < 1)
+            dh = 1;
+    }
+
+    int handle = 0;
+    if (dw == sw && dh == sh) {
+        handle = nvgCreateImageRGBA(p->render->vg, sw, sh, 0, img);
+    } else {
+        unsigned char *small = downscale_rgba(img, sw, sh, dw, dh);
+        if (small) {
+            handle = nvgCreateImageRGBA(p->render->vg, dw, dh, 0, small);
+            free(small);
+        }
+    }
+    stbi_image_free(img);
     if (handle <= 0)
         return 0;
-    if (p->thumb_count < DC_CP_MAX_ENTRIES)
+
+    if (p->thumb_count < DC_CP_MAX_ENTRIES) {
         p->thumbs[p->thumb_count++] = (cp_thumb){.id = e->id, .handle = handle};
-    else
+    } else {
         dc_warn("clip_picker: thumbnail cache full, not caching entry %llu",
                (unsigned long long)e->id);
+        nvgDeleteImage(p->render->vg, handle);
+        return 0;
+    }
     return handle;
 }
 

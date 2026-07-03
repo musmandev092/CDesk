@@ -6,8 +6,10 @@
 #include "wayland/wl.h"
 
 #include <poll.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 /* Declarations only (no STB_IMAGE_IMPLEMENTATION here) -- the implementation
@@ -16,11 +18,13 @@
  * for a cheap PNG/JPEG header parse (width/height, no pixel decode). */
 #include "stb_image.h"
 
+#include "cJSON.h"
+
 #include "wlr-data-control-unstable-v1-client-protocol.h"
 
 #define DC_CLIP_MAX 32
 #define DC_CLIP_TEXT_MAX (64 * 1024)          /* cap a single text entry */
-#define DC_CLIP_IMAGE_MAX (5 * 1024 * 1024)   /* cap a single image entry (docs/13-POPOUTS-SPEC.md sec.4) */
+#define DC_CLIP_IMAGE_MAX (8 * 1024 * 1024)   /* cap a single image entry (task: skip anything bigger) */
 
 #define DC_MIME_UTF8 "text/plain;charset=utf-8"
 #define DC_MIME_TEXT "text/plain"
@@ -77,6 +81,7 @@ struct transfer {
     size_t cap;
     size_t cap_limit;
     bool is_image;
+    bool overflowed; /* image offer exceeded cap_limit -- skip, don't store truncated data */
     char ext[8];
 };
 
@@ -114,6 +119,138 @@ static bool evict_oldest_unpinned(dc_clipboard *c)
            (size_t)(c->count - idx - 1) * sizeof(c->entries[0]));
     c->count--;
     return true;
+}
+
+/* Pinned-text persistence (~/.local/state/dankc/clipboard_pins.json, cJSON).
+ * Only text entries are saved -- images aren't persisted across restarts
+ * (task doc: "document that images don't persist"), so a pinned image
+ * survives eviction for the running session only. */
+static bool pins_path(char *out, size_t n)
+{
+    const char *xdg = getenv("XDG_STATE_HOME");
+    const char *home = getenv("HOME");
+    if (xdg && *xdg)
+        snprintf(out, n, "%.400s/dankc/clipboard_pins.json", xdg);
+    else if (home)
+        snprintf(out, n, "%.400s/.local/state/dankc/clipboard_pins.json", home);
+    else
+        return false;
+    return true;
+}
+
+static void pins_ensure_parent_dir(const char *path)
+{
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (!slash)
+        return;
+    *slash = '\0';
+    char *slash2 = strrchr(dir, '/');
+    if (slash2) {
+        *slash2 = '\0';
+        mkdir(dir, 0755);
+        *slash2 = '/';
+    }
+    mkdir(dir, 0755);
+}
+
+static char *pins_read_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n <= 0 || n > 1 << 20) { /* sanity cap: 1 MiB of pinned text */
+        fclose(f);
+        return NULL;
+    }
+    char *buf = malloc((size_t)n + 1);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    size_t got = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    buf[got] = '\0';
+    return buf;
+}
+
+/* Save every currently-pinned *text* entry, newest-pinned first (same order
+ * dc_clipboard_list() already returns pinned entries in), so a restart can
+ * reconstruct the exact same relative order. */
+static void save_pins(dc_clipboard *c)
+{
+    char path[512];
+    if (!pins_path(path, sizeof(path)))
+        return;
+    pins_ensure_parent_dir(path);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(root, "pins");
+    for (int i = c->count - 1; i >= 0; i--) {
+        struct clip_item *e = &c->entries[i];
+        if (e->pinned && e->kind == DC_CLIP_TEXT && e->text)
+            cJSON_AddItemToArray(arr, cJSON_CreateString(e->text));
+    }
+
+    char *text = cJSON_Print(root);
+    cJSON_Delete(root);
+    if (!text)
+        return;
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fputs(text, f);
+        fputc('\n', f);
+        fclose(f);
+    } else {
+        dc_warn("clipboard: could not write %s", path);
+    }
+    free(text);
+}
+
+/* Load pinned text saved by a previous run and reinsert it as pinned
+ * history entries so it survives the restart. Called once at startup,
+ * before the first live selection arrives. Entries are appended oldest-pin
+ * first so dc_clipboard_list()'s "newest pinned first" pass reproduces the
+ * saved order. */
+static void load_pins(dc_clipboard *c)
+{
+    char path[512];
+    if (!pins_path(path, sizeof(path)))
+        return;
+    char *text = pins_read_file(path);
+    if (!text)
+        return;
+    cJSON *root = cJSON_Parse(text);
+    free(text);
+    if (!root)
+        return;
+    cJSON *arr = cJSON_GetObjectItemCaseSensitive(root, "pins");
+    if (cJSON_IsArray(arr)) {
+        int n = cJSON_GetArraySize(arr);
+        for (int i = n - 1; i >= 0 && c->count < DC_CLIP_MAX; i--) {
+            cJSON *item = cJSON_GetArrayItem(arr, i);
+            if (!cJSON_IsString(item) || !item->valuestring || !item->valuestring[0])
+                continue;
+            char *dup = strdup(item->valuestring);
+            if (!dup)
+                continue;
+            struct clip_item *e = &c->entries[c->count++];
+            memset(e, 0, sizeof(*e));
+            e->id = ++c->next_id;
+            e->kind = DC_CLIP_TEXT;
+            e->pinned = true;
+            e->text = dup;
+            e->text_len = strlen(dup);
+        }
+    }
+    cJSON_Delete(root);
+    if (c->count > 0)
+        dc_info("clipboard: restored %d pinned text entr%s from %s", c->count,
+               c->count == 1 ? "y" : "ies", path);
 }
 
 /* Store `text` as the newest history entry (dedup vs the current newest). */
@@ -187,7 +324,11 @@ static void transfer_finish(struct transfer *t)
 {
     dc_loop_remove_fd(t->c->loop, t->fd);
     close(t->fd);
-    if (t->buf) {
+    if (t->overflowed) {
+        dc_debug("clipboard: image offer exceeds %zu-byte cap, skipping (task: skip >8MB)",
+                t->cap_limit);
+        free(t->buf);
+    } else if (t->buf) {
         if (t->is_image) {
             store_image(t->c, (unsigned char *)t->buf, t->len, t->ext);
             t->buf = NULL; /* ownership moved into store_image() */
@@ -202,20 +343,40 @@ static void transfer_finish(struct transfer *t)
     free(t);
 }
 
-/* Pipe is readable: accumulate until EOF, then store. */
+/* Pipe is readable: accumulate until EOF, then store. Once the buffer has
+ * grown to cap_limit and still can't fit more, a naive "read() returned 0 ==
+ * EOF" check misfires: read() with a 0-byte request also returns 0, which
+ * would otherwise be mistaken for real EOF and silently store a
+ * truncated/corrupt blob for any offer bigger than the cap. Instead, probe
+ * with a real (1-byte) read to tell "exactly cap_limit bytes, true EOF" apart
+ * from "more data follows" -- for images the latter means the whole entry
+ * must be skipped (task: "skip >8MB"), not truncated; text keeps the older
+ * truncate-at-cap behavior since a partial paste is still usable. */
 static void transfer_read(int fd, uint32_t revents, void *data)
 {
     DC_UNUSED(revents);
     struct transfer *t = data;
     for (;;) {
-        if (t->len + 4096 > t->cap) {
+        size_t avail = (t->cap > t->len + 1) ? (t->cap - t->len - 1) : 0;
+        if (avail == 0) {
+            if (t->cap >= t->cap_limit) {
+                if (!t->is_image) { /* text: cap reached, truncate in place */
+                    transfer_finish(t);
+                    return;
+                }
+                char probe;
+                ssize_t pn = read(fd, &probe, 1);
+                if (pn > 0) {
+                    t->overflowed = true;
+                    transfer_finish(t);
+                } else if (pn == 0) { /* true EOF right at the cap */
+                    transfer_finish(t);
+                } /* else EAGAIN: wait for the next POLLIN and probe again */
+                return;
+            }
             size_t ncap = t->cap ? t->cap * 2 : 8192;
             if (ncap > t->cap_limit)
                 ncap = t->cap_limit;
-            if (ncap <= t->len) { /* entry too big -- stop reading */
-                transfer_finish(t);
-                return;
-            }
             char *nb = realloc(t->buf, ncap);
             if (!nb) {
                 transfer_finish(t);
@@ -223,8 +384,9 @@ static void transfer_read(int fd, uint32_t revents, void *data)
             }
             t->buf = nb;
             t->cap = ncap;
+            continue;
         }
-        ssize_t n = read(fd, t->buf + t->len, t->cap - t->len - 1);
+        ssize_t n = read(fd, t->buf + t->len, avail);
         if (n > 0) {
             t->len += (size_t)n;
             continue;
@@ -358,6 +520,7 @@ dc_clipboard *dc_clipboard_create(dc_wayland *wl, struct dc_loop *loop)
     c->device =
         zwlr_data_control_manager_v1_get_data_device(wl->data_control_manager, wl->seat);
     zwlr_data_control_device_v1_add_listener(c->device, &device_listener, c);
+    load_pins(c);
     dc_info("clipboard history watching selection");
     return c;
 }
@@ -469,10 +632,13 @@ void dc_clipboard_delete(dc_clipboard *c, uint64_t id)
     int idx = find_by_id(c, id);
     if (idx < 0)
         return;
+    bool was_pinned_text = c->entries[idx].pinned && c->entries[idx].kind == DC_CLIP_TEXT;
     free_item(&c->entries[idx]);
     memmove(&c->entries[idx], &c->entries[idx + 1],
            (size_t)(c->count - idx - 1) * sizeof(c->entries[0]));
     c->count--;
+    if (was_pinned_text)
+        save_pins(c);
     if (c->cb)
         c->cb(c->cb_data);
 }
@@ -485,6 +651,10 @@ void dc_clipboard_toggle_pin(dc_clipboard *c, uint64_t id)
     if (idx < 0)
         return;
     c->entries[idx].pinned = !c->entries[idx].pinned;
+    dc_debug("clipboard: entry id=%llu %s", (unsigned long long)id,
+            c->entries[idx].pinned ? "pinned" : "unpinned");
+    if (c->entries[idx].kind == DC_CLIP_TEXT)
+        save_pins(c);
     if (c->cb)
         c->cb(c->cb_data);
 }
