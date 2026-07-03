@@ -14,25 +14,21 @@ A lightweight desktop shell for the **niri** Wayland compositor, written in C �
 DankMaterialShell's core (QML/Quickshell + Go) as one native binary. Full spec in `docs/` (00–11).
 niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
 
-## Current status — BACKLOG COMPLETE ✅ (2026-07-03, main @ 189045d)
-Bar + all panels at DMS parity AND the full polish/perf backlog is done. Landed 2026-07-03
-(16 worktree merges, every one make+meson zero-warning, reviewed before merge):
-power menu modal (arm-then-confirm, login1), bar media marquee (DMS 60ms/px bounce),
-dashboard hourly forecast + wallpaper grid browser, notification action buttons + inline
-images, control-center depth (async Wi-Fi scan list, BlueZ device list, media row, live %
-labels), launcher calc/frecency/desktop-actions/paging (tests/test_calc.c 41/41),
-settings tab depth, power profiles (PPD→tuned D-Bus→tuned-adm; battery-popout chips),
-brightness OSD (generalized dc_osd), clipboard image thumbnails + pins + delete (+8MB-cap
-truncation fix), tray click/SecondaryActivate + IconPixmap + dbusmenu popups, auto-hide
-dock (dockEnabled off by default), rounded screen corners (frameEnabled off) + blurred
-material bg behind all 5 panel cards (materialBlur on), P7 perf (bar damage-hash skips
-66-79% idle frames; wpctl forks -69%; icon font subset 14.5MB→244KB via
-scripts/subset-fonts.sh; Pss 77MB vs DMS qs 595MB), HarfBuzz+FriBidi shaping
-(render/shape.c + vendored nvgTextGlyphs; Urdu/Arabic joins correctly incl. U+06C1/U+06D2
-via lang=ur fallback; Latin path byte-identical).
-Remaining (deliberate): T29 plugins (post-v1 by design), light theme variants, true
-HCT/MCU dynamic color, full 424-setting parity. meson source list now matches src (a
-4-file gap had silently broken the meson LINK while `make` stayed green — check BOTH).
+## Current status — STRUCTURE COMPLETE ✅ (2026-07-03, main @ HEAD)
+Bar + all panels at DMS parity, full polish, P7 perf, AND the entire completion plan
+(docs/14-COMPLETION-PLAN.md) done. 13 feature waves merged 2026-07-03 on top of the
+overnight work: power menu, media marquee, dashboard hourly+wallpaper grid, notif
+actions/images + app-grouping/scroll, control-center depth + Wi-Fi password entry +
+Bluetooth discovery/pairing (Agent1), launcher calc/frecency/actions, tuned power
+profiles, brightness OSD, clipboard image thumbs+pins, tray click/menus, auto-hide dock,
+rounded corners + material blur, HarfBuzz/BiDi Urdu shaping, per-level battery glyph +
+ink-bbox icon centering, XDG autostart, notification sounds, keybind cheat-sheet overlay,
+polkit authentication agent, true HCT/MCU dynamic color (matches matugen +/-2) + light
+themes + themeMode, and a 27-tab Settings app covering EVERY config key + system controls
+(audio/brightness/network/bt/power/default-apps/locale/osd/typography/lock-screen/
+window-rules + mux/updater/printer/users). Both `make` and `meson` build zero-warning.
+RSS ~170MB / Pss ~77MB vs DMS qs ~595MB. Deferred by design: T29 plugins; PERF
+OPTIMIZATION (user wants structure first, then optimize the ~77MB footprint further).
 ## Previous status — bar parity DONE ✅ (S1–S6, 2026-07-02); panels parity next
 Bar now pixel-matches the user's live DMS bottom bar (docs/12-BAR-SPEC.md, commits
 07831c7..c412bb6): floating rounded 40px container + elevation shadow + bottom position,

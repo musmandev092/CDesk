@@ -353,3 +353,17 @@ comment referencing the exact `docs/09-DMS-SETTINGS-INVENTORY.md` line.
 - **Out of scope**: plugins (T29) · Hyprland/Mango/Sway settings · Greeter · Desktop Widgets/plugin-based
   widgets · VPN/Tailscale · calendar event backends · niri workspace-overview overlay · generic File
   Browser · any performance work
+
+---
+
+## COMPLETION LOG (2026-07-03)
+
+**ALL WAVES COMPLETE.** Every task above merged to main, both build systems zero-warning.
+Delivered W0–W5 plus the pre-plan polish waves. Only intentional deferrals remain:
+- **T29 native .so plugins** — post-v1 by project decision.
+- **Performance optimization** — explicitly deferred by the user: "structure first, then
+  optimize." Footprint is RSS ~170MB / Pss ~77MB (vs DMS qs ~595MB); the next phase is
+  reducing it further (Mesa/glyph-cache trimming, damage-tracking already partially done in
+  the P7 pass, poll consolidation, lazy panel EGL teardown).
+- Hyprland/Mango/Sway-gated settings, greeter binary, VPN/Tailscale, calendar event
+  backends, niri workspace-overview (native Mod+O), generic file browser — out of scope.
