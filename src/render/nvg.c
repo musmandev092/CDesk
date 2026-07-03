@@ -757,13 +757,16 @@ void dc_render_icon(dc_render *render, int codepoint, float x, float y, float si
          * the Material Symbols icon font that metrics box sits well above
          * a glyph's visual center, so every circular icon button (media
          * play/pause, etc.) rendered its glyph noticeably high. Measure
-         * this glyph's real bounding box instead and center that. */
+         * this glyph's real ink bounding box via nvgTextInkBounds() instead
+         * and center that. (nvgTextBounds() computes the same ink box
+         * internally but then discards it in favor of the font's line-box
+         * metrics for y — a no-op for our purposes; see nanovg.c.) */
         int halign = align_nvg & (NVG_ALIGN_LEFT | NVG_ALIGN_CENTER | NVG_ALIGN_RIGHT);
         if (!halign)
             halign = NVG_ALIGN_LEFT;
         nvgTextAlign(render->vg, NVG_ALIGN_LEFT | NVG_ALIGN_BASELINE);
         float bounds[4];
-        nvgTextBounds(render->vg, 0.0f, 0.0f, glyph, NULL, bounds);
+        nvgTextInkBounds(render->vg, 0.0f, 0.0f, glyph, NULL, bounds);
         draw_y = y - (bounds[1] + bounds[3]) / 2.0f;
         nvgTextAlign(render->vg, halign | NVG_ALIGN_BASELINE);
     } else {

@@ -2976,6 +2976,34 @@ float nvgTextBounds(NVGcontext* ctx, float x, float y, const char* string, const
 	return width * invscale;
 }
 
+float nvgTextInkBounds(NVGcontext* ctx, float x, float y, const char* string, const char* end, float* bounds)
+{
+	NVGstate* state = nvg__getState(ctx);
+	float scale = nvg__getFontScale(state) * ctx->devicePxRatio;
+	float invscale = 1.0f / scale;
+	float width;
+
+	if (state->fontId == FONS_INVALID) return 0;
+
+	fonsSetSize(ctx->fs, state->fontSize*scale);
+	fonsSetSpacing(ctx->fs, state->letterSpacing*scale);
+	fonsSetBlur(ctx->fs, state->fontBlur*scale);
+	fonsSetAlign(ctx->fs, state->textAlign);
+	fonsSetFont(ctx->fs, state->fontId);
+
+	// Unlike nvgTextBounds(), do NOT overwrite bounds[1]/bounds[3] with
+	// fonsLineBounds(): keep fonsTextBounds()'s true ink y-extents so callers
+	// can optically center a single glyph on its actual ink.
+	width = fonsTextBounds(ctx->fs, x*scale, y*scale, string, end, bounds);
+	if (bounds != NULL) {
+		bounds[0] *= invscale;
+		bounds[1] *= invscale;
+		bounds[2] *= invscale;
+		bounds[3] *= invscale;
+	}
+	return width * invscale;
+}
+
 void nvgTextBoxBounds(NVGcontext* ctx, float x, float y, float breakRowWidth, const char* string, const char* end, float* bounds)
 {
 	NVGstate* state = nvg__getState(ctx);
