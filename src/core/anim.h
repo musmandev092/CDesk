@@ -17,6 +17,10 @@ typedef enum {
     DC_DUR_MEDIUM = 300,
     DC_DUR_LONG = 450,
     DC_DUR_EXPRESSIVE = 500,
+    /* Dock reveal/hide slide (docs/11-UX-FLOW.md sec.5/7: "Dock slide | 225 ms
+     * OutCubic" — deliberately its own value since it doesn't match any of
+     * the generic short/medium/long buckets above). */
+    DC_DUR_DOCK_SLIDE = 225,
 } dc_duration;
 
 typedef enum {

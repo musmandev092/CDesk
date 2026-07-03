@@ -291,6 +291,16 @@ int dc_apps_count(const dc_apps *apps)
     return apps ? apps->count : 0;
 }
 
+const dc_app *dc_apps_find(const dc_apps *apps, const char *id)
+{
+    if (!apps || !id || !*id)
+        return NULL;
+    for (int i = 0; i < apps->count; i++)
+        if (strcasecmp(apps->items[i].id, id) == 0)
+            return &apps->items[i];
+    return NULL;
+}
+
 /* Score `name` against the lowercased `q`. Higher is better; 0 = no match.
  * Rewards exact prefix and word-start hits, then falls back to subsequence. */
 static int score_match(const char *name, const char *q)

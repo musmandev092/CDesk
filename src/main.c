@@ -28,6 +28,7 @@
 #include "ui/clip_picker.h"
 #include "ui/controlcenter.h"
 #include "ui/dashboard.h"
+#include "ui/dock.h"
 #include "ui/launcher.h"
 #include "ui/lock.h"
 #include "ui/notifcenter.h"
@@ -215,6 +216,21 @@ static void niri_changed(void *data)
     render_all(data);
 }
 
+/* niri's own changed-callback additionally needs to rebuild the dock's
+ * running-apps side (docs/POLISH.md P5) -- tray's reuse of niri_changed()
+ * above is unrelated to windows, so that one stays as-is. */
+struct niri_dock_ctx {
+    struct bar_set *set;
+    dc_dock *dock;
+};
+
+static void niri_and_dock_changed(void *data)
+{
+    struct niri_dock_ctx *c = data;
+    render_all(c->set);
+    dc_dock_refresh(c->dock);
+}
+
 /* The two notification views fed by the server's changed-callback. */
 struct notif_ui {
     dc_toasts *toasts;
@@ -244,6 +260,7 @@ struct click_ctx {
     dc_powermenu *powermenu;
     dc_tray *tray;
     dc_tray_menu *tray_menu;
+    dc_dock *dock;
 };
 
 /* logind asked us to lock (pre-sleep / lock-session). */
@@ -293,6 +310,7 @@ struct control_ctx {
     dc_lock *lock;
     dc_notifications *notifications;
     dc_powermenu *powermenu;
+    dc_dock *dock;
 };
 
 static struct dc_output *first_output(struct dc_wayland *wl)
@@ -346,6 +364,10 @@ static void control_dispatch(const char *cmd, void *data)
     }
     else if (strcmp(cmd, "clipboard") == 0 || strcmp(cmd, "clipboard toggle") == 0)
         dc_clip_picker_toggle(c->clip_picker, out);
+    else if (strcmp(cmd, "dock") == 0 || strcmp(cmd, "dock toggle") == 0)
+        /* Live show/hide, independent of the persistent dockEnabled config
+         * key (docs/POLISH.md P5) -- mainly for verification/testing. */
+        dc_dock_toggle(c->dock, out);
     else if (strcmp(cmd, "processes") == 0 || strcmp(cmd, "processes toggle") == 0 ||
              strcmp(cmd, "processes cpu") == 0)
         dc_processes_toggle(c->processes, out, DC_PROCESSES_SORT_CPU);
@@ -429,6 +451,11 @@ static void handle_left_click(struct wl_surface *surface, double x, double y, st
 
     if (dc_toasts_handle_click(ctx->toasts, surface, x, y))
         return;
+
+    if (dc_dock_visible(ctx->dock) && surface == dc_dock_surface(ctx->dock)) {
+        dc_dock_handle_click(ctx->dock, x, y);
+        return;
+    }
 
     if (dc_powermenu_visible(ctx->powermenu) && surface == dc_powermenu_surface(ctx->powermenu)) {
         dc_powermenu_handle_click(ctx->powermenu, x, y);
@@ -617,6 +644,12 @@ static void handle_bar_motion(struct wl_surface *surface, double x, double y, vo
         dc_clip_picker_handle_motion(ctx->clip_picker, x, y);
         return;
     }
+    if (dc_dock_visible(ctx->dock) && surface == dc_dock_surface(ctx->dock)) {
+        /* Also the dock's reveal-on-enter trigger (docs/POLISH.md P5/docs/11
+         * sec.8): a motion callback fires for wl_pointer.enter too. */
+        dc_dock_handle_motion(ctx->dock, x, y);
+        return;
+    }
 }
 
 /* Pointer left a surface entirely: clear hover (and, for control center, any
@@ -626,6 +659,11 @@ static void handle_bar_motion(struct wl_surface *surface, double x, double y, vo
 static void handle_bar_leave(struct wl_surface *surface, void *data)
 {
     struct click_ctx *ctx = data;
+
+    if (dc_dock_visible(ctx->dock) && surface == dc_dock_surface(ctx->dock)) {
+        dc_dock_handle_leave(ctx->dock);
+        return;
+    }
 
     for (int i = 0; i < ctx->set->count; i++) {
         if (dc_bar_surface(ctx->set->bars[i]) == surface) {
@@ -810,11 +848,17 @@ int main(int argc, char **argv)
     dc_battery_popout *battery_popout = dc_battery_popout_create(wl, &egl, &render);
     dc_osd *osd = dc_osd_create(wl, &egl, &render);
     dc_tray_menu *tray_menu = dc_tray_menu_create(wl, &egl, &render, dbus, tray);
+    dc_dock *dock = dc_dock_create(wl, &egl, &render, niri);
 
     dc_output *first_output = NULL;
     wl_list_for_each(first_output, &wl->outputs, link) {
         break;
     }
+    /* dockEnabled defaults to false (docs/POLISH.md P5) -- only map a surface
+     * at startup if the user opted in via config.json; `dankc ctl dock`
+     * still works either way for live testing. */
+    if (dc_config_current->dock_enabled && first_output)
+        dc_dock_show(dock, first_output);
     dc_toasts *toasts = dc_toasts_create(wl, &egl, &render, notifications, first_output);
     dc_notif_center *notif_center = dc_notif_center_create(wl, &egl, &render, notifications);
     struct notif_ui notif_ui = {.toasts = toasts, .center = notif_center};
@@ -834,7 +878,8 @@ int main(int argc, char **argv)
     g_loop = dc_loop_create();
     dc_wayland_integrate(wl, g_loop);
     dc_niri_integrate(niri, g_loop);
-    dc_niri_set_changed_cb(niri, niri_changed, &set);
+    struct niri_dock_ctx niri_dock_ctx = {.set = &set, .dock = dock};
+    dc_niri_set_changed_cb(niri, niri_and_dock_changed, &niri_dock_ctx);
     dc_dbus_integrate(dbus, g_loop);
     dc_osd_integrate(osd, g_loop);
     dc_loop_set_tick(g_loop, clock_tick, &tick, 1000);
@@ -870,7 +915,8 @@ int main(int argc, char **argv)
                              .notifications = notifications,
                              .powermenu = powermenu,
                              .tray = tray,
-                             .tray_menu = tray_menu};
+                             .tray_menu = tray_menu,
+                             .dock = dock};
     dc_wayland_set_click_cb(wl, handle_bar_click, &cctx);
     dc_wayland_set_motion_cb(wl, handle_bar_motion, &cctx);
     dc_wayland_set_leave_cb(wl, handle_bar_leave, &cctx);
@@ -895,7 +941,8 @@ int main(int argc, char **argv)
                                       .dashboard = dashboard,
                                       .lock = lock,
                                       .notifications = notifications,
-                                      .powermenu = powermenu};
+                                      .powermenu = powermenu,
+                                      .dock = dock};
     dc_control *control = dc_control_create(g_loop, control_dispatch, &control_ctx);
     dc_logind *logind = dc_logind_create(dbus, logind_lock, lock);
 
@@ -1020,6 +1067,7 @@ int main(int argc, char **argv)
     dc_osd_destroy(osd);
     dc_control_center_destroy(control_center);
     dc_battery_popout_destroy(battery_popout);
+    dc_dock_destroy(dock);
     for (int i = 0; i < set.count; i++)
         dc_bar_destroy(set.bars[i]);
     /* GL teardown is skipped: the process is exiting and nvgDelete needs a live

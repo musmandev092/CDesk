@@ -353,6 +353,16 @@ const dc_niri_window *dc_niri_focused_window(const dc_niri *niri)
     return NULL;
 }
 
+const dc_niri_window *dc_niri_windows(const dc_niri *niri, int *count)
+{
+    if (!niri) {
+        *count = 0;
+        return NULL;
+    }
+    *count = niri->window_count;
+    return niri->windows;
+}
+
 void dc_niri_focus_workspace(int idx)
 {
     char idx_str[16];
@@ -361,6 +371,19 @@ void dc_niri_focus_workspace(int idx)
     pid_t pid = fork();
     if (pid == 0) {
         execlp("niri", "niri", "msg", "action", "focus-workspace", idx_str, (char *)NULL);
+        _exit(127);
+    }
+    /* Parent: fire-and-forget, reaped by main's SIGCHLD = SIG_IGN. */
+}
+
+void dc_niri_focus_window(uint64_t id)
+{
+    char id_str[32];
+    snprintf(id_str, sizeof(id_str), "%llu", (unsigned long long)id);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("niri", "niri", "msg", "action", "focus-window", "--id", id_str, (char *)NULL);
         _exit(127);
     }
     /* Parent: fire-and-forget, reaped by main's SIGCHLD = SIG_IGN. */

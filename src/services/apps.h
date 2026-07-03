@@ -51,6 +51,11 @@ int dc_apps_count(const dc_apps *apps);
  * empty query returns the first `max` apps alphabetically. */
 int dc_apps_search(dc_apps *apps, const char *query, const dc_app **out, int max);
 
+/* Exact (case-insensitive) lookup by desktop-entry id -- the app dock's
+ * pinned-apps launch path (ui/dock.c) and niri app_id -> icon/name mapping.
+ * Returns NULL if no indexed entry matches. */
+const dc_app *dc_apps_find(const dc_apps *apps, const char *id);
+
 /* Launch an app's Exec line, detached from DankC. */
 void dc_app_launch(const dc_app *app);
 
