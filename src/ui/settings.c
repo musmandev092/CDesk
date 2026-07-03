@@ -1214,6 +1214,26 @@ static void tab_notifications(uictx *c)
     if (ui_stepper(c, "Critical urgency (0 = never)", &c->cfg->notif_timeout_critical_sec, 0, 120,
                    5))
         c->changed = true;
+
+    /* docs/14-COMPLETION-PLAN.md W1.3 -- matches DMS's SoundsTab.qml "Enable
+     * System Sounds" + "New Notification" rows (services/sound.c plays the
+     * actual sound). */
+    ui_section(c, "SOUNDS");
+    if (ui_toggle(c, "Enable sounds", "Master switch for system sounds", c->cfg->sounds_enabled)) {
+        c->cfg->sounds_enabled = !c->cfg->sounds_enabled;
+        c->changed = true;
+    }
+    if (c->cfg->sounds_enabled) {
+        if (ui_toggle(c, "New notification", "Play a sound when a notification arrives",
+                      c->cfg->notif_sound_enabled)) {
+            c->cfg->notif_sound_enabled = !c->cfg->notif_sound_enabled;
+            c->changed = true;
+        }
+        char vv[16];
+        snprintf(vv, sizeof(vv), "%d%%", (int)lroundf(c->cfg->sound_volume * 100.0f));
+        if (ui_slider(c, "Volume", &c->cfg->sound_volume, 0.0f, 1.0f, vv))
+            c->changed = true;
+    }
 }
 
 static void tab_launcher(uictx *c)

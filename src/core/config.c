@@ -52,6 +52,12 @@ static dc_config config = {
     .notif_timeout_critical_sec = 0,
     .dnd_enabled = false,
 
+    /* docs/14-COMPLETION-PLAN.md W1.3: matches DMS SettingsData.soundsEnabled/
+     * soundNewNotification defaults (both on). */
+    .sounds_enabled = true,
+    .notif_sound_enabled = true,
+    .sound_volume = 1.0f,
+
     .launcher_grid_view = false,
 
     .dock_enabled = false,
@@ -282,6 +288,10 @@ void dc_config_load(void)
     get_int(root, "notifTimeoutCritical", &config.notif_timeout_critical_sec, 0, 120);
     get_bool(root, "dndEnabled", &config.dnd_enabled);
 
+    get_bool(root, "soundsEnabled", &config.sounds_enabled);
+    get_bool(root, "soundNewNotification", &config.notif_sound_enabled);
+    get_float(root, "soundVolume", &config.sound_volume, 0.0f, 1.0f);
+
     get_bool(root, "launcherGridView", &config.launcher_grid_view);
 
     get_bool(root, "dockEnabled", &config.dock_enabled);
@@ -388,6 +398,10 @@ void dc_config_save(void)
     cJSON_AddNumberToObject(root, "notifTimeoutNormal", config.notif_timeout_normal_sec);
     cJSON_AddNumberToObject(root, "notifTimeoutCritical", config.notif_timeout_critical_sec);
     cJSON_AddBoolToObject(root, "dndEnabled", config.dnd_enabled);
+
+    cJSON_AddBoolToObject(root, "soundsEnabled", config.sounds_enabled);
+    cJSON_AddBoolToObject(root, "soundNewNotification", config.notif_sound_enabled);
+    cJSON_AddNumberToObject(root, "soundVolume", (double)config.sound_volume);
 
     cJSON_AddBoolToObject(root, "launcherGridView", config.launcher_grid_view);
 
