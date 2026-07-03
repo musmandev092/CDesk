@@ -11,7 +11,9 @@
 #include "services/bluez.h"
 #include "services/display.h"
 #include "services/net.h"
+#include "services/nightlight.h"
 #include "services/power.h"
+#include "services/printers.h"
 #include "services/weather.h"
 #include "theme/theme.h"
 #include "ui/material_bg.h"
@@ -103,6 +105,12 @@
  * render/icons.h (used nowhere else yet), no font-subset update needed. */
 #define IC_EXPAND_MORE DC_ICON_EXPAND_MORE
 #define IC_EXPAND_LESS DC_ICON_EXPAND_LESS
+/* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.4: Night Light gets its own tab
+ * (replaces the old duplicated pgrep/pkill/gammastep toggle that used to live
+ * in tab_displays). Glyph already used by controlcenter.c's "Night Mode"
+ * tile -- already in the bundled font subset, no scripts/subset-fonts.sh
+ * update needed. */
+#define IC_NIGHTLIGHT DC_ICON_NIGHTLIGHT
 
 typedef enum {
     TAB_PERSONALIZATION = 0,
@@ -113,6 +121,7 @@ typedef enum {
     TAB_WEATHER,
     TAB_DOCK,
     TAB_DISPLAYS,
+    TAB_NIGHTLIGHT,
     TAB_AUDIO,
     TAB_NETWORK,
     TAB_BLUETOOTH,
@@ -144,6 +153,7 @@ static const s_tab_def TABS[TAB_COUNT] = {
     {IC_TEXT_FORMAT, "Typography & Motion"}, {IC_TOOLBAR, "Bar"},
     {IC_WIDGETS, "Widgets"},              {IC_CLOUD, "Weather"},
     {IC_DOCK, "Dock"},                    {IC_MONITOR, "Displays"},
+    {IC_NIGHTLIGHT, "Night Light"},
     {IC_AUDIO, "Audio"},                  {IC_NETWORK, "Network"},
     {IC_BLUETOOTH, "Bluetooth"},          {IC_NOTIFICATIONS, "Notifications"},
     {IC_GRID_VIEW, "Launcher"},           {IC_APPS, "Default Apps"},
@@ -208,6 +218,13 @@ struct dc_settings {
      * disclosure is open right now. */
     int disp_selected;
     bool disp_res_open;
+
+    /* Network tab hotspot form (docs/19 sec.2, "Hotspot" section extension):
+     * draft SSID/password, not persisted anywhere until "Start Hotspot" is
+     * clicked -- dc_net_hotspot_start() is the actual owner of the resulting
+     * NetworkManager connection, this is just the in-progress form state. */
+    char net_hotspot_ssid[64];
+    char net_hotspot_password[64];
 };
 
 /* Bounded string copy without gcc's -Wformat-truncation firing: several text
@@ -854,27 +871,6 @@ static void backlight_set(const backlight_info *bl, float frac)
              ">/dev/null 2>&1",
              bl->device, raw);
     run_detached(cmd);
-}
-
-/* --- night mode: gammastep one-shot, same command pair as main.c's `dankc
- * ctl night`. State = "a gammastep process exists". The local flip below
- * makes the toggle respond instantly instead of waiting out the cache. */
-static bool night_mode_read(void)
-{
-    static bool cache = false;
-    static time_t cache_time = 0;
-    time_t now = time(NULL);
-    if (cache_time && now - cache_time < SYS_CACHE_SECONDS)
-        return cache;
-    cache_time = now;
-    cache = system("pgrep -x gammastep >/dev/null 2>&1") == 0;
-    return cache;
-}
-
-static void night_mode_toggle(void)
-{
-    run_detached("if pgrep -x gammastep >/dev/null; then pkill -x gammastep; "
-                 "else gammastep -O 4000 >/dev/null 2>&1 & fi");
 }
 
 /* --- default audio *source* (mic) mute state; audio.h's dc_audio_read()
@@ -2103,14 +2099,6 @@ static void tab_displays(uictx *c)
         ui_hint(c, "No backlight device found");
     }
 
-    ui_section(c, "NIGHT MODE");
-    static opt_flip night_flip;
-    bool night = flip_get(&night_flip, night_mode_read());
-    if (ui_toggle(c, "Night mode", "Warm color temperature (gammastep, 4000K)", night)) {
-        night_mode_toggle();
-        flip_set(&night_flip, !night);
-    }
-
     ui_section(c, "MONITORS");
     dc_display_info outs[DC_DISPLAY_MAX_OUTPUTS];
     int n = dc_display_list(outs);
@@ -2180,6 +2168,86 @@ static void tab_displays(uictx *c)
             }
         }
         dc_display_persist(cfgs, cn, NULL);
+    }
+}
+
+/* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.4: Night Light -- its own tab now
+ * (replaces the old duplicated pgrep/pkill/gammastep-O-4000 one-shot that
+ * used to live in tab_displays; main.c's `ctl night` was already migrated to
+ * this same services/nightlight.c backend). All state is owned by
+ * nightlight.c (persists to config.json itself) -- this tab is a thin
+ * getter/setter view, same shape as tab_power over services/power.c. */
+static void tab_nightlight(uictx *c)
+{
+    ui_section(c, "NIGHT LIGHT");
+    dc_nightlight_backend be = dc_nightlight_backend_get();
+    if (be == DC_NIGHTLIGHT_BACKEND_NONE) {
+        ui_hint(c, "No backend found -- install wlsunset or gammastep.");
+        return;
+    }
+    char backend_line[64];
+    snprintf(backend_line, sizeof(backend_line), "Backend: %s", dc_nightlight_backend_name(be));
+    ui_hint(c, backend_line);
+
+    static opt_flip enabled_flip;
+    bool enabled = flip_get(&enabled_flip, dc_nightlight_active());
+    if (ui_toggle(c, "Enable Night Light", "Warm color temperature at night", enabled)) {
+        dc_nightlight_enable(!enabled);
+        flip_set(&enabled_flip, !enabled);
+    }
+
+    ui_section(c, "TEMPERATURE");
+    static opt_value temp_pending;
+    float temp = (float)dc_nightlight_get_temp();
+    float pv;
+    if (opt_value_get(&temp_pending, &pv))
+        temp = pv;
+    char tv[16];
+    snprintf(tv, sizeof(tv), "%dK", (int)lroundf(temp));
+    if (ui_slider(c, "Color temperature (night side)", &temp, 2500.0f, 6500.0f, tv)) {
+        int k = (int)lroundf(temp);
+        dc_nightlight_set_temp(k);
+        opt_value_set(&temp_pending, (float)k);
+    }
+
+    ui_section(c, "SCHEDULE");
+    dc_nightlight_schedule sched = dc_nightlight_get_schedule();
+    static const char *const sched_opts[] = {"Manual", "Sunset - Sunrise", "Custom Times"};
+    int clicked = ui_segmented(c, "Mode", sched_opts, 3, (int)sched);
+    if (clicked >= 0 && clicked != (int)sched) {
+        char from[6], to[6];
+        dc_nightlight_get_times(from, sizeof(from), to, sizeof(to));
+        dc_nightlight_set_schedule((dc_nightlight_schedule)clicked, from, to);
+        sched = (dc_nightlight_schedule)clicked;
+    }
+
+    if (sched == DC_NIGHTLIGHT_SCHED_SUNSET) {
+        ui_hint(c, "Uses the Weather tab's latitude/longitude for sunset/sunrise.");
+    } else if (sched == DC_NIGHTLIGHT_SCHED_TIMES) {
+        char from[6], to[6];
+        dc_nightlight_get_times(from, sizeof(from), to, sizeof(to));
+
+        bool from_focus = c->s->focus_field == 7;
+        char frombuf[6];
+        if (from_focus)
+            copy_trunc(frombuf, sizeof(frombuf), c->s->edit_buf);
+        else
+            snprintf(frombuf, sizeof(frombuf), "%s", from);
+        if (ui_textfield(c, "From (HH:MM)", frombuf, from_focus)) {
+            c->s->focus_field = 7;
+            snprintf(c->s->edit_buf, sizeof(c->s->edit_buf), "%s", from);
+        }
+
+        bool to_focus = c->s->focus_field == 8;
+        char tobuf[6];
+        if (to_focus)
+            copy_trunc(tobuf, sizeof(tobuf), c->s->edit_buf);
+        else
+            snprintf(tobuf, sizeof(tobuf), "%s", to);
+        if (ui_textfield(c, "To (HH:MM)", tobuf, to_focus)) {
+            c->s->focus_field = 8;
+            snprintf(c->s->edit_buf, sizeof(c->s->edit_buf), "%s", to);
+        }
     }
 }
 
@@ -2260,6 +2328,129 @@ static void tab_network(uictx *c)
         ui_value(c, "Connection", "Disconnected");
     }
     ui_hint(c, "Scan and join networks from the Control Center's Wi-Fi section");
+
+    /* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.2 extension: wired device,
+     * hotspot, and saved-network management, all native NetworkManager D-Bus
+     * (services/net.h) -- no nmcli popen()s on this path. */
+    ui_section(c, "ETHERNET");
+    dc_net_eth_info eth;
+    if (dc_net_ethernet(&eth) && eth.has_device) {
+        static const char *const eth_state_name[] = {"Unavailable", "No cable", "Disconnected",
+                                                     "Connecting\xe2\x80\xa6", "Connected"};
+        int si = (int)eth.state;
+        ui_value(c, "Device", eth.device_name);
+        ui_value(c, "State", eth_state_name[si >= 0 && si < 5 ? si : 0]);
+        if (eth.connection_name[0])
+            ui_value(c, "Connection", eth.connection_name);
+        if (eth.state == DC_NET_ETH_CONNECTED) {
+            char ipbuf[96];
+            snprintf(ipbuf, sizeof(ipbuf), "%s/%u", eth.ipv4_address, eth.ipv4_prefix);
+            ui_value(c, "IPv4 address", ipbuf);
+            ui_value(c, "Gateway", eth.ipv4_gateway[0] ? eth.ipv4_gateway : "-");
+            if (eth.ipv4_dns_count > 0) {
+                char dnsbuf[3 * 64] = "";
+                for (int i = 0; i < eth.ipv4_dns_count; i++) {
+                    if (i > 0)
+                        strncat(dnsbuf, ", ", sizeof(dnsbuf) - strlen(dnsbuf) - 1);
+                    strncat(dnsbuf, eth.ipv4_dns[i], sizeof(dnsbuf) - strlen(dnsbuf) - 1);
+                }
+                ui_value(c, "DNS", dnsbuf);
+            }
+            if (eth.link_speed_mbps > 0) {
+                char sp[32];
+                snprintf(sp, sizeof(sp), "%u Mbps", eth.link_speed_mbps);
+                ui_value(c, "Link speed", sp);
+            }
+        }
+        if (eth.mac[0])
+            ui_value(c, "MAC address", eth.mac);
+
+        bool can_connect = eth.state == DC_NET_ETH_DISCONNECTED;
+        bool can_disconnect =
+            eth.state == DC_NET_ETH_CONNECTED || eth.state == DC_NET_ETH_CONNECTING;
+        if (can_connect && ui_list_row(c, "Connect", NULL, IC_LINK, false) == 1)
+            dc_net_eth_connect();
+        if (can_disconnect && ui_list_row(c, "Disconnect", NULL, IC_REMOVE, false) == 1)
+            dc_net_eth_disconnect();
+    } else {
+        ui_hint(c, "No ethernet device found");
+    }
+
+    ui_section(c, "HOTSPOT");
+    char hs_ssid[64] = {0};
+    bool hs_active = dc_net_hotspot_active(hs_ssid, sizeof(hs_ssid));
+    static opt_flip hotspot_flip;
+    bool hs_on = flip_get(&hotspot_flip, hs_active);
+    if (ui_toggle(c, "Wi-Fi Hotspot", "Share your connection over Wi-Fi (access-point mode)",
+                 hs_on)) {
+        if (hs_on) {
+            dc_net_hotspot_stop();
+        } else {
+            const char *ssid =
+                c->s->net_hotspot_ssid[0] ? c->s->net_hotspot_ssid : "dankc-hotspot";
+            dc_net_hotspot_start(ssid, c->s->net_hotspot_password[0] ? c->s->net_hotspot_password
+                                                                     : NULL,
+                                 NULL);
+        }
+        flip_set(&hotspot_flip, !hs_on);
+    }
+    ui_hint(c, "A single Wi-Fi radio can't be a client and a hotspot at once --");
+    ui_hint(c, "starting this drops any current Wi-Fi client connection.");
+    if (hs_active) {
+        ui_value(c, "Active SSID", hs_ssid);
+    } else {
+        bool ssid_focus = c->s->focus_field == 9;
+        char ssidbuf[64];
+        if (ssid_focus)
+            copy_trunc(ssidbuf, sizeof(ssidbuf), c->s->edit_buf);
+        else
+            snprintf(ssidbuf, sizeof(ssidbuf), "%s", c->s->net_hotspot_ssid);
+        if (ui_textfield(c, "Hotspot name (SSID)", ssidbuf, ssid_focus)) {
+            c->s->focus_field = 9;
+            snprintf(c->s->edit_buf, sizeof(c->s->edit_buf), "%s", c->s->net_hotspot_ssid);
+        }
+
+        bool pw_focus = c->s->focus_field == 10;
+        char pw_source[64];
+        if (pw_focus)
+            copy_trunc(pw_source, sizeof(pw_source), c->s->edit_buf);
+        else
+            snprintf(pw_source, sizeof(pw_source), "%s", c->s->net_hotspot_password);
+        /* Masked display -- dots for whatever's typed so far, same length as
+         * the real value (no plaintext echo, matches a normal password
+         * field's UX; this tab has no other masked-field precedent to
+         * follow so the mask is built ad hoc here rather than in ui_textfield
+         * itself). */
+        char pwdisplay[64];
+        size_t pn = strlen(pw_source);
+        if (pn >= sizeof(pwdisplay))
+            pn = sizeof(pwdisplay) - 1;
+        memset(pwdisplay, '*', pn);
+        pwdisplay[pn] = '\0';
+        if (ui_textfield(c, "Password (blank = open network)", pwdisplay, pw_focus)) {
+            c->s->focus_field = 10;
+            snprintf(c->s->edit_buf, sizeof(c->s->edit_buf), "%s", c->s->net_hotspot_password);
+        }
+    }
+
+    ui_section(c, "SAVED WI-FI NETWORKS");
+    dc_net_saved_net saved[DC_NET_SAVED_MAX];
+    int sn = dc_net_saved_list(saved, DC_NET_SAVED_MAX);
+    if (sn == 0) {
+        ui_hint(c, "No saved networks");
+    } else {
+        for (int i = 0; i < sn; i++) {
+            const dc_net_saved_net *nw = &saved[i];
+            int clicked = ui_list_row(c, nw->id[0] ? nw->id : nw->ssid,
+                                      nw->autoconnect ? "Auto-connect" : "Manual", IC_REMOVE,
+                                      false);
+            if (clicked == 2)
+                dc_net_saved_forget(nw->path);
+            else if (clicked == 1)
+                dc_net_saved_set_autoconnect(nw->path, !nw->autoconnect);
+        }
+        ui_hint(c, "Click a network to toggle auto-connect, or the icon to forget it.");
+    }
 }
 
 static void tab_bluetooth(uictx *c)
@@ -3271,60 +3462,60 @@ static void tab_system_updater(uictx *c)
     ui_hint(c, "never installs or upgrades anything automatically.");
 }
 
-/* docs/14-COMPLETION-PLAN.md W5.3: CUPS printer list via `lpstat -p`,
- * read-only (low priority per the task -- no printer-management UI, just
- * visibility). Each line looks like "printer <name> is idle.  enabled ..."
- * or "printer <name> disabled since ...". */
-#define DC_PRINTER_MAX 8
-
-typedef struct {
-    char name[64];
-    char status[96];
-} printer_entry;
-
-static int printers_read(printer_entry *out, int max)
-{
-    int n = 0;
-    FILE *pipe = popen("lpstat -p 2>/dev/null", "r");
-    if (!pipe)
-        return 0;
-    char line[256];
-    while (n < max && fgets(line, sizeof(line), pipe)) {
-        if (strncmp(line, "printer ", 8) != 0)
-            continue;
-        char *name = line + 8;
-        char *sp = strchr(name, ' ');
-        if (!sp)
-            continue;
-        size_t nlen = (size_t)(sp - name);
-        if (nlen >= sizeof(out[n].name))
-            nlen = sizeof(out[n].name) - 1;
-        memcpy(out[n].name, name, nlen);
-        out[n].name[nlen] = '\0';
-
-        char *rest = sp + 1;
-        size_t rl = strlen(rest);
-        while (rl > 0 && (rest[rl - 1] == '\n' || rest[rl - 1] == '\r'))
-            rest[--rl] = '\0';
-        copy_trunc(out[n].status, sizeof(out[n].status), rest);
-        n++;
-    }
-    pclose(pipe);
-    return n;
-}
-
+/* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.6: CUPS printers, now backed by
+ * services/printers.h (dc_printers_list()/set_default()/test_page()/jobs())
+ * instead of this tab's own inline `lpstat -p` popen() parser -- both writes
+ * are per-user, no root (see printers.h's file header). Adding/removing
+ * queues (`lpadmin`) is still out of scope -- punt to system-config-printer
+ * or the CUPS web UI, same as before. */
 static void tab_printer(uictx *c)
 {
     ui_section(c, "PRINTERS");
-    printer_entry printers[DC_PRINTER_MAX];
-    int n = printers_read(printers, DC_PRINTER_MAX);
-    if (n == 0) {
-        ui_hint(c, "No printers configured (CUPS `lpstat -p` returned nothing)");
-    } else {
-        for (int i = 0; i < n; i++)
-            ui_list_row(c, printers[i].name, printers[i].status, 0, false);
+    if (!dc_printers_available()) {
+        ui_hint(c, "CUPS not running (no `lpstat` on PATH, or no daemon).");
+        ui_hint(c, "Install/start cups, or manage printers via");
+        ui_hint(c, "system-config-printer / http://localhost:631.");
+        return;
     }
-    ui_hint(c, "Read-only -- manage printers via system-config-printer or");
+
+    dc_printer_info printers[DC_PRINTERS_MAX];
+    int n = dc_printers_list(printers);
+    if (n == 0) {
+        ui_hint(c, "No printers configured (CUPS has no queues set up).");
+    } else {
+        for (int i = 0; i < n; i++) {
+            const dc_printer_info *p = &printers[i];
+            char status[DC_PRINTER_TEXT_MAX + 16];
+            snprintf(status, sizeof(status), "%s%s", p->is_default ? "Default \xe2\x80\xa2 " : "",
+                    dc_printer_state_name(p->state));
+            ui_list_row(c, p->name, status, 0, p->is_default);
+            if (p->description[0] || p->location[0]) {
+                char meta[2 * DC_PRINTER_TEXT_MAX];
+                snprintf(meta, sizeof(meta), "%s%s%s", p->description,
+                        (p->description[0] && p->location[0]) ? " -- " : "", p->location);
+                ui_hint(c, meta);
+            }
+            if (!p->is_default && ui_list_row(c, "Set as default", NULL, IC_DONE, false) == 1)
+                dc_printers_set_default(p->name);
+            if (ui_list_row(c, "Print test page", NULL, IC_PRINTER, false) == 1)
+                dc_printers_test_page(p->name);
+        }
+    }
+
+    ui_section(c, "JOB QUEUE");
+    dc_printer_job jobs[DC_PRINTER_JOBS_MAX];
+    int jn = dc_printers_jobs(NULL, jobs);
+    if (jn == 0) {
+        ui_hint(c, "No active jobs");
+    } else {
+        for (int i = 0; i < jn; i++) {
+            char val[64 + DC_PRINTER_TEXT_MAX];
+            snprintf(val, sizeof(val), "%s -- %s", jobs[i].user, jobs[i].info);
+            ui_value(c, jobs[i].id, val);
+        }
+    }
+
+    ui_hint(c, "Adding/removing queues needs system-config-printer or");
     ui_hint(c, "the CUPS web UI (http://localhost:631).");
 }
 
@@ -3433,6 +3624,9 @@ static void build_tab(uictx *c)
     case TAB_DISPLAYS:
         tab_displays(c);
         break;
+    case TAB_NIGHTLIGHT:
+        tab_nightlight(c);
+        break;
     case TAB_AUDIO:
         tab_audio(c);
         break;
@@ -3540,6 +3734,32 @@ static void commit_edit(dc_settings *s)
     case 6: /* niri window-rules "add" app-id draft -- not config.json state, see
              * wr_add_rule() (writes ~/.config/niri/dankc-rules.kdl instead) */
         copy_trunc(s->wr_new_app_id, sizeof(s->wr_new_app_id), s->edit_buf);
+        break;
+    case 7: { /* nightlight custom-schedule "from" HH:MM -- nightlight.c owns
+               * persistence itself, so this calls straight into the service
+               * rather than mutating cfg (the dc_config_save() below is a
+               * harmless no-op extra for this field, same as case 6). */
+        char from[6], to[6];
+        dc_nightlight_get_times(from, sizeof(from), to, sizeof(to));
+        char newfrom[6];
+        copy_trunc(newfrom, sizeof(newfrom), s->edit_buf);
+        dc_nightlight_set_schedule(DC_NIGHTLIGHT_SCHED_TIMES, newfrom, to);
+        break;
+    }
+    case 8: { /* nightlight custom-schedule "to" HH:MM */
+        char from[6], to[6];
+        dc_nightlight_get_times(from, sizeof(from), to, sizeof(to));
+        char newto[6];
+        copy_trunc(newto, sizeof(newto), s->edit_buf);
+        dc_nightlight_set_schedule(DC_NIGHTLIGHT_SCHED_TIMES, from, newto);
+        break;
+    }
+    case 9: /* network hotspot SSID draft -- not persisted until "Start
+             * Hotspot" is clicked (tab_network), see dc_settings.net_hotspot_ssid */
+        copy_trunc(s->net_hotspot_ssid, sizeof(s->net_hotspot_ssid), s->edit_buf);
+        break;
+    case 10: /* network hotspot password draft */
+        copy_trunc(s->net_hotspot_password, sizeof(s->net_hotspot_password), s->edit_buf);
         break;
     default:
         break;
