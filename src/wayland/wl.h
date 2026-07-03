@@ -33,8 +33,13 @@ typedef struct dc_output {
     struct wl_list link; /* dc_wayland.outputs */
 } dc_output;
 
-/* Left-click on a bar surface, in surface-local logical coordinates. */
-typedef void (*dc_click_cb)(struct wl_surface *surface, double x, double y, void *user_data);
+/* A button click on a bar surface, in surface-local logical coordinates.
+ * `button` is a raw evdev code (BTN_LEFT/BTN_RIGHT/BTN_MIDDLE from
+ * <linux/input-event-codes.h>) — added for tray right-click context menus/
+ * middle-click SecondaryActivate (docs/POLISH.md P4); every pre-existing
+ * caller only ever cared about BTN_LEFT and can keep ignoring the rest. */
+typedef void (*dc_click_cb)(struct wl_surface *surface, double x, double y, uint32_t button,
+                            void *user_data);
 
 /* A key press: `keysym` is the xkb keysym; `utf8` is its text (may be empty). */
 typedef void (*dc_key_cb)(uint32_t keysym, const char *utf8, void *user_data);

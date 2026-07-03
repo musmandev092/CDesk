@@ -173,6 +173,16 @@ struct dc_bar {
         int image;
     } tray_cache[DC_TRAY_MAX];
     int tray_cache_n;
+    /* IconPixmap fallback cache (docs/POLISH.md P4): one slot per possible
+     * tray item, keyed by "service|path" since pixmap data has no stable
+     * name to key on like tray_cache above. GC'd every draw_tray_pill() pass
+     * against the current dc_tray_items() list so a vanished item's texture
+     * doesn't leak. */
+    struct {
+        bool in_use;
+        char key[DC_TRAY_STR * 2 + 2];
+        int image; /* 0 = resolved-to-nothing, still cached to skip re-querying every frame */
+    } tray_pixmap_cache[DC_TRAY_MAX];
 
     /* Per-widget click targets from the most recent render (widget host
      * layout pass; docs/12-BAR-SPEC.md sec.5). */
@@ -1456,12 +1466,75 @@ static int get_tray_image(dc_bar *bar, const char *name)
     return img;
 }
 
+/* Resolve+load item `index`'s IconPixmap property (docs/POLISH.md P4),
+ * cached per "service|path" since pixmap-only items have no name to key on.
+ * Called only when the named-icon lookup above found nothing. */
+static int get_tray_pixmap_image(dc_bar *bar, int index, const char *service, const char *path)
+{
+    char key[DC_TRAY_STR * 2 + 2];
+    snprintf(key, sizeof(key), "%s|%s", service, path);
+
+    for (int i = 0; i < DC_TRAY_MAX; i++)
+        if (bar->tray_pixmap_cache[i].in_use && strcmp(bar->tray_pixmap_cache[i].key, key) == 0)
+            return bar->tray_pixmap_cache[i].image;
+
+    int img = 0;
+    uint8_t *rgba = NULL;
+    int w = 0, h = 0;
+    if (dc_tray_icon_pixmap(bar->tray, index, 48, &rgba, &w, &h) && rgba) {
+        img = nvgCreateImageRGBA(bar->render->vg, w, h, 0, rgba);
+        free(rgba);
+    }
+
+    int slot = -1;
+    for (int i = 0; i < DC_TRAY_MAX; i++)
+        if (!bar->tray_pixmap_cache[i].in_use) {
+            slot = i;
+            break;
+        }
+    if (slot < 0)
+        slot = 0; /* shouldn't happen: at most DC_TRAY_MAX items exist */
+    bar->tray_pixmap_cache[slot].in_use = true;
+    snprintf(bar->tray_pixmap_cache[slot].key, sizeof(bar->tray_pixmap_cache[slot].key), "%s", key);
+    bar->tray_pixmap_cache[slot].image = img;
+    return img;
+}
+
+/* Evict + nvgDeleteImage() every IconPixmap cache slot whose item is no
+ * longer in the tray (docs/POLISH.md P4: "free nvg images ... when items
+ * vanish"). Must run with the bar's own EGL context current -- called from
+ * inside draw_tray_pill()'s render pass, same as every other nvg* call
+ * here. */
+static void gc_tray_pixmap_cache(dc_bar *bar)
+{
+    const dc_tray_item *items[DC_TRAY_MAX];
+    int n = bar->tray ? dc_tray_items(bar->tray, items, DC_TRAY_MAX) : 0;
+
+    for (int i = 0; i < DC_TRAY_MAX; i++) {
+        if (!bar->tray_pixmap_cache[i].in_use)
+            continue;
+        bool found = false;
+        for (int j = 0; j < n && !found; j++) {
+            char key[DC_TRAY_STR * 2 + 2];
+            snprintf(key, sizeof(key), "%s|%s", items[j]->service, items[j]->path);
+            if (strcmp(key, bar->tray_pixmap_cache[i].key) == 0)
+                found = true;
+        }
+        if (!found) {
+            if (bar->tray_pixmap_cache[i].image > 0)
+                nvgDeleteImage(bar->render->vg, bar->tray_pixmap_cache[i].image);
+            memset(&bar->tray_pixmap_cache[i], 0, sizeof(bar->tray_pixmap_cache[i]));
+        }
+    }
+}
+
 /* Per-item chip: 21x21 (DC_BAR_TRAY_CHIP), transparent idle bg (hover fill —
  * radius-clamped to a circle via dc_bar_clamp_radius() — lands with the S6
- * hover pass), icon at barIconSize(-6), letter fallback otherwise
- * (docs/12-BAR-SPEC.md sec.4 systemTray). Pushes each item's own hit rect
- * (DC_BAR_REGION_TRAY, payload = item index) — clicking is still a no-op
- * until S6 wires actions. */
+ * hover pass), icon at barIconSize(-6) (named icon, else IconPixmap, else a
+ * letter fallback -- docs/12-BAR-SPEC.md sec.4 systemTray). Pushes each
+ * item's own hit rect (DC_BAR_REGION_TRAY, payload = item index); main.c
+ * routes left/middle/right clicks there to Activate/SecondaryActivate/the
+ * dbusmenu popup (docs/POLISH.md P4). */
 static float measure_tray(dc_bar *bar)
 {
     if (!bar->tray)
@@ -1488,6 +1561,8 @@ static void draw_tray_pill(dc_bar *bar, const dc_pill *p)
     for (int i = 0; i < n; i++) {
         float cx = x + DC_BAR_TRAY_CHIP / 2.0f;
         int img = items[i]->icon_name[0] ? get_tray_image(bar, items[i]->icon_name) : 0;
+        if (img <= 0)
+            img = get_tray_pixmap_image(bar, i, items[i]->service, items[i]->path);
         if (img > 0) {
             NVGpaint pat = nvgImagePattern(vg, cx - icon_sz / 2.0f, p->cy - icon_sz / 2.0f,
                                            icon_sz, icon_sz, 0.0f, img, 1.0f);
@@ -1508,6 +1583,8 @@ static void draw_tray_pill(dc_bar *bar, const dc_pill *p)
         bar_push_hit(bar, x, x + DC_BAR_TRAY_CHIP, DC_BAR_REGION_TRAY, i);
         x += DC_BAR_TRAY_CHIP + DC_BAR_TRAY_GAP;
     }
+
+    gc_tray_pixmap_cache(bar);
 }
 
 /* --- controlCenterButton --------------------------------------------------- */

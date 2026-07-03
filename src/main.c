@@ -35,9 +35,11 @@
 #include "ui/processes.h"
 #include "ui/settings.h"
 #include "ui/toasts.h"
+#include "ui/tray_menu.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
+#include <linux/input-event-codes.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -155,6 +157,8 @@ struct click_ctx {
     dc_dashboard *dashboard;
     dc_notifications *notifications;
     dc_powermenu *powermenu;
+    dc_tray *tray;
+    dc_tray_menu *tray_menu;
 };
 
 /* logind asked us to lock (pre-sleep / lock-session). */
@@ -334,9 +338,8 @@ static void print_keybinds(void)
 
 /* Route a left click: into the control-center popup if it's the target, else to
  * the bar under the pointer (toggle the control center, or dismiss it). */
-static void handle_bar_click(struct wl_surface *surface, double x, double y, void *data)
+static void handle_left_click(struct wl_surface *surface, double x, double y, struct click_ctx *ctx)
 {
-    struct click_ctx *ctx = data;
     dc_control_center *cc = ctx->control_center;
 
     if (dc_toasts_handle_click(ctx->toasts, surface, x, y))
@@ -390,6 +393,11 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
         return;
     }
 
+    if (dc_tray_menu_visible(ctx->tray_menu) && surface == dc_tray_menu_surface(ctx->tray_menu)) {
+        dc_tray_menu_handle_click(ctx->tray_menu, x, y);
+        return;
+    }
+
     for (int i = 0; i < ctx->set->count; i++) {
         dc_bar *bar = ctx->set->bars[i];
         if (dc_bar_surface(bar) != surface)
@@ -426,6 +434,10 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
             dc_dashboard_toggle(ctx->dashboard, dc_bar_output(bar), DC_DASH_MEDIA);
         } else if (region == DC_BAR_REGION_WEATHER) {
             dc_dashboard_toggle(ctx->dashboard, dc_bar_output(bar), DC_DASH_WEATHER);
+        } else if (region == DC_BAR_REGION_TRAY) {
+            /* Click-to-activate (docs/POLISH.md P4): left click opens the
+             * item's primary action (e.g. a player's main window). */
+            dc_tray_activate(ctx->tray, payload, (int)x, (int)y);
         } else {
             if (dc_control_center_visible(cc))
                 dc_control_center_hide(cc);
@@ -437,9 +449,45 @@ static void handle_bar_click(struct wl_surface *surface, double x, double y, voi
                 dc_processes_hide(ctx->processes);
             if (dc_dashboard_visible(ctx->dashboard))
                 dc_dashboard_hide(ctx->dashboard);
+            if (dc_tray_menu_visible(ctx->tray_menu))
+                dc_tray_menu_hide(ctx->tray_menu);
         }
         return;
     }
+}
+
+/* Middle/right click on a bar surface: only the systemTray widget reacts
+ * (docs/POLISH.md P4) -- middle-click SecondaryActivate, right-click opens
+ * the item's dbusmenu popup (or falls back to ContextMenu(x,y) if it has
+ * none; see dc_tray_menu_open()). Every other widget ignores non-left
+ * clicks, same as before this feature existed. */
+static void handle_other_click(struct wl_surface *surface, double x, double y, uint32_t button,
+                               struct click_ctx *ctx)
+{
+    for (int i = 0; i < ctx->set->count; i++) {
+        dc_bar *bar = ctx->set->bars[i];
+        if (dc_bar_surface(bar) != surface)
+            continue;
+        int payload = 0;
+        dc_bar_region region = dc_bar_hittest(bar, x, y, &payload);
+        if (region != DC_BAR_REGION_TRAY)
+            return;
+        if (button == BTN_MIDDLE)
+            dc_tray_secondary_activate(ctx->tray, payload, (int)x, (int)y);
+        else if (button == BTN_RIGHT)
+            dc_tray_menu_open(ctx->tray_menu, dc_bar_output(bar), payload, (int)x, (int)y);
+        return;
+    }
+}
+
+static void handle_bar_click(struct wl_surface *surface, double x, double y, uint32_t button,
+                             void *data)
+{
+    struct click_ctx *ctx = data;
+    if (button == BTN_LEFT)
+        handle_left_click(surface, x, y, ctx);
+    else
+        handle_other_click(surface, x, y, button, ctx);
 }
 
 /* Pointer motion over any DankC surface: forward to whichever one it's over
@@ -675,6 +723,7 @@ int main(int argc, char **argv)
     dc_control_center *control_center = dc_control_center_create(wl, &egl, &render);
     dc_battery_popout *battery_popout = dc_battery_popout_create(wl, &egl, &render);
     dc_osd *osd = dc_osd_create(wl, &egl, &render);
+    dc_tray_menu *tray_menu = dc_tray_menu_create(wl, &egl, &render, dbus, tray);
 
     dc_output *first_output = NULL;
     wl_list_for_each(first_output, &wl->outputs, link) {
@@ -733,7 +782,9 @@ int main(int argc, char **argv)
                              .settings = settings,
                              .dashboard = dashboard,
                              .notifications = notifications,
-                             .powermenu = powermenu};
+                             .powermenu = powermenu,
+                             .tray = tray,
+                             .tray_menu = tray_menu};
     dc_wayland_set_click_cb(wl, handle_bar_click, &cctx);
     dc_wayland_set_motion_cb(wl, handle_bar_motion, &cctx);
     dc_wayland_set_leave_cb(wl, handle_bar_leave, &cctx);
@@ -854,6 +905,7 @@ int main(int argc, char **argv)
 
     dc_info("shutting down");
     dc_logind_destroy(logind);
+    dc_tray_menu_destroy(tray_menu);
     dc_tray_destroy(tray);
     dc_powermenu_destroy(powermenu);
     dc_lock_destroy(lock);
