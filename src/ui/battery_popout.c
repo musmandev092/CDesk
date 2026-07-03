@@ -7,6 +7,7 @@
 #include "render/icons.h"
 #include "render/nvg.h"
 #include "services/battery.h"
+#include "services/power.h"
 #include "theme/theme.h"
 #include "ui/popout.h"
 #include "wayland/egl.h"
@@ -16,8 +17,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <unistd.h>
 
 #include "fractional-scale-v1-client-protocol.h"
 #include "nanovg.h"
@@ -30,7 +29,9 @@
  * two stat cards (Health/Capacity), and a 3-way power-profile segmented
  * control (docs/13-POPOUTS-SPEC.md sec.2). */
 #define DC_BP_WIDTH 360
-#define DC_BP_HEIGHT 260
+/* +26px over the original 260 to fit the raw-profile-name caption line under
+ * the power-profile segments (see bp_get_layout's caption_y/caption_h). */
+#define DC_BP_HEIGHT 286
 #define DC_SCALE_BASE 120
 /* Inset from the screen's right edge when bar-adjacent. Battery sits just
  * left of controlCenterButton in the bar's right cluster (bar.c's widget
@@ -97,81 +98,17 @@ static inline NVGcolor tc_alpha(dc_color c, int a)
     return nvgRGBA(c.r, c.g, c.b, (unsigned char)a);
 }
 
-/* Run a shell command detached (children auto-reaped via SIG_IGN on SIGCHLD,
- * set in main.c) -- same pattern as controlcenter.c's run_detached(). */
-static void run_detached(const char *cmd)
-{
-    pid_t pid = fork();
-    if (pid == 0) {
-        setsid();
-        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
-        _exit(127);
-    }
-}
+/* --- power profiles: src/services/power.c does the real work (backend
+ * detection across power-profiles-daemon / tuned D-Bus / tuned-adm CLI,
+ * caching, mode<->profile mapping). This file just renders the 3-mode
+ * segmented control and the raw-profile caption. --------------------------- */
 
-/* --- power-profiles-daemon, via `powerprofilesctl` (docs/13-POPOUTS-SPEC.md
- * sec.2: "power-profiles-daemon over D-Bus (or powerprofilesctl)" -- the CLI
- * avoids a direct sd-bus dependency for a single 3-state toggle). ---------- */
+static const char *const power_mode_labels[3] = {"Power Saver", "Balanced", "Performance"};
 
-typedef enum {
-    DC_PP_POWER_SAVER = 0,
-    DC_PP_BALANCED = 1,
-    DC_PP_PERFORMANCE = 2,
-} dc_power_profile;
-
-static const char *const power_profile_names[3] = {"power-saver", "balanced", "performance"};
-static const char *const power_profile_labels[3] = {"Power Saver", "Balanced", "Performance"};
-
-/* `command -v powerprofilesctl` once per process -- cheap and the binary's
- * presence doesn't change at runtime. */
-static bool power_profiles_available(void)
-{
-    static int cached = -1; /* -1 unknown, 0 no, 1 yes */
-    if (cached < 0)
-        cached = (system("command -v powerprofilesctl >/dev/null 2>&1") == 0) ? 1 : 0;
-    return cached == 1;
-}
-
-/* Currently-active profile index, or -1 if unavailable/unknown. Cached
- * per-second like controlcenter.c's audio_source_read(), since this can be
- * queried once per render frame during the entrance animation. */
-static int active_power_profile(void)
-{
-    static int cache = -1;
-    static time_t cache_time;
-
-    if (!power_profiles_available())
-        return -1;
-
-    time_t now = time(NULL);
-    if (cache_time == now)
-        return cache;
-    cache_time = now;
-    cache = -1;
-
-    FILE *pipe = popen("powerprofilesctl get 2>/dev/null", "r");
-    if (pipe) {
-        char line[64];
-        if (fgets(line, sizeof(line), pipe)) {
-            line[strcspn(line, "\n")] = '\0';
-            for (int i = 0; i < 3; i++) {
-                if (strcmp(line, power_profile_names[i]) == 0) {
-                    cache = i;
-                    break;
-                }
-            }
-        }
-        pclose(pipe);
-    }
-    return cache;
-}
-
-static void set_power_profile(dc_power_profile p)
-{
-    char cmd[64];
-    snprintf(cmd, sizeof(cmd), "powerprofilesctl set %s", power_profile_names[p]);
-    run_detached(cmd);
-}
+/* Exact DMS slug for each mode -- used to decide whether the raw active
+ * profile needs a caption (docs task: "show the raw tuned profile name as a
+ * small caption if it doesn't exactly match a mode"). */
+static const char *const power_mode_slugs[3] = {"power-saver", "balanced", "performance"};
 
 /* --- layout: shared by bp_render (draw) and handle_click (hit-test) ------ */
 
@@ -189,6 +126,8 @@ typedef struct {
 
     float profiles_y, profiles_h;
     float seg_x[3], seg_w, seg_gap;
+
+    float caption_y, caption_h; /* raw backend profile name, e.g. "throughput-performance" */
 } bp_layout;
 
 static bp_layout bp_get_layout(float w)
@@ -224,6 +163,9 @@ static bp_layout bp_get_layout(float w)
     l.seg_w = (l.iw - 2.0f * l.seg_gap) / 3.0f;
     for (int i = 0; i < 3; i++)
         l.seg_x[i] = l.ix + (float)i * (l.seg_w + l.seg_gap);
+
+    l.caption_y = l.profiles_y + l.profiles_h + 8.0f;
+    l.caption_h = 18.0f;
 
     return l;
 }
@@ -448,12 +390,33 @@ static void bp_render(dc_battery_popout *bp)
     draw_stat_card(bp->render, l.stat_x[1], l.stats_y, l.stat_w, l.stat_h, "Capacity", capacity_buf,
                   t->surface_text);
 
-    /* --- Power profile segmented control ------------------------------- */
-    bool pp_avail = power_profiles_available();
-    int active = pp_avail ? active_power_profile() : -1;
+    /* --- Power profile segmented control --------------------------------- */
+    dc_power_info pw = {0};
+    bool pw_avail = dc_power_read(&pw);
     for (int i = 0; i < 3; i++) {
+        bool seg_dimmed =
+            !pw_avail || (i == DC_POWER_MODE_PERFORMANCE && !pw.has_performance_mode);
         draw_profile_segment(bp->render, l.seg_x[i], l.profiles_y, l.seg_w, l.profiles_h,
-                             power_profile_labels[i], active == i, !pp_avail);
+                             power_mode_labels[i], pw.active_mode == i, seg_dimmed);
+    }
+
+    /* Raw backend profile name as a caption, only when it doesn't exactly
+     * match one of the 3 mode slugs -- tuned's "throughput-performance" maps
+     * onto Performance but isn't literally "performance". */
+    if (pw_avail && pw.active_profile[0] &&
+        !(pw.active_mode != DC_POWER_MODE_UNKNOWN &&
+          strcmp(pw.active_profile, power_mode_slugs[pw.active_mode]) == 0)) {
+        const char *prefix = (pw.backend == DC_POWER_BACKEND_TUNED_DBUS ||
+                              pw.backend == DC_POWER_BACKEND_TUNED_CLI)
+                                 ? "tuned: "
+                                 : "";
+        char caption[96];
+        snprintf(caption, sizeof(caption), "%s%s", prefix, pw.active_profile);
+        nvgFontFaceId(vg, bp->render->font_ui);
+        nvgFontSize(vg, 12.0f);
+        nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+        nvgFillColor(vg, tc_alpha(t->surface_variant_text, 200));
+        nvgText(vg, l.ix + l.iw / 2.0f, l.caption_y + l.caption_h / 2.0f, caption, NULL);
     }
 
     nvgEndFrame(vg);
@@ -634,19 +597,21 @@ void dc_battery_popout_handle_click(dc_battery_popout *bp, double x, double y)
 
     /* Power profile segments. */
     if (y >= (double)l.profiles_y && y <= (double)(l.profiles_y + l.profiles_h)) {
-        if (!power_profiles_available()) {
-            /* TODO(P4-power-profiles): no power-profiles-daemon/powerprofilesctl
-             * found -- row stays dimmed and non-interactive until a fallback
-             * (direct sd-bus call, or a different backend) is added. */
-            dc_debug("battery popout: power profiles unavailable (TODO)");
+        dc_power_info pw = {0};
+        if (!dc_power_read(&pw)) {
+            /* No backend (power-profiles-daemon, tuned D-Bus, or tuned-adm)
+             * found -- row stays dimmed and non-interactive. */
+            dc_debug("battery popout: power profiles unavailable");
             return;
         }
         for (int i = 0; i < 3; i++) {
-            if (x >= (double)l.seg_x[i] && x <= (double)(l.seg_x[i] + l.seg_w)) {
-                set_power_profile((dc_power_profile)i);
-                bp_render(bp);
-                return;
-            }
+            if (x < (double)l.seg_x[i] || x > (double)(l.seg_x[i] + l.seg_w))
+                continue;
+            if (i == DC_POWER_MODE_PERFORMANCE && !pw.has_performance_mode)
+                return; /* dimmed segment, not selectable */
+            dc_power_set_mode((dc_power_mode)i);
+            bp_render(bp);
+            return;
         }
     }
 }

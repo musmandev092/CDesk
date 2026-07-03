@@ -18,6 +18,7 @@
 #include "services/logind.h"
 #include "services/mpris.h"
 #include "services/notifications.h"
+#include "services/power.h"
 #include "services/sysmon.h"
 #include "services/tray.h"
 #include "services/weather.h"
@@ -643,6 +644,7 @@ int main(int argc, char **argv)
     dc_dbus *dbus = dc_dbus_connect();
     dc_bluez_init(dbus);
     dc_mpris_init(dbus);
+    dc_power_init(dbus);
     dc_notifications *notifications = dc_notifications_create(dbus);
     dc_tray *tray = dc_tray_create(dbus);
 

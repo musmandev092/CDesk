@@ -24,9 +24,6 @@ Weather w/ 7-day forecast/Media w/ album art/Wallpapers; clock/music/weather chi
 Plus: full-Unicode fallback fonts + monochrome emoji; **Makefile now does header dep
 tracking (-MMD)** — stale-.o struct mismatches previously caused phantom "corruption";
 dc_render_icon now saves/restores nvg state (recurring garbled-text class killed).
-Remaining polish: tuned power-profile backend (in flight), notif action-images (in flight),
-settings/launcher/CC-depth/clipboard waves (in flight), HarfBuzz shaping, P7 perf (damage
-tracking, poll reduction, font subsetting). Plugins (T29) still deferred.
 Power menu modal DONE (wt/powermenu): centered modal, arm-then-confirm, login1 actions,
 `ctl power-menu`, Mod+Escape keybind, DANKC_POWER_DRYRUN/POWERMENU_DEMO hooks.
 Media marquee DONE (wt/marquee): bar music title scrolls DMS-style (2s pause / 60ms-per-px
@@ -35,6 +32,19 @@ Hourly forecast + wallpaper grid DONE (wt/dash): weather.c fetches &hourly=..., 
 Daily/Hourly pills toggle a next-24h strip; Wallpapers tab is a lazy-thumbnail 4-col grid
 (stb decode + box-sample, 2/frame), click = config wallpaper + dynamic color +
 swaybg-if-present, wheel scroll.
+
+**Tuned power-profile backend DONE** (wt/tuned): `src/services/power.c/.h` — real 3-mode
+(power-saver/balanced/performance) power-profile service backed by whichever of (a)
+`org.freedesktop.UPower.PowerProfiles`, (b) tuned's native `com.redhat.tuned` D-Bus control, or
+(c) the `tuned-adm` CLI is available, probed lazily and cached ~5s like bluez.c. The user runs
+`tuned` (not power-profiles-daemon); tuned ships its own `tuned-ppd` bridge service that speaks
+the standard PowerProfiles interface backed by real tuned profiles, so that's the backend
+actually used. battery_popout.c's segmented control is wired to it (click to switch, active
+mode highlighted, raw tuned profile name shown as a caption when it doesn't exactly match a
+mode slug, e.g. "tuned: throughput-performance" for Performance).
+Remaining polish: notif action-images, settings/launcher/CC-depth/clipboard waves, HarfBuzz
+shaping, P7 perf (damage tracking, poll reduction, font subsetting). Plugins (T29) still
+deferred.
 
 ## Previous status — bar parity DONE ✅ (S1–S6, 2026-07-02); panels parity next
 Bar now pixel-matches the user's live DMS bottom bar (docs/12-BAR-SPEC.md, commits

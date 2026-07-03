@@ -31,7 +31,12 @@ Dashboard or DankDash,AppDrawer,...}`. Verify exact tokens in QML before impleme
 - Header: big "94%" + "Fully Charged" + battery icon (green), X close.
 - Two stat cards: "Health 64%" | "Capacity 31.8 Wh" (sysfs energy_full/_design).
 - Power-profile segmented buttons: Power Saver / Balanced / Performance (✓ active, green)
-  → power-profiles-daemon over D-Bus (or `powerprofilesctl`).
+  → `src/services/power.c`: power-profiles-daemon (`org.freedesktop.UPower.PowerProfiles`) if
+  present, else tuned's native D-Bus control (`com.redhat.tuned`), else the `tuned-adm` CLI.
+  The user runs `tuned` (not `power-profiles-daemon`) — tuned's own `tuned-ppd` bridge service
+  speaks the standard PowerProfiles interface backed by real tuned profiles, so that's usually
+  the backend picked. A small caption under the segments shows the raw backend profile name
+  (e.g. "tuned: throughput-performance") when it doesn't exactly match one of the 3 mode slugs.
 
 ## 3. Notification Center (14-17-48)
 - Header: "Notifications" + bell, right: info, settings, "Clear" button (with icon).
