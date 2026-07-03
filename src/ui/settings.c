@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pwd.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <time.h>
@@ -89,6 +90,13 @@
  * own new glyph (render/icons.h). */
 #define IC_LOCK_SCREEN DC_ICON_LOCK
 #define IC_WINDOW_RULES DC_ICON_SELECT_WINDOW
+/* docs/14-COMPLETION-PLAN.md W5 stretch tabs. Users reuses the existing
+ * PERSON glyph (already used elsewhere), so no new render/icons.h entry was
+ * needed for it. */
+#define IC_MUX DC_ICON_TERMINAL
+#define IC_SYSTEM_UPDATER DC_ICON_UPDATE
+#define IC_PRINTER DC_ICON_PRINT
+#define IC_USERS DC_ICON_PERSON
 
 typedef enum {
     TAB_PERSONALIZATION = 0,
@@ -112,6 +120,10 @@ typedef enum {
     TAB_POWER,
     TAB_LOCKSCREEN,
     TAB_WINDOW_RULES,
+    TAB_MUX,
+    TAB_SYSTEM_UPDATER,
+    TAB_PRINTER,
+    TAB_USERS,
     TAB_ABOUT,
     TAB_COUNT,
 } s_tab;
@@ -132,7 +144,9 @@ static const s_tab_def TABS[TAB_COUNT] = {
     {IC_LANGUAGE, "Locale"},              {IC_COMPUTER, "System"},
     {IC_TUNE, "OSD"},                     {IC_COLOR_LENS, "Theme & Colors"},
     {IC_POWER, "Power"},                  {IC_LOCK_SCREEN, "Lock Screen"},
-    {IC_WINDOW_RULES, "Window Rules"},    {IC_INFO, "About"},
+    {IC_WINDOW_RULES, "Window Rules"},    {IC_MUX, "Multiplexer"},
+    {IC_SYSTEM_UPDATER, "System Updater"}, {IC_PRINTER, "Printer"},
+    {IC_USERS, "Users"},                  {IC_INFO, "About"},
 };
 
 struct dc_settings {
@@ -2662,6 +2676,295 @@ static void tab_lockscreen(uictx *c)
     ui_hint(c, "unlock with your normal password).");
 }
 
+/* ====================== W5 stretch tabs (docs/14-COMPLETION-PLAN.md) ======================
+ *
+ * Lower-priority MISSING tabs, each read-only-safe: list real system state via
+ * a real command, never mutate anything the user didn't explicitly ask for
+ * (System Updater's "Check" button runs the read-only `checkupdates` query,
+ * never an actual upgrade -- matches the task's explicit "do NOT run updates
+ * automatically"). Multiplexer's "attach" action is the one exception that
+ * launches something (a terminal), which is the whole point of the feature.
+ */
+
+#define DC_MUX_MAX 8
+#define DC_MUX_NAME_MAX 64
+
+typedef struct {
+    char name[DC_MUX_NAME_MAX];
+    int windows; /* tmux only; -1 if unknown (zellij doesn't report this via list-sessions) */
+} mux_session;
+
+/* `tmux list-sessions -F '#{session_name}:#{session_windows}'` -> one
+ * "name:N" per line. */
+static int mux_tmux_list(mux_session *out, int max)
+{
+    int n = 0;
+    FILE *pipe = popen("tmux list-sessions -F '#{session_name}:#{session_windows}' 2>/dev/null", "r");
+    if (!pipe)
+        return 0;
+    char line[160];
+    while (n < max && fgets(line, sizeof(line), pipe)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        char *colon = strrchr(line, ':');
+        if (!colon)
+            continue;
+        *colon = '\0';
+        out[n].windows = atoi(colon + 1);
+        copy_trunc(out[n].name, sizeof(out[n].name), line);
+        n++;
+    }
+    pclose(pipe);
+    return n;
+}
+
+/* `zellij list-sessions` output is one session per line, name first
+ * (optionally followed by " [Created ...]"/"[current]" -- best-effort: take
+ * the first whitespace-delimited token). Zellij isn't installed on the dev
+ * machine this was written on, so this is unverified against real output;
+ * kept intentionally tolerant (worst case a session name mis-parses and is
+ * skipped, never a crash). */
+static int mux_zellij_list(mux_session *out, int max)
+{
+    int n = 0;
+    FILE *pipe = popen("zellij list-sessions 2>/dev/null", "r");
+    if (!pipe)
+        return 0;
+    char line[160];
+    while (n < max && fgets(line, sizeof(line), pipe)) {
+        size_t len = strcspn(line, " \t\n\r");
+        if (len == 0 || len >= sizeof(out[0].name))
+            continue;
+        memcpy(out[n].name, line, len);
+        out[n].name[len] = '\0';
+        out[n].windows = -1;
+        n++;
+    }
+    pclose(pipe);
+    return n;
+}
+
+#define DC_MUX_CMD_MAX 200
+
+/* Try a handful of common terminal emulators in order and run `inner_cmd`
+ * inside whichever is found first, detached (fire-and-forget, matching
+ * run_detached()'s existing DANKC_SETTINGS_DRYRUN gate below). `inner_cmd` is
+ * a fixed-size array (not just `const char *`) so its bound stays visible to
+ * the caller's -Wformat-truncation analysis all the way through -- see
+ * copy_trunc()'s doc comment at the top of this file for the same rationale. */
+static void mux_launch_terminal(const char inner_cmd[DC_MUX_CMD_MAX])
+{
+    char cmd[2 * DC_MUX_CMD_MAX + 200];
+    snprintf(cmd, sizeof(cmd),
+             "for t in foot kitty alacritty wezterm ghostty xterm; do "
+             "command -v \"$t\" >/dev/null 2>&1 || continue; "
+             "if [ \"$t\" = wezterm ]; then \"$t\" start -- sh -c '%s' & else "
+             "\"$t\" -e sh -c '%s' & fi; exit 0; done",
+             inner_cmd, inner_cmd);
+    run_detached(cmd);
+}
+
+/* docs/14-COMPLETION-PLAN.md W5.1: tmux/zellij session list, read-only, plus
+ * an "attach in terminal" action per session (the one launch this tab does --
+ * attaching to an existing session mutates nothing dankc doesn't already
+ * consider safe, same trust level as the launcher opening any other app). */
+static void tab_mux(uictx *c)
+{
+    ui_section(c, "TMUX");
+    mux_session tsessions[DC_MUX_MAX];
+    int tn = mux_tmux_list(tsessions, DC_MUX_MAX);
+    if (tn == 0) {
+        bool installed = system("command -v tmux >/dev/null 2>&1") == 0;
+        ui_hint(c, installed ? "No tmux sessions running" : "tmux not installed");
+    } else {
+        for (int i = 0; i < tn; i++) {
+            char status[32];
+            snprintf(status, sizeof(status), "%d window%s", tsessions[i].windows,
+                     tsessions[i].windows == 1 ? "" : "s");
+            if (ui_list_row(c, tsessions[i].name, status, IC_MUX, false) == 1) {
+                char name[DC_MUX_NAME_MAX];
+                copy_trunc(name, sizeof(name), tsessions[i].name);
+                char cmd[DC_MUX_CMD_MAX];
+                snprintf(cmd, sizeof(cmd), "tmux attach -t '%s'", name);
+                mux_launch_terminal(cmd);
+            }
+        }
+    }
+
+    ui_section(c, "ZELLIJ");
+    mux_session zsessions[DC_MUX_MAX];
+    int zn = mux_zellij_list(zsessions, DC_MUX_MAX);
+    if (zn == 0) {
+        bool installed = system("command -v zellij >/dev/null 2>&1") == 0;
+        ui_hint(c, installed ? "No zellij sessions running" : "zellij not installed");
+    } else {
+        for (int i = 0; i < zn; i++) {
+            if (ui_list_row(c, zsessions[i].name, NULL, IC_MUX, false) == 1) {
+                char name[DC_MUX_NAME_MAX];
+                copy_trunc(name, sizeof(name), zsessions[i].name);
+                char cmd[DC_MUX_CMD_MAX];
+                snprintf(cmd, sizeof(cmd), "zellij attach '%s'", name);
+                mux_launch_terminal(cmd);
+            }
+        }
+    }
+    ui_hint(c, "Read-only list; click a session to attach in a new terminal.");
+}
+
+/* docs/14-COMPLETION-PLAN.md W5.2: Arch's `checkupdates` (pacman-contrib) --
+ * a read-only sync-db-then-compare check that never touches the real pacman
+ * DB or installs anything. Explicitly NOT run automatically or on every
+ * render (it syncs a temp package DB over the network, which would be both
+ * slow -- blocking dankc's single-threaded event loop -- and rude to do
+ * unprompted): only a detached background run kicked off by the "Check for
+ * updates" button, polled via a small cache file so the render loop never
+ * blocks on it. */
+#define DC_UPDATES_CACHE "/tmp/dankc-checkupdates.out"
+
+static bool updates_backend_available(void)
+{
+    return system("command -v checkupdates >/dev/null 2>&1") == 0;
+}
+
+static void updates_check_now(void)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+             "{ checkupdates 2>/dev/null || true; } >" DC_UPDATES_CACHE ".tmp 2>/dev/null && "
+             "mv " DC_UPDATES_CACHE ".tmp " DC_UPDATES_CACHE);
+    run_detached(cmd);
+}
+
+/* Reads the last completed check's line count + the cache file's mtime (as
+ * "last checked"). Returns false if no check has completed yet. */
+static bool updates_read_cache(int *count, time_t *mtime)
+{
+    struct stat st;
+    if (stat(DC_UPDATES_CACHE, &st) != 0)
+        return false;
+    *mtime = st.st_mtime;
+    FILE *f = fopen(DC_UPDATES_CACHE, "r");
+    if (!f)
+        return false;
+    int n = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f))
+        if (line[0] != '\n')
+            n++;
+    fclose(f);
+    *count = n;
+    return true;
+}
+
+static void tab_system_updater(uictx *c)
+{
+    ui_section(c, "PACKAGE UPDATES (ARCH)");
+    if (!updates_backend_available()) {
+        ui_hint(c, "checkupdates not found (pacman-contrib package) -- Arch-only");
+        return;
+    }
+
+    int count = 0;
+    time_t mtime = 0;
+    if (updates_read_cache(&count, &mtime)) {
+        char cv[16];
+        snprintf(cv, sizeof(cv), "%d", count);
+        ui_value(c, "Updates available", cv);
+        char when[64];
+        struct tm tm;
+        localtime_r(&mtime, &tm);
+        strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &tm);
+        ui_value(c, "Last checked", when);
+    } else {
+        ui_hint(c, "Not checked yet this session");
+    }
+
+    if (ui_list_row(c, "Check for updates", NULL, IC_SYSTEM_UPDATER, false) == 1)
+        updates_check_now();
+
+    ui_hint(c, "Runs `checkupdates` (syncs a temp package DB, read-only) --");
+    ui_hint(c, "never installs or upgrades anything automatically.");
+}
+
+/* docs/14-COMPLETION-PLAN.md W5.3: CUPS printer list via `lpstat -p`,
+ * read-only (low priority per the task -- no printer-management UI, just
+ * visibility). Each line looks like "printer <name> is idle.  enabled ..."
+ * or "printer <name> disabled since ...". */
+#define DC_PRINTER_MAX 8
+
+typedef struct {
+    char name[64];
+    char status[96];
+} printer_entry;
+
+static int printers_read(printer_entry *out, int max)
+{
+    int n = 0;
+    FILE *pipe = popen("lpstat -p 2>/dev/null", "r");
+    if (!pipe)
+        return 0;
+    char line[256];
+    while (n < max && fgets(line, sizeof(line), pipe)) {
+        if (strncmp(line, "printer ", 8) != 0)
+            continue;
+        char *name = line + 8;
+        char *sp = strchr(name, ' ');
+        if (!sp)
+            continue;
+        size_t nlen = (size_t)(sp - name);
+        if (nlen >= sizeof(out[n].name))
+            nlen = sizeof(out[n].name) - 1;
+        memcpy(out[n].name, name, nlen);
+        out[n].name[nlen] = '\0';
+
+        char *rest = sp + 1;
+        size_t rl = strlen(rest);
+        while (rl > 0 && (rest[rl - 1] == '\n' || rest[rl - 1] == '\r'))
+            rest[--rl] = '\0';
+        copy_trunc(out[n].status, sizeof(out[n].status), rest);
+        n++;
+    }
+    pclose(pipe);
+    return n;
+}
+
+static void tab_printer(uictx *c)
+{
+    ui_section(c, "PRINTERS");
+    printer_entry printers[DC_PRINTER_MAX];
+    int n = printers_read(printers, DC_PRINTER_MAX);
+    if (n == 0) {
+        ui_hint(c, "No printers configured (CUPS `lpstat -p` returned nothing)");
+    } else {
+        for (int i = 0; i < n; i++)
+            ui_list_row(c, printers[i].name, printers[i].status, 0, false);
+    }
+    ui_hint(c, "Read-only -- manage printers via system-config-printer or");
+    ui_hint(c, "the CUPS web UI (http://localhost:631).");
+}
+
+/* docs/14-COMPLETION-PLAN.md W5.4: current-user info, read-only (lowest
+ * priority in the whole plan -- mostly irrelevant on a single-user desktop,
+ * per the task). No user-switching UI: dankc has no greeter/multi-seat
+ * story (see docs/14's "Deliberately out of scope" > Greeter). */
+static void tab_users(uictx *c)
+{
+    ui_section(c, "CURRENT USER");
+    struct passwd *pw = getpwuid(getuid());
+    ui_value(c, "Username", pw && pw->pw_name ? pw->pw_name : "(unknown)");
+    char uidbuf[16];
+    snprintf(uidbuf, sizeof(uidbuf), "%d", (int)getuid());
+    ui_value(c, "UID", uidbuf);
+    ui_value(c, "Home directory", pw && pw->pw_dir ? pw->pw_dir : "(unknown)");
+    ui_value(c, "Shell", pw && pw->pw_shell ? pw->pw_shell : "(unknown)");
+    char hostname[256] = "(unknown)";
+    gethostname(hostname, sizeof(hostname) - 1);
+    ui_value(c, "Hostname", hostname);
+    ui_hint(c, "Single-user desktop -- read-only; dankc has no user-switching");
+    ui_hint(c, "or account-management UI (see a real DE's Settings for that).");
+}
+
 static void tab_about(uictx *c)
 {
     if (c->mode == UI_RENDER) {
@@ -2784,6 +3087,18 @@ static void build_tab(uictx *c)
         break;
     case TAB_WINDOW_RULES:
         tab_window_rules(c);
+        break;
+    case TAB_MUX:
+        tab_mux(c);
+        break;
+    case TAB_SYSTEM_UPDATER:
+        tab_system_updater(c);
+        break;
+    case TAB_PRINTER:
+        tab_printer(c);
+        break;
+    case TAB_USERS:
+        tab_users(c);
         break;
     case TAB_ABOUT:
         tab_about(c);
