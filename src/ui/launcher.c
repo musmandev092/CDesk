@@ -6,6 +6,7 @@
 #include "dc.h"
 #include "render/icons.h"
 #include "render/nvg.h"
+#include "render/shape.h"
 #include "services/apps.h"
 #include "services/calc.h"
 #include "services/history.h"
@@ -490,12 +491,12 @@ static void draw_list_row(dc_launcher *l, const dc_app *app, float x, float y, f
     nvgFontSize(vg, 14.0f);
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
     nvgFillColor(vg, tc(t->surface_text));
-    nvgText(vg, text_x, name_cy, app->name, NULL);
+    dc_shape_draw_text(l->render, text_x, name_cy, app->name, NULL);
 
     if (has_desc) {
         nvgFontSize(vg, 12.0f);
         nvgFillColor(vg, tc_alpha(t->surface_text, 140));
-        nvgText(vg, text_x, y + 40.0f, app->desc, NULL);
+        dc_shape_draw_text(l->render, text_x, y + 40.0f, app->desc, NULL);
     }
 
     nvgRestore(vg);
@@ -537,7 +538,7 @@ static void draw_grid_cell(dc_launcher *l, const dc_app *app, float x, float y, 
     nvgFontSize(vg, 12.0f);
     nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_TOP);
     nvgFillColor(vg, tc(t->surface_text));
-    nvgText(vg, x + w / 2.0f, icy + isz + 6.0f, app->name, NULL);
+    dc_shape_draw_text(l->render, x + w / 2.0f, icy + isz + 6.0f, app->name, NULL);
     nvgRestore(vg);
 }
 
