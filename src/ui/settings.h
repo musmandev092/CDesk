@@ -31,7 +31,10 @@ bool dc_settings_visible(dc_settings *s);
 struct wl_surface *dc_settings_surface(dc_settings *s);
 
 void dc_settings_handle_click(dc_settings *s, double x, double y);
-void dc_settings_handle_scroll(dc_settings *s, int steps_v);
+/* `x` (surface-local) picks whether the wheel scrolls the sidebar tab list
+ * (now 20 tabs, taller than the window -- docs/14-COMPLETION-PLAN.md W2) or
+ * the active tab's content pane; see the .c file's routing comment. */
+void dc_settings_handle_scroll(dc_settings *s, double x, int steps_v);
 
 /* Keyboard: only consumed while a text field (e.g. weather lat/lon) has focus.
  * dc_settings_wants_keyboard() lets main.c route keys here first. */

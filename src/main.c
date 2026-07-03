@@ -790,6 +790,9 @@ struct axis_ctx {
     dc_settings *settings;
     dc_dashboard *dashboard;
     dc_keybinds_modal *keybinds_modal;
+    /* Settings' sidebar-vs-content scroll routing needs the pointer's current
+     * surface-local x (dc_wayland tracks the last motion position itself). */
+    dc_wayland *wl;
 };
 
 /* Scroll on a bar surface: vertical wheel -> workspace focus, horizontal ->
@@ -834,7 +837,7 @@ static void handle_bar_axis(struct wl_surface *surface, int steps_v, int steps_h
         return;
     }
     if (dc_settings_visible(actx->settings) && surface == dc_settings_surface(actx->settings)) {
-        dc_settings_handle_scroll(actx->settings, steps_v);
+        dc_settings_handle_scroll(actx->settings, actx->wl->pointer_x, steps_v);
         return;
     }
     if (dc_dashboard_visible(actx->dashboard) &&
@@ -1045,7 +1048,8 @@ int main(int argc, char **argv)
                             .launcher = launcher,
                             .settings = settings,
                             .dashboard = dashboard,
-                            .keybinds_modal = keybinds_modal};
+                            .keybinds_modal = keybinds_modal,
+                            .wl = wl};
     dc_wayland_set_axis_cb(wl, handle_bar_axis, &actx);
 
     struct control_ctx control_ctx = {.wl = wl,

@@ -182,4 +182,15 @@
  * WIFI/BLUETOOTH glyphs above, Power reuses the existing POWER glyph). */
 #define DC_ICON_DOCK_TO_BOTTOM 0xf7e6
 
+/* Settings tabs added by docs/14-COMPLETION-PLAN.md W2 (OSD, Typography &
+ * Motion, System, Locale, Default Apps, Theme & Colors). Values verified
+ * present (non-tofu) in assets/fonts/MaterialSymbolsRounded.ttf's cmap via
+ * fontTools, same convention as the block above (Default Apps reuses the
+ * existing APPS glyph). */
+#define DC_ICON_TUNE 0xe429         /* OSD tab */
+#define DC_ICON_TEXT_FORMAT 0xe165  /* Typography & Motion tab */
+#define DC_ICON_COMPUTER 0xe30a     /* System tab */
+#define DC_ICON_LANGUAGE 0xe894     /* Locale tab */
+#define DC_ICON_COLOR_LENS 0xe3b0   /* Theme & Colors tab */
+
 #endif /* DC_RENDER_ICONS_H */

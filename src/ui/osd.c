@@ -26,7 +26,6 @@
 
 #define DC_OSD_WIDTH 320
 #define DC_OSD_HEIGHT 60
-#define DC_OSD_TIMEOUT_MS 2000
 #define DC_SCALE_BASE 120
 /* Fixed bottom margin when the bar is at the TOP (no bar to clear down
  * there — just DMS's usual OSD lift off the screen edge). When the bar is
@@ -35,6 +34,9 @@
 #define DC_OSD_MARGIN_NO_BAR 80
 /* Extra visual gap above the bar, matching popout.c's DC_POPOUT_BAR_GAP. */
 #define DC_OSD_BAR_GAP 8
+/* Side inset for the bottom-left/bottom-right position variants (docs/14-
+ * COMPLETION-PLAN.md W2.3), matching the bar's own screen-edge spacing. */
+#define DC_OSD_SIDE_MARGIN 16
 
 /* OSD mode: either volume or brightness. */
 typedef enum {
@@ -274,11 +276,17 @@ static void osd_begin_close(dc_osd *osd)
     osd_render(osd);
 }
 
+/* Auto-hide delay, config-driven (docs/14-COMPLETION-PLAN.md W2.3, settings'
+ * OSD tab). Re-read from dc_config_current on every arm so a change while an
+ * OSD happens to be up takes effect on its very next re-arm. */
 static void arm_timer(dc_osd *osd)
 {
+    int ms = dc_config_current->osd_timeout_ms;
+    if (ms < 200)
+        ms = 200; /* guard against a corrupt/zero config value disarming the timer */
     struct itimerspec spec = {0};
-    spec.it_value.tv_sec = DC_OSD_TIMEOUT_MS / 1000;
-    spec.it_value.tv_nsec = (DC_OSD_TIMEOUT_MS % 1000) * 1000000L;
+    spec.it_value.tv_sec = ms / 1000;
+    spec.it_value.tv_nsec = (ms % 1000) * 1000000L;
     timerfd_settime(osd->timer_fd, 0, &spec, NULL);
 }
 
@@ -351,17 +359,45 @@ static void osd_show_generic(dc_osd *osd, dc_output *output, dc_osd_mode mode, i
     osd->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
         osd->wl->layer_shell, osd->surface, output ? output->wl_output : NULL,
         ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "dankc:osd");
-    zwlr_layer_surface_v1_set_anchor(osd->layer_surface, ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM);
     zwlr_layer_surface_v1_set_size(osd->layer_surface, DC_OSD_WIDTH, DC_OSD_HEIGHT);
-    /* OSD is always bottom-center (DMS osdPosition=5), independent of
-     * bar_position — but it must clear a bottom bar (docs/13-POPOUTS-SPEC.md
-     * sec.0). A top bar doesn't intrude on the bottom edge, so keep the
-     * original fixed lift there. */
+
+    /* Position (docs/14-COMPLETION-PLAN.md W2.3, config.h's osd_position):
+     * bottom variants must clear a bottom bar (docs/13-POPOUTS-SPEC.md
+     * sec.0); a top bar doesn't intrude on the bottom edge, so keep the
+     * original fixed lift there. The top-center variant mirrors that same
+     * logic against the top edge. */
     const dc_config *cfg = dc_config_current;
-    int32_t margin_bottom = (cfg->bar_position == DC_BAR_POSITION_BOTTOM)
-                                ? dc_bar_window_height(cfg) + DC_OSD_BAR_GAP
-                                : DC_OSD_MARGIN_NO_BAR;
-    zwlr_layer_surface_v1_set_margin(osd->layer_surface, 0, 0, margin_bottom, 0);
+    int32_t bottom_lift = (cfg->bar_position == DC_BAR_POSITION_BOTTOM)
+                              ? dc_bar_window_height(cfg) + DC_OSD_BAR_GAP
+                              : DC_OSD_MARGIN_NO_BAR;
+    int32_t top_lift = (cfg->bar_position == DC_BAR_POSITION_TOP)
+                           ? dc_bar_window_height(cfg) + DC_OSD_BAR_GAP
+                           : DC_OSD_MARGIN_NO_BAR;
+    uint32_t anchor;
+    int32_t mt = 0, mr = 0, mb = 0, ml = 0;
+    switch ((dc_osd_position)cfg->osd_position) {
+    case DC_OSD_POS_BOTTOM_LEFT:
+        anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT;
+        mb = bottom_lift;
+        ml = DC_OSD_SIDE_MARGIN;
+        break;
+    case DC_OSD_POS_BOTTOM_RIGHT:
+        anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
+        mb = bottom_lift;
+        mr = DC_OSD_SIDE_MARGIN;
+        break;
+    case DC_OSD_POS_TOP_CENTER:
+        anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP;
+        mt = top_lift;
+        break;
+    case DC_OSD_POS_BOTTOM_CENTER:
+    default:
+        anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM;
+        mb = bottom_lift;
+        break;
+    }
+    zwlr_layer_surface_v1_set_anchor(osd->layer_surface, anchor);
+    zwlr_layer_surface_v1_set_margin(osd->layer_surface, mt, mr, mb, ml);
     zwlr_layer_surface_v1_set_exclusive_zone(osd->layer_surface, -1);
     zwlr_layer_surface_v1_add_listener(osd->layer_surface, &layer_surface_listener, osd);
 

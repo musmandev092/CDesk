@@ -74,6 +74,15 @@ static dc_config config = {
     .material_blur = true,
 
     .autostart_enabled = true,
+
+    .osd_position = 0, /* DC_OSD_POS_BOTTOM_CENTER, matches osd.c's prior hardcoded behavior */
+    .osd_timeout_ms = 2000,
+
+    .font_scale = 1.0f,
+
+    .first_day_of_week = 0, /* Sunday, matches dashboard.c's prior hardcoded dow[] order */
+
+    .theme_mode = "dark",
 };
 
 const dc_config *dc_config_current = &config;
@@ -332,6 +341,12 @@ void dc_config_load(void)
     get_float(root, "frameRadius", &config.frame_radius, 0.0f, 200.0f);
     get_bool(root, "materialBlur", &config.material_blur);
     get_bool(root, "autostartEnabled", &config.autostart_enabled);
+
+    get_int(root, "osdPosition", &config.osd_position, 0, 3);
+    get_int(root, "osdTimeoutMs", &config.osd_timeout_ms, 500, 10000);
+    get_float(root, "fontScale", &config.font_scale, 0.8f, 1.5f);
+    get_int(root, "firstDayOfWeek", &config.first_day_of_week, 0, 6);
+    get_string(root, "themeMode", config.theme_mode, sizeof(config.theme_mode));
     cJSON_Delete(root);
 
     apply_theme();
@@ -444,6 +459,12 @@ void dc_config_save(void)
     cJSON_AddNumberToObject(root, "frameRadius", (double)config.frame_radius);
     cJSON_AddBoolToObject(root, "materialBlur", config.material_blur);
     cJSON_AddBoolToObject(root, "autostartEnabled", config.autostart_enabled);
+
+    cJSON_AddNumberToObject(root, "osdPosition", config.osd_position);
+    cJSON_AddNumberToObject(root, "osdTimeoutMs", config.osd_timeout_ms);
+    cJSON_AddNumberToObject(root, "fontScale", (double)config.font_scale);
+    cJSON_AddNumberToObject(root, "firstDayOfWeek", config.first_day_of_week);
+    cJSON_AddStringToObject(root, "themeMode", config.theme_mode);
 
     char *text = cJSON_Print(root);
     cJSON_Delete(root);
