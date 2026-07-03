@@ -148,6 +148,18 @@ typedef struct dc_config {
      * the dashboard calendar grid (0=Sunday .. 6=Saturday, matching struct
      * tm's tm_wday numbering used by ui/dashboard.c's draw_calendar_card()). */
     int first_day_of_week;
+
+    /* Lock Screen (docs/14-COMPLETION-PLAN.md W3.2, ui/lock.c): a pragmatic
+     * subset of DMS's 23-setting LockScreenTab.qml -- only the options
+     * ui/lock.c can actually honor (no fingerprint/U2F/video-screensaver/
+     * multi-monitor backend exists). Defaults match lock.c's prior
+     * hardcoded behavior (clock+date always shown, password field always
+     * visible, flat themed background). */
+    bool lock_show_clock;         /* big HH:MM clock */
+    bool lock_show_date;          /* weekday/date line under the clock */
+    bool lock_show_password_field; /* if false, the password pill only appears once typing starts */
+    bool lock_use_wallpaper_bg;   /* blurred wallpaper background (reuses `wallpaper` + material_blur's
+                                    * blur pipeline, ui/material_bg.c) instead of the flat surface fill */
 } dc_config;
 
 /* The active config. Read-only for the rest of the app. */

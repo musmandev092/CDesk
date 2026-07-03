@@ -1,11 +1,13 @@
 #include "ui/lock.h"
 
+#include "core/config.h"
 #include "core/log.h"
 #include "dc.h"
 #include "render/icons.h"
 #include "render/nvg.h"
 #include "services/auth.h"
 #include "theme/theme.h"
+#include "ui/material_bg.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
@@ -81,6 +83,7 @@ static void render_output(struct lock_output *o)
 
     NVGcontext *vg = l->render->vg;
     const dc_theme *t = dc_theme_current;
+    const dc_config *cfg = dc_config_current;
     const float w = o->logical_w, h = o->logical_h;
 
     glViewport(0, 0, o->phys_w, o->phys_h);
@@ -88,57 +91,80 @@ static void render_output(struct lock_output *o)
     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     nvgBeginFrame(vg, w, h, (float)o->scale120 / DC_SCALE_BASE);
 
-    /* Dim themed backdrop. */
-    nvgBeginPath(vg);
-    nvgRect(vg, 0, 0, w, h);
-    nvgFillColor(vg, tc(t->surface));
-    nvgFill(vg);
+    /* Background: blurred+dimmed wallpaper (docs/14-COMPLETION-PLAN.md
+     * W3.2's lock_use_wallpaper_bg config key, ui/material_bg.c) when opted
+     * in, else the flat themed fill (unconditional prior behavior). Like
+     * every other panel's dc_material_bg_fill_card() call, this internally
+     * falls back to the flat fill when materialBlur is off or no wallpaper
+     * is configured/readable -- so this toggle only visibly changes
+     * anything together with Personalization's "Material backgrounds"
+     * switch, same coupling every other panel already has. */
+    if (cfg->lock_use_wallpaper_bg) {
+        dc_material_bg_fill_card(vg, l->render, 0, 0, w, h, 0.0f);
+    } else {
+        nvgBeginPath(vg);
+        nvgRect(vg, 0, 0, w, h);
+        nvgFillColor(vg, tc(t->surface));
+        nvgFill(vg);
+    }
 
     /* Big clock. */
     time_t now = time(NULL);
     struct tm tm;
     localtime_r(&now, &tm);
-    char hhmm[16], date[64];
-    strftime(hhmm, sizeof(hhmm), "%H:%M", &tm);
-    strftime(date, sizeof(date), "%A, %B %-d", &tm);
-
-    nvgFontFaceId(vg, l->render->font_ui);
-    nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
-    nvgFontSize(vg, 96.0f);
-    nvgFillColor(vg, tc(t->surface_text));
-    nvgText(vg, w / 2.0f, h / 2.0f - 90.0f, hhmm, NULL);
-    nvgFontSize(vg, 22.0f);
-    nvgFillColor(vg, tc(t->surface_variant_text));
-    nvgText(vg, w / 2.0f, h / 2.0f - 30.0f, date, NULL);
-
-    /* Password field: a rounded pill with dots. */
-    const float fw = 320.0f, fh = 46.0f;
-    const float fx = w / 2.0f - fw / 2.0f, fy = h / 2.0f + 30.0f;
-    nvgBeginPath(vg);
-    nvgRoundedRect(vg, fx, fy, fw, fh, fh / 2.0f);
-    nvgFillColor(vg, tc(t->surface_container_high));
-    nvgFill(vg);
-    if (l->auth_failed) {
-        nvgStrokeColor(vg, tc(t->error));
-        nvgStrokeWidth(vg, 2.0f);
-        nvgStroke(vg);
+    if (cfg->lock_show_clock) {
+        char hhmm[16];
+        strftime(hhmm, sizeof(hhmm), "%H:%M", &tm);
+        nvgFontFaceId(vg, l->render->font_ui);
+        nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+        nvgFontSize(vg, 96.0f);
+        nvgFillColor(vg, tc(t->surface_text));
+        nvgText(vg, w / 2.0f, h / 2.0f - 90.0f, hhmm, NULL);
+    }
+    if (cfg->lock_show_date) {
+        char date[64];
+        strftime(date, sizeof(date), "%A, %B %-d", &tm);
+        nvgFontFaceId(vg, l->render->font_ui);
+        nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+        nvgFontSize(vg, 22.0f);
+        nvgFillColor(vg, tc(t->surface_variant_text));
+        nvgText(vg, w / 2.0f, h / 2.0f - 30.0f, date, NULL);
     }
 
-    dc_render_icon(l->render, DC_ICON_LOCK, fx + 22.0f, fy + fh / 2.0f, 20.0f, t->surface_variant_text,
-                   NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
-    if (l->pw_len == 0) {
-        nvgFontSize(vg, 15.0f);
-        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
-        nvgFillColor(vg, tc_alpha(t->surface_text, 110));
-        nvgText(vg, fx + 44.0f, fy + fh / 2.0f, l->auth_failed ? "Wrong password" : "Password",
-                NULL);
-    } else {
-        int dots = l->pw_len > 16 ? 16 : l->pw_len;
-        for (int i = 0; i < dots; i++) {
-            nvgBeginPath(vg);
-            nvgCircle(vg, fx + 50.0f + i * 15.0f, fy + fh / 2.0f, 4.5f);
-            nvgFillColor(vg, tc(t->surface_text));
-            nvgFill(vg);
+    /* Password field: a rounded pill with dots. docs/14-COMPLETION-PLAN.md
+     * W3.2's lock_show_password_field: when off, the pill stays hidden until
+     * the user actually starts typing (matches DMS LockScreenTab.qml's
+     * "Show Password Field" description: "If the field is hidden, it will
+     * appear as soon as a key is pressed."). */
+    if (cfg->lock_show_password_field || l->pw_len > 0) {
+        const float fw = 320.0f, fh = 46.0f;
+        const float fx = w / 2.0f - fw / 2.0f, fy = h / 2.0f + 30.0f;
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, fx, fy, fw, fh, fh / 2.0f);
+        nvgFillColor(vg, tc(t->surface_container_high));
+        nvgFill(vg);
+        if (l->auth_failed) {
+            nvgStrokeColor(vg, tc(t->error));
+            nvgStrokeWidth(vg, 2.0f);
+            nvgStroke(vg);
+        }
+
+        dc_render_icon(l->render, DC_ICON_LOCK, fx + 22.0f, fy + fh / 2.0f, 20.0f,
+                       t->surface_variant_text, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+        if (l->pw_len == 0) {
+            nvgFontSize(vg, 15.0f);
+            nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+            nvgFillColor(vg, tc_alpha(t->surface_text, 110));
+            nvgText(vg, fx + 44.0f, fy + fh / 2.0f, l->auth_failed ? "Wrong password" : "Password",
+                    NULL);
+        } else {
+            int dots = l->pw_len > 16 ? 16 : l->pw_len;
+            for (int i = 0; i < dots; i++) {
+                nvgBeginPath(vg);
+                nvgCircle(vg, fx + 50.0f + i * 15.0f, fy + fh / 2.0f, 4.5f);
+                nvgFillColor(vg, tc(t->surface_text));
+                nvgFill(vg);
+            }
         }
     }
 

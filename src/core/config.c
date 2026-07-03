@@ -81,6 +81,14 @@ static dc_config config = {
     .font_scale = 1.0f,
 
     .first_day_of_week = 0, /* Sunday, matches dashboard.c's prior hardcoded dow[] order */
+
+    /* docs/14-COMPLETION-PLAN.md W3.2: matches lock.c's prior hardcoded
+     * behavior (clock+date always on, password pill always visible, flat
+     * background) so existing users see no change until they opt in. */
+    .lock_show_clock = true,
+    .lock_show_date = true,
+    .lock_show_password_field = true,
+    .lock_use_wallpaper_bg = false,
 };
 
 const dc_config *dc_config_current = &config;
@@ -344,6 +352,11 @@ void dc_config_load(void)
     get_int(root, "osdTimeoutMs", &config.osd_timeout_ms, 500, 10000);
     get_float(root, "fontScale", &config.font_scale, 0.8f, 1.5f);
     get_int(root, "firstDayOfWeek", &config.first_day_of_week, 0, 6);
+
+    get_bool(root, "lockShowClock", &config.lock_show_clock);
+    get_bool(root, "lockShowDate", &config.lock_show_date);
+    get_bool(root, "lockShowPasswordField", &config.lock_show_password_field);
+    get_bool(root, "lockUseWallpaperBg", &config.lock_use_wallpaper_bg);
     cJSON_Delete(root);
 
     apply_theme();
@@ -461,6 +474,11 @@ void dc_config_save(void)
     cJSON_AddNumberToObject(root, "osdTimeoutMs", config.osd_timeout_ms);
     cJSON_AddNumberToObject(root, "fontScale", (double)config.font_scale);
     cJSON_AddNumberToObject(root, "firstDayOfWeek", config.first_day_of_week);
+
+    cJSON_AddBoolToObject(root, "lockShowClock", config.lock_show_clock);
+    cJSON_AddBoolToObject(root, "lockShowDate", config.lock_show_date);
+    cJSON_AddBoolToObject(root, "lockShowPasswordField", config.lock_show_password_field);
+    cJSON_AddBoolToObject(root, "lockUseWallpaperBg", config.lock_use_wallpaper_bg);
 
     char *text = cJSON_Print(root);
     cJSON_Delete(root);

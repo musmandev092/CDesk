@@ -83,6 +83,11 @@
 #define IC_LANGUAGE DC_ICON_LANGUAGE
 #define IC_APPS DC_ICON_APPS
 #define IC_COLOR_LENS DC_ICON_COLOR_LENS
+/* docs/14-COMPLETION-PLAN.md W3.2/W3.4: Lock Screen reuses the existing LOCK
+ * glyph (already used by ui/lock.c's password pill); Window Rules gets its
+ * own new glyph (render/icons.h). */
+#define IC_LOCK_SCREEN DC_ICON_LOCK
+#define IC_WINDOW_RULES DC_ICON_SELECT_WINDOW
 
 typedef enum {
     TAB_PERSONALIZATION = 0,
@@ -104,6 +109,8 @@ typedef enum {
     TAB_OSD,
     TAB_THEME_COLORS,
     TAB_POWER,
+    TAB_LOCKSCREEN,
+    TAB_WINDOW_RULES,
     TAB_ABOUT,
     TAB_COUNT,
 } s_tab;
@@ -123,7 +130,8 @@ static const s_tab_def TABS[TAB_COUNT] = {
     {IC_GRID_VIEW, "Launcher"},           {IC_APPS, "Default Apps"},
     {IC_LANGUAGE, "Locale"},              {IC_COMPUTER, "System"},
     {IC_TUNE, "OSD"},                     {IC_COLOR_LENS, "Theme & Colors"},
-    {IC_POWER, "Power"},                  {IC_INFO, "About"},
+    {IC_POWER, "Power"},                  {IC_LOCK_SCREEN, "Lock Screen"},
+    {IC_WINDOW_RULES, "Window Rules"},    {IC_INFO, "About"},
 };
 
 struct dc_settings {
@@ -1900,6 +1908,44 @@ static void tab_power(uictx *c)
     ui_hint(c, "Lock, suspend and power-off live in the power menu (bar \xc2\xb7 power button)");
 }
 
+/* docs/14-COMPLETION-PLAN.md W3.2: a pragmatic subset of DMS's 23-setting
+ * LockScreenTab.qml -- only the options ui/lock.c can actually honor (no
+ * fingerprint/U2F/video-screensaver/per-monitor backend exists in dankc's
+ * lock screen). All four keys live-apply the next time the lock screen is
+ * shown (`dankc ctl lock`); none of them can be previewed while the lock
+ * isn't active, since ext-session-lock intentionally has no "peek" mode. */
+static void tab_lockscreen(uictx *c)
+{
+    ui_section(c, "CLOCK");
+    if (ui_toggle(c, "Show clock", "Big HH:MM clock on the lock screen", c->cfg->lock_show_clock)) {
+        c->cfg->lock_show_clock = !c->cfg->lock_show_clock;
+        c->changed = true;
+    }
+    if (ui_toggle(c, "Show date", "Weekday and date under the clock", c->cfg->lock_show_date)) {
+        c->cfg->lock_show_date = !c->cfg->lock_show_date;
+        c->changed = true;
+    }
+
+    ui_section(c, "PASSWORD FIELD");
+    if (ui_toggle(c, "Always show password field",
+                  "If off, the field appears once you start typing", c->cfg->lock_show_password_field)) {
+        c->cfg->lock_show_password_field = !c->cfg->lock_show_password_field;
+        c->changed = true;
+    }
+
+    ui_section(c, "BACKGROUND");
+    if (ui_toggle(c, "Use wallpaper background",
+                  "Blurred wallpaper instead of a flat color (needs Material",
+                  c->cfg->lock_use_wallpaper_bg)) {
+        c->cfg->lock_use_wallpaper_bg = !c->cfg->lock_use_wallpaper_bg;
+        c->changed = true;
+    }
+    ui_hint(c, "backgrounds + a wallpaper set on the Personalization tab)");
+
+    ui_hint(c, "Try it: run \"dankc ctl lock\" (Esc/wrong password stays locked;");
+    ui_hint(c, "unlock with your normal password).");
+}
+
 static void tab_about(uictx *c)
 {
     if (c->mode == UI_RENDER) {
@@ -2016,6 +2062,9 @@ static void build_tab(uictx *c)
         break;
     case TAB_POWER:
         tab_power(c);
+        break;
+    case TAB_LOCKSCREEN:
+        tab_lockscreen(c);
         break;
     case TAB_ABOUT:
         tab_about(c);
