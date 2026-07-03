@@ -57,6 +57,21 @@ typedef struct dc_config {
     bool weather_fahrenheit;
     char weather_location[64]; /* display name for the dashboard Weather tab */
 
+    /* Night Light (docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.4,
+     * services/nightlight.c): replaces the old hardcoded 4000K on/off
+     * toggle. nightlight_schedule_mode is a dc_nightlight_schedule value
+     * (0=manual/fixed, 1=sunset-to-sunrise via weather_lat/weather_lon,
+     * 2=fixed HH:MM-to-HH:MM window) -- stored as a plain int here so
+     * config.c doesn't need to depend on services/nightlight.h; nightlight.c
+     * casts it back. nightlight_temp is the night-side color temperature in
+     * Kelvin (2500-6500); nightlight_from/to are "HH:MM" strings, only used
+     * when schedule mode == 2. */
+    bool nightlight_enabled;
+    int nightlight_temp;
+    int nightlight_schedule_mode;
+    char nightlight_from[8];
+    char nightlight_to[8];
+
     /* Left/center/right widget ids, in display order (left-to-right within
      * each section; see dc_bar's layout pass for how each section anchors). */
     char bar_left_widgets[DC_CONFIG_WIDGETS_MAX][DC_CONFIG_WIDGET_ID_MAX];

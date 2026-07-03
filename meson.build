@@ -131,6 +131,7 @@ src = files(
   'src/services/weather.c', 'src/services/sysmon.c', 'src/services/power.c',
   'src/services/autostart.c',
   'src/services/sound.c', 'src/services/polkit.c',
+  'src/services/nightlight.c',
   'src/niri/niri.c',
   'src/theme/theme.c',
   'src/ipc/control.c',
