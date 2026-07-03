@@ -257,8 +257,6 @@ static void control_dispatch(const char *cmd, void *data)
     }
     else if (strcmp(cmd, "clipboard") == 0 || strcmp(cmd, "clipboard toggle") == 0)
         dc_clip_picker_toggle(c->clip_picker, out);
-    else if (strcmp(cmd, "clipboard-test-pin0") == 0) /* TEMP verification hook, remove before merging */
-        dc_clip_picker_debug_toggle_pin(c->clip_picker, 0);
     else if (strcmp(cmd, "processes") == 0 || strcmp(cmd, "processes toggle") == 0 ||
              strcmp(cmd, "processes cpu") == 0)
         dc_processes_toggle(c->processes, out, DC_PROCESSES_SORT_CPU);

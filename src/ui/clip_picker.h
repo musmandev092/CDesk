@@ -40,10 +40,4 @@ void dc_clip_picker_handle_motion(dc_clip_picker *p, double x, double y);
 /* Pointer left the panel: clears hover. */
 void dc_clip_picker_handle_leave(dc_clip_picker *p);
 
-/* TEMP verification hook (P4 clipboard task) -- pins/unpins the visible
- * result at `index` without needing a pixel-accurate click; exercised by
- * `dankc ctl clipboard-test-pin0` to verify pin persistence headlessly.
- * Remove before merging. */
-void dc_clip_picker_debug_toggle_pin(dc_clip_picker *p, int index);
-
 #endif /* DC_UI_CLIP_PICKER_H */
