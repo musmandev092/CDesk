@@ -14,21 +14,18 @@ A lightweight desktop shell for the **niri** Wayland compositor, written in C �
 DankMaterialShell's core (QML/Quickshell + Go) as one native binary. Full spec in `docs/` (00–11).
 niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
 
-## Current status — STRUCTURE COMPLETE ✅ (2026-07-03, main @ HEAD)
-Bar + all panels at DMS parity, full polish, P7 perf, AND the entire completion plan
-(docs/14-COMPLETION-PLAN.md) done. 13 feature waves merged 2026-07-03 on top of the
-overnight work: power menu, media marquee, dashboard hourly+wallpaper grid, notif
-actions/images + app-grouping/scroll, control-center depth + Wi-Fi password entry +
-Bluetooth discovery/pairing (Agent1), launcher calc/frecency/actions, tuned power
-profiles, brightness OSD, clipboard image thumbs+pins, tray click/menus, auto-hide dock,
-rounded corners + material blur, HarfBuzz/BiDi Urdu shaping, per-level battery glyph +
-ink-bbox icon centering, XDG autostart, notification sounds, keybind cheat-sheet overlay,
-polkit authentication agent, true HCT/MCU dynamic color (matches matugen +/-2) + light
-themes + themeMode, and a 27-tab Settings app covering EVERY config key + system controls
-(audio/brightness/network/bt/power/default-apps/locale/osd/typography/lock-screen/
-window-rules + mux/updater/printer/users). Both `make` and `meson` build zero-warning.
-RSS ~170MB / Pss ~77MB vs DMS qs ~595MB. Deferred by design: T29 plugins; PERF
-OPTIMIZATION (user wants structure first, then optimize the ~77MB footprint further).
+## Current status — STRUCTURE COMPLETE + PERF PHASE 1 DONE ✅ (2026-07-03)
+Everything in docs/14 (structure) plus the docs/15-PERF-PLAN.md Wave 1 optimizations are done.
+Perf results (measured, idle bar, 2 outputs): font files now mmap'd read-only (T1.1) — dankc's
+Private memory ~40MB→~20MB (the real win, biggest single lever); installed binary stripped
+3.8M→911K (T1.3); wpctl volume poll cache 3s→10s = ~70% fewer audio forks (T2.3); Wi-Fi status
+now NetworkManager D-Bus event-driven = 0 background nmcli forks (T2.2). DISCARDED malloc-arena
+tune (only -12KB) as a no-op. Deep-dive (docs/15 addendum) VERDICT: dankc's true incremental cost
+is ~20MB Private / ~40-54MB Pss; the ~161-173MB RSS is ~87% SHARED Mesa/libLLVM pages niri holds
+resident regardless of dankc — NOT reclaimable from the app (Vulkan-rewrite/EGL-device-tricks/
+malloc-swap all tested and rejected: 0 or negative gain). Memory is at the practical floor for a
+Mesa-GLES nanovg client. vs DMS qs ~590MB Pss = ~11x lighter. Deferred by design: T29 plugins.
+Next perf frontier if pursued: idle CPU/wakeups (already ~0.1-0.3%) and startup time, NOT RAM.
 ## Previous status — bar parity DONE ✅ (S1–S6, 2026-07-02); panels parity next
 Bar now pixel-matches the user's live DMS bottom bar (docs/12-BAR-SPEC.md, commits
 07831c7..c412bb6): floating rounded 40px container + elevation shadow + bottom position,
