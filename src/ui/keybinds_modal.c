@@ -78,9 +78,9 @@
 #define DC_KB_CAT_GAP 22.0f
 #define DC_KB_ROW_H 22.0f
 #define DC_KB_ROW_GAP 5.0f
-#define DC_KB_KEY_COL_W 160.0f /* fixed offset to desc text, DMS: leftMargin 170 */
+#define DC_KB_KEY_COL_W 178.0f /* fixed offset to desc text, DMS: leftMargin 170 */
 #define DC_KB_CHIP_H 20.0f
-#define DC_KB_CHIP_MAX_W 148.0f
+#define DC_KB_CHIP_MAX_W 164.0f
 
 #define DC_KB_SCROLL_STEP 48.0f
 
@@ -1031,8 +1031,16 @@ static void kb_draw_chip(dc_render *r, float x, float y, const char *key)
 
     nvgFontFaceId(vg, r->font_ui);
     nvgFontSize(vg, 11.0f);
+
+    /* Long chords (e.g. "Mod + Ctrl + WheelScrollDown") would otherwise get
+     * hard-clipped by the scissor below with no indication text is missing
+     * -- ellipsize instead, same as the description column. */
+    char key_buf[DC_KB_KEY_MAX];
+    snprintf(key_buf, sizeof(key_buf), "%s", key);
+    kb_ellipsize(vg, key_buf, sizeof(key_buf), DC_KB_CHIP_MAX_W - 14.0f);
+
     float b[4];
-    nvgTextBounds(vg, 0, 0, key, NULL, b);
+    nvgTextBounds(vg, 0, 0, key_buf, NULL, b);
     float w = (b[2] - b[0]) + 14.0f;
     if (w > DC_KB_CHIP_MAX_W)
         w = DC_KB_CHIP_MAX_W;
@@ -1044,12 +1052,9 @@ static void kb_draw_chip(dc_render *r, float x, float y, const char *key)
     nvgFillColor(vg, tc(t->surface_container_high));
     nvgFill(vg);
 
-    nvgSave(vg);
-    nvgScissor(vg, x + 2.0f, y, w - 4.0f, DC_KB_CHIP_H);
     nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
     nvgFillColor(vg, tc(t->secondary));
-    nvgText(vg, x + w / 2.0f, y + DC_KB_CHIP_H / 2.0f + 0.5f, key, NULL);
-    nvgRestore(vg);
+    nvgText(vg, x + w / 2.0f, y + DC_KB_CHIP_H / 2.0f + 0.5f, key_buf, NULL);
 }
 
 static void kb_render(dc_keybinds_modal *kb)
