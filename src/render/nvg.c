@@ -5,10 +5,13 @@
 
 #include <fontconfig/fontconfig.h>
 #include <GLES3/gl3.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "nanosvg.h"
@@ -326,6 +329,37 @@ static char *fc_match_path(const char *pattern)
     return result;
 }
 
+/* docs/15-PERF-PLAN.md T1.1: mmap `path` read-only/private instead of the
+ * fread-into-malloc that fontstash's own nvgCreateFont()/fonsAddFont() do.
+ * Read-only MAP_PRIVATE pages are never written, so they're never promoted
+ * to Private_Dirty — they stay file-backed (Shared_Clean/Private_Clean in
+ * smaps) and the kernel only faults in the glyph-table pages a font actually
+ * uses, evicting them under memory pressure like any other page-cache page.
+ * The mapping is handed to nvgCreateFontMemAtIndex(..., freeData=0, ...),
+ * which makes fontstash/stb_truetype retain the raw pointer directly (no
+ * internal copy — see fonsAddFontMem() in third_party/nanovg/fontstash.h)
+ * for as long as the NVGcontext lives, i.e. the whole process lifetime.
+ * Deliberately never munmap'd once nanovg holds it: process exit reclaims
+ * it, and unmapping under a live font atlas would be a use-after-unmap.
+ * Returns NULL (leaving *out_size untouched) on any I/O failure. */
+static unsigned char *mmap_font_file(const char *path, size_t *out_size)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        close(fd);
+        return NULL;
+    }
+    void *data = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd); /* the mapping stays valid after the fd is closed */
+    if (data == MAP_FAILED)
+        return NULL;
+    *out_size = (size_t)st.st_size;
+    return (unsigned char *)data;
+}
+
 /* Load `path` as one more fallback of the UI font, unless it's already
  * loaded (dedupe — zh-cn/ja/ko usually all resolve to the same CJK .ttc),
  * fails the `probe` coverage check, or the chain is full. On success its
@@ -353,9 +387,20 @@ static bool add_fallback_font(dc_render *render, const char *path, uint32_t prob
         return false;
     }
 
-    int fb = nvgCreateFont(render->vg, path, path); /* name just needs uniqueness */
+    size_t fsize = 0;
+    unsigned char *fdata = mmap_font_file(path, &fsize);
+    if (!fdata) {
+        dc_warn("could not mmap fallback font %s", path);
+        free(cov);
+        return false;
+    }
+    /* fontIndex 0: matches the previous nvgCreateFont() behaviour — the CJK
+     * .ttc collections here are always read at collection index 0 (see the
+     * coverage block comment above load_cmap()). name just needs uniqueness. */
+    int fb = nvgCreateFontMemAtIndex(render->vg, path, fdata, (int)fsize, 0, 0);
     if (fb < 0 || !nvgAddFallbackFontId(render->vg, render->font_ui, fb)) {
         dc_warn("could not load fallback font %s", path);
+        munmap(fdata, fsize); /* fontstash never retained it (freeData=0, load failed) */
         free(cov);
         return false;
     }
@@ -413,13 +458,18 @@ static int load_font(NVGcontext *vg, const char *name, const char *const *candid
     for (size_t i = 0; i < count; i++) {
         if (access(candidates[i], R_OK) != 0)
             continue;
-        int font = nvgCreateFont(vg, name, candidates[i]);
+        size_t size = 0;
+        unsigned char *data = mmap_font_file(candidates[i], &size);
+        if (!data)
+            continue;
+        int font = nvgCreateFontMemAtIndex(vg, name, data, (int)size, 0, 0);
         if (font >= 0) {
-            dc_debug("loaded font '%s': %s", name, candidates[i]);
+            dc_debug("loaded font '%s': %s (mmap %zu bytes)", name, candidates[i], size);
             if (out_path)
                 *out_path = candidates[i];
             return font;
         }
+        munmap(data, size); /* fontstash never retained it (freeData=0, load failed) */
     }
     return -1;
 }
