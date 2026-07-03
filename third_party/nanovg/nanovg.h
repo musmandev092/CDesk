@@ -627,6 +627,16 @@ void nvgTextBox(NVGcontext* ctx, float x, float y, float breakRowWidth, const ch
 // Measured values are returned in local coordinate space.
 float nvgTextBounds(NVGcontext* ctx, float x, float y, const char* string, const char* end, float* bounds);
 
+// Like nvgTextBounds(), but the y-bounds are the glyphs' TRUE ink extents
+// (min/max of the actual rasterized quads) instead of being overwritten with
+// the font's line-box metrics (ascender/descender). nvgTextBounds() computes
+// the ink bounds internally via fonsTextBounds() and then discards them in
+// favor of fonsLineBounds() for y — fine for laying out text on a baseline
+// grid, but wrong for optically centering a single glyph (e.g. an icon in a
+// circular button), where the line box sits well above the glyph's visual
+// center. Use this variant for that case.
+float nvgTextInkBounds(NVGcontext* ctx, float x, float y, const char* string, const char* end, float* bounds);
+
 // Measures the specified multi-text string. Parameter bounds should be a pointer to float[4],
 // if the bounding box of the text should be returned. The bounds value are [xmin,ymin, xmax,ymax]
 // Measured values are returned in local coordinate space.
