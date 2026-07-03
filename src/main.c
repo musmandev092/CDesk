@@ -17,6 +17,7 @@
 #include "services/audio.h"
 #include "services/display.h"
 #include "services/autostart.h"
+#include "services/firewall.h"
 #include "services/logind.h"
 #include "services/mpris.h"
 #include "services/net.h"
@@ -1029,6 +1030,46 @@ int main(int argc, char **argv)
             mkdir(tmp_dir, 0755);
             bool ok = dc_display_persist(&cfg, 1, tmp_dir);
             dc_info("display test: persist to isolated %s -> %s", tmp_dir, ok ? "ok" : "FAILED");
+        }
+    }
+
+    /* DANKC_FIREWALL_TEST=1: read-verification for the Firewall service
+     * layer (docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.5) -- log the
+     * detected backend + status at startup. Read-only by itself; the write
+     * paths below only ever fire when DANKC_FIREWALL_DRYRUN=1 is ALSO set
+     * (checked here as a second, redundant safety gate on top of
+     * firewall.c's own dryrun_enabled(), so this test path can never
+     * actually flip the user's live firewall or rules). */
+    if (getenv("DANKC_FIREWALL_TEST")) {
+        dc_firewall_info fw = {0};
+        dc_firewall_status(&fw);
+        dc_info("firewall test: backend=%s available=%d enabled_known=%d enabled=%d "
+                 "zone=\"%s\" policy=\"%s\"",
+                dc_firewall_backend_name(fw.backend), fw.available, fw.enabled_known, fw.enabled,
+                fw.active_zone, fw.default_policy);
+
+        if (getenv("DANKC_FIREWALL_DRYRUN")) {
+            dc_info("firewall test: dry-run write-path check, detected backend (%s)",
+                    dc_firewall_backend_name(fw.backend));
+            dc_firewall_set_enabled(true);
+            dc_firewall_set_enabled(false);
+            dc_firewall_allow("ssh", true);
+            dc_firewall_allow("ssh", false);
+
+            /* Also force-exercise the OTHER backend's command shapes, even
+             * if it isn't the one actually installed on this dev machine --
+             * see firewall.h's dc_firewall_debug_force_backend() doc
+             * comment for why this exists. */
+            dc_firewall_backend other = fw.backend == DC_FIREWALL_BACKEND_UFW
+                    ? DC_FIREWALL_BACKEND_FIREWALLD
+                    : DC_FIREWALL_BACKEND_UFW;
+            dc_firewall_debug_force_backend(other);
+            dc_info("firewall test: dry-run write-path check, forced backend (%s)",
+                    dc_firewall_backend_name(other));
+            dc_firewall_set_enabled(true);
+            dc_firewall_set_enabled(false);
+            dc_firewall_allow("ssh", true);
+            dc_firewall_allow("ssh", false);
         }
     }
 
