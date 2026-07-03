@@ -996,6 +996,22 @@ static void cc_gather_state(dc_control_center *cc, cc_state *st)
     if (cc->net_expanded) {
         st->expand_kind = 1;
         st->expand_rows = dc_net_wifi_scan(st->net_aps, CC_MAX_EXPAND_ROWS);
+
+        /* Known/saved networks (W2): one dc_net_saved_list() call populates
+         * the cache dc_net_saved_find_by_ssid() reads from, then a lookup per
+         * visible row -- cheap enough to do every gather (same cost class as
+         * dc_net_ethernet(), per net.h's doc comment). */
+        dc_net_saved_net saved_buf[DC_NET_SAVED_MAX];
+        dc_net_saved_list(saved_buf, DC_NET_SAVED_MAX);
+        int net_rows = st->expand_rows < CC_MAX_EXPAND_ROWS ? st->expand_rows : CC_MAX_EXPAND_ROWS;
+        for (int i = 0; i < net_rows; i++) {
+            const dc_net_saved_net *sv = dc_net_saved_find_by_ssid(st->net_aps[i].ssid);
+            if (sv) {
+                st->net_ap_saved[i] = true;
+                snprintf(st->net_ap_saved_path[i], sizeof(st->net_ap_saved_path[i]), "%s", sv->path);
+                st->net_ap_autoconnect[i] = sv->autoconnect;
+            }
+        }
     } else if (cc->bt_expanded) {
         dc_bluez_info bt;
         dc_bluez_read(&bt);
@@ -2037,6 +2053,7 @@ static void cc_render(dc_control_center *cc)
             if (l.expand_kind == 1) {
                 const dc_net_wifi_ap *ap = &st.net_aps[i];
                 bool pw_open = i == l.pw_after_row;
+                bool saved = st.net_ap_saved[i];
                 char status[24];
                 status[0] = '\0';
                 if (pw_open) {
@@ -2048,9 +2065,18 @@ static void cc_render(dc_control_center *cc)
                     snprintf(status, sizeof(status), "%d%%", ap->signal_percent);
                 else
                     snprintf(status, sizeof(status), "Open \xc2\xb7 %d%%", ap->signal_percent);
+                /* Saved-network badge (W2): a small pin icon between the
+                 * title and status text. Forget action icon (only when not
+                 * mid password-entry -- cc_close_net_pw() already tears down
+                 * the panel before a forget would make sense anyway). */
+                bool show_forget = saved && !pw_open;
                 draw_expand_row(cc->render, l.ix, ry, l.iw, l.expand_row_h,
                                 ap->secured ? DC_ICON_LOCK : DC_ICON_WIFI, ap->ssid, status,
-                                ap->in_use, false, NULL, 0, 0.0f);
+                                ap->in_use, false, NULL, saved ? DC_ICON_PUSH_PIN : 0,
+                                show_forget ? CC_ROW_FORGET_RESERVE_W : 0.0f);
+                if (show_forget)
+                    dc_render_icon(cc->render, DC_ICON_CLOSE, l.net_forget_cx, cy, 13.0f,
+                                  t->surface_variant_text, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
                 if (pw_open)
                     draw_net_pw_panel(cc->render, &l, cc->net_pw_buf, cc->net_pw_connecting,
                                       cc->net_pw_err);
@@ -2469,7 +2495,14 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
              * connect/pair/forget-target dispatch further down, same priority
              * order as cc_hittest(). */
             float cy = ry + l.expand_row_h / 2.0f;
-            if (l.expand_kind == 2 && st.bt_devs[i].paired) {
+            if (l.expand_kind == 1 && st.net_ap_saved[i]) {
+                double dx = x - (double)l.net_forget_cx, dy = y - (double)cy;
+                if (dx * dx + dy * dy <= (double)(l.net_forget_r * l.net_forget_r)) {
+                    dc_net_saved_forget(st.net_ap_saved_path[i]);
+                    cc_render(cc);
+                    return;
+                }
+            } else if (l.expand_kind == 2 && st.bt_devs[i].paired) {
                 double dx = x - (double)l.bt_trust_cx, dy = y - (double)cy;
                 if (dx * dx + dy * dy <= (double)(l.bt_action_r * l.bt_action_r)) {
                     dc_bluez_set_trusted(st.bt_devs[i].mac, !st.bt_devs[i].trusted);
