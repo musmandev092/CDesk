@@ -9,6 +9,7 @@
 #include "services/apps.h"
 #include "services/audio.h"
 #include "services/bluez.h"
+#include "services/display.h"
 #include "services/net.h"
 #include "services/power.h"
 #include "services/weather.h"
@@ -97,6 +98,11 @@
 #define IC_SYSTEM_UPDATER DC_ICON_UPDATE
 #define IC_PRINTER DC_ICON_PRINT
 #define IC_USERS DC_ICON_PERSON
+/* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.3: Displays tab's resolution
+ * picker expand/collapse chevron -- both glyphs already exist in
+ * render/icons.h (used nowhere else yet), no font-subset update needed. */
+#define IC_EXPAND_MORE DC_ICON_EXPAND_MORE
+#define IC_EXPAND_LESS DC_ICON_EXPAND_LESS
 
 typedef enum {
     TAB_PERSONALIZATION = 0,
@@ -194,6 +200,14 @@ struct dc_settings {
     bool wr_new_maximized;
     bool wr_new_opacity_enabled;
     float wr_new_opacity;
+
+    /* Displays tab (docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.3): which
+     * monitor card's detail section is expanded, and whether that monitor's
+     * resolution picker is expanded. Not config.json state -- dc_display_
+     * list() is the live source of truth, this is purely which UI
+     * disclosure is open right now. */
+    int disp_selected;
+    bool disp_res_open;
 };
 
 /* Bounded string copy without gcc's -Wformat-truncation firing: several text
@@ -1871,6 +1885,203 @@ static void tab_dock(uictx *c)
     ui_hint(c, "Running apps always appear in the dock; pinning keeps them there");
 }
 
+/* ====================== Displays (docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.3) =====
+ *
+ * services/display.c owns the actual niri IPC (read via one-shot "Outputs"/
+ * "FocusedOutput" socket requests, write via fire-and-forget `niri msg
+ * output <name> ...`, gated by $DANKC_DISPLAY_DRYRUN for offline
+ * verification -- see that file's header). Everything below is pure UI glue
+ * calling those functions directly, same shape as the Audio/Network/
+ * Bluetooth tabs (no config.json keys -- the live niri session + the
+ * persisted KDL file ARE the state). Runtime actions apply instantly;
+ * "Save as default" (bottom of the tab) is the only action that writes to
+ * disk, via dc_display_persist().
+ */
+
+/* One deduplicated (width, height, refresh_mhz) option for the resolution
+ * picker, with the modes[] index it corresponds to (dc_display_set_mode()
+ * only needs the values, but the index lets us mark the current selection).
+ * Real panels report duplicate entries at the same WxH@refresh (interlaced/
+ * legacy CRTC variants niri surfaces separately) -- collapsing them here
+ * keeps the on-screen list to what a user actually needs to choose between.
+ */
+typedef struct {
+    int width, height, refresh_mhz;
+    bool is_preferred;
+    int mode_idx;
+} disp_mode_opt;
+
+static int disp_unique_modes(const dc_display_info *o, disp_mode_opt out[DC_DISPLAY_MAX_MODES])
+{
+    int n = 0;
+    for (int i = 0; i < o->mode_count; i++) {
+        bool dup = false;
+        for (int j = 0; j < n; j++) {
+            if (out[j].width == o->modes[i].width && out[j].height == o->modes[i].height &&
+                out[j].refresh_mhz == o->modes[i].refresh_mhz) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+        out[n].width = o->modes[i].width;
+        out[n].height = o->modes[i].height;
+        out[n].refresh_mhz = o->modes[i].refresh_mhz;
+        out[n].is_preferred = o->modes[i].is_preferred;
+        out[n].mode_idx = i;
+        n++;
+    }
+    return n;
+}
+
+static void disp_mode_label(int width, int height, int refresh_mhz, bool preferred, char *buf,
+                            size_t n)
+{
+    char refresh[16];
+    dc_display_format_refresh(refresh_mhz, refresh, sizeof(refresh));
+    snprintf(buf, n, "%dx%d @ %sHz%s", width, height, refresh, preferred ? "  (preferred)" : "");
+}
+
+/* Full control set for one monitor: resolution picker, scale presets,
+ * rotation, position/arrangement, enable + VRR toggles. `outs`/`n` is the
+ * full list (needed for the arrangement buttons, which place `idx` relative
+ * to every *other* connected output); `idx` is the monitor these controls
+ * currently act on. */
+static void disp_monitor_detail(uictx *c, const dc_display_info *outs, int n, int idx)
+{
+    const dc_display_info *o = &outs[idx];
+
+    ui_section(c, "RESOLUTION & REFRESH RATE");
+    char cur_label[64];
+    if (o->current_mode_idx >= 0 && o->current_mode_idx < o->mode_count)
+        disp_mode_label(o->modes[o->current_mode_idx].width, o->modes[o->current_mode_idx].height,
+                        o->modes[o->current_mode_idx].refresh_mhz, false, cur_label,
+                        sizeof(cur_label));
+    else
+        snprintf(cur_label, sizeof(cur_label), "%dx%d (unknown mode)", o->logical_width,
+                o->logical_height);
+    if (ui_list_row(c, cur_label, o->mode_count > 0 ? "Change" : NULL,
+                    c->s->disp_res_open ? IC_EXPAND_LESS : IC_EXPAND_MORE, false) == 1) {
+        c->s->disp_res_open = !c->s->disp_res_open;
+    }
+    if (c->s->disp_res_open) {
+        disp_mode_opt opts[DC_DISPLAY_MAX_MODES];
+        int on = disp_unique_modes(o, opts);
+        for (int i = 0; i < on; i++) {
+            char label[64];
+            disp_mode_label(opts[i].width, opts[i].height, opts[i].refresh_mhz,
+                            opts[i].is_preferred, label, sizeof(label));
+            bool active = opts[i].mode_idx == o->current_mode_idx;
+            if (ui_list_row(c, label, NULL, 0, active) == 1 && !active) {
+                dc_display_set_mode(o->name, opts[i].width, opts[i].height, opts[i].refresh_mhz);
+                c->s->disp_res_open = false;
+            }
+        }
+        if (on == 0)
+            ui_hint(c, "No modes reported for this display");
+    }
+
+    ui_section(c, "SCALE");
+    static const float presets[5] = {1.0f, 1.25f, 1.5f, 1.75f, 2.0f};
+    static const char *const preset_labels[5] = {"100%", "125%", "150%", "175%", "200%"};
+    int cur_preset = -1;
+    for (int i = 0; i < 5; i++)
+        if (fabsf((float)o->scale - presets[i]) < 0.01f)
+            cur_preset = i;
+    int scale_clicked = ui_segmented(c, "Display scale", preset_labels, 5, cur_preset);
+    if (scale_clicked >= 0)
+        dc_display_set_scale(o->name, (double)presets[scale_clicked]);
+    if (cur_preset < 0) {
+        char sv[32];
+        snprintf(sv, sizeof(sv), "%.0f%%", o->scale * 100.0);
+        ui_value(c, "Current scale (custom)", sv);
+    }
+
+    ui_section(c, "ORIENTATION");
+    static const char *const rot_labels[4] = {"Normal", "90\xc2\xb0", "180\xc2\xb0", "270\xc2\xb0"};
+    static const dc_display_transform rot_vals[4] = {
+        DC_DISPLAY_TRANSFORM_NORMAL, DC_DISPLAY_TRANSFORM_90, DC_DISPLAY_TRANSFORM_180,
+        DC_DISPLAY_TRANSFORM_270};
+    int cur_rot = -1;
+    for (int i = 0; i < 4; i++)
+        if (rot_vals[i] == o->transform)
+            cur_rot = i;
+    int rot_clicked = ui_segmented(c, "Rotation", rot_labels, 4, cur_rot);
+    if (rot_clicked >= 0)
+        dc_display_set_transform(o->name, rot_vals[rot_clicked]);
+    if (cur_rot < 0)
+        ui_hint(c, "Currently flipped -- pick a rotation above to clear the flip");
+
+    ui_section(c, "POSITION & ARRANGEMENT");
+    char posv[32];
+    snprintf(posv, sizeof(posv), "%d, %d", o->x, o->y);
+    ui_value(c, "Position (x, y)", posv);
+
+    /* Relative-placement buttons against every other connected output --
+     * the cheapest correct "arrangement" UI without a drag canvas (no such
+     * widget primitive exists in the shared kit above; docs/19 sec.3
+     * explicitly prefers this over a mini-canvas for that reason). Logical
+     * (post-scale) sizes, since niri's x/y position space is logical. */
+    for (int j = 0; j < n; j++) {
+        if (j == idx)
+            continue;
+        const dc_display_info *other = &outs[j];
+        char rel[96];
+        snprintf(rel, sizeof(rel), "Place relative to %s:", other->name);
+        ui_hint(c, rel);
+        static const char *const dir_labels[4] = {"Left of", "Right of", "Above", "Below"};
+        int dir = ui_segmented(c, "Direction", dir_labels, 4, -1);
+        if (dir >= 0) {
+            int nx = other->x, ny = other->y;
+            switch (dir) {
+            case 0:
+                nx = other->x - o->logical_width;
+                break;
+            case 1:
+                nx = other->x + other->logical_width;
+                break;
+            case 2:
+                ny = other->y - o->logical_height;
+                break;
+            case 3:
+                ny = other->y + other->logical_height;
+                break;
+            }
+            dc_display_set_position(o->name, nx, ny);
+        }
+    }
+
+    int xv = o->x;
+    if (ui_stepper(c, "Fine-tune X", &xv, -10000, 10000, 10))
+        dc_display_set_position(o->name, xv, o->y);
+    int yv = o->y;
+    if (ui_stepper(c, "Fine-tune Y", &yv, -10000, 10000, 10))
+        dc_display_set_position(o->name, o->x, yv);
+    if (ui_list_row(c, "Let niri auto-arrange this display", NULL, 0, false) == 1)
+        dc_display_set_position_auto(o->name);
+
+    ui_section(c, "POWER & VRR");
+    int enabled_count = 0;
+    for (int i = 0; i < n; i++)
+        if (outs[i].enabled)
+            enabled_count++;
+    bool can_disable = !o->enabled || enabled_count > 1;
+    if (ui_toggle(c, "Enabled",
+                 can_disable ? "Turn this display off" : "Can't disable the only active display",
+                 o->enabled)) {
+        if (can_disable)
+            dc_display_set_enabled(o->name, !o->enabled);
+    }
+    if (o->vrr_supported) {
+        if (ui_toggle(c, "Variable refresh rate", "Reduce tearing at variable frame rates",
+                     o->vrr_enabled))
+            dc_display_set_vrr(o->name, !o->vrr_enabled);
+    } else {
+        ui_hint(c, "Variable refresh rate not supported on this display");
+    }
+}
+
 static void tab_displays(uictx *c)
 {
     ui_section(c, "BRIGHTNESS");
@@ -1898,6 +2109,77 @@ static void tab_displays(uictx *c)
     if (ui_toggle(c, "Night mode", "Warm color temperature (gammastep, 4000K)", night)) {
         night_mode_toggle();
         flip_set(&night_flip, !night);
+    }
+
+    ui_section(c, "MONITORS");
+    dc_display_info outs[DC_DISPLAY_MAX_OUTPUTS];
+    int n = dc_display_list(outs);
+    if (n == 0) {
+        ui_hint(c, "No outputs reported (niri IPC unavailable?)");
+        return;
+    }
+    if (c->s->disp_selected >= n)
+        c->s->disp_selected = 0;
+
+    for (int i = 0; i < n; i++) {
+        const dc_display_info *o = &outs[i];
+        int rw = (o->current_mode_idx >= 0 && o->current_mode_idx < o->mode_count)
+                        ? o->modes[o->current_mode_idx].width
+                        : o->logical_width;
+        int rh = (o->current_mode_idx >= 0 && o->current_mode_idx < o->mode_count)
+                        ? o->modes[o->current_mode_idx].height
+                        : o->logical_height;
+        char title[96];
+        snprintf(title, sizeof(title), "%s%s", o->name, o->is_focused ? "  (focused)" : "");
+        char status[64];
+        snprintf(status, sizeof(status), "%dx%d @ %d%%%s", rw, rh,
+                (int)lroundf((float)o->scale * 100.0f), o->enabled ? "" : "  \xe2\x80\xa2 off");
+        bool active = i == c->s->disp_selected;
+        if (ui_list_row(c, title, status, 0, active) == 1 && !active) {
+            c->s->disp_selected = i;
+            c->s->disp_res_open = false;
+        }
+        if (o->make[0] || o->model[0]) {
+            char mm[160];
+            snprintf(mm, sizeof(mm), "%s %s", o->make, o->model);
+            ui_hint(c, mm);
+        }
+    }
+
+    disp_monitor_detail(c, outs, n, c->s->disp_selected);
+
+    ui_section(c, "SAVE");
+    ui_hint(c, "Changes above apply immediately for this session (niri msg output).");
+    ui_hint(c, "They're forgotten when niri restarts unless saved as default below.");
+    if (ui_list_row(c, "Save as default (write to niri config)", NULL, IC_DONE, false) == 1) {
+        dc_display_persist_config cfgs[DC_DISPLAY_MAX_OUTPUTS];
+        int cn = 0;
+        for (int i = 0; i < n; i++) {
+            const dc_display_info *o = &outs[i];
+            dc_display_persist_config *pc = &cfgs[cn++];
+            memset(pc, 0, sizeof(*pc));
+            snprintf(pc->name, sizeof(pc->name), "%s", o->name);
+            if (o->current_mode_idx >= 0 && o->current_mode_idx < o->mode_count) {
+                pc->has_mode = true;
+                pc->width = o->modes[o->current_mode_idx].width;
+                pc->height = o->modes[o->current_mode_idx].height;
+                pc->refresh_mhz = o->modes[o->current_mode_idx].refresh_mhz;
+            }
+            pc->has_scale = true;
+            pc->scale = o->scale;
+            pc->has_transform = true;
+            pc->transform = o->transform;
+            pc->has_position = true;
+            pc->x = o->x;
+            pc->y = o->y;
+            pc->has_enabled = true;
+            pc->enabled = o->enabled;
+            if (o->vrr_supported) {
+                pc->has_vrr = true;
+                pc->vrr_enabled = o->vrr_enabled;
+            }
+        }
+        dc_display_persist(cfgs, cn, NULL);
     }
 }
 
@@ -3478,6 +3760,14 @@ static void layer_surface_handle_configure(void *data, struct zwlr_layer_surface
      * setup -- see the project's input-synthesis notes). */
     if (!s->test_clicks_done) {
         s->test_clicks_done = true;
+        /* Displays tab verification (docs/19 sec.3): its content is taller
+         * than one screen, so scripted clicks on rows below the fold need
+         * a pre-scroll -- DANKC_SETTINGS_SCROLL=<content pixels> sets
+         * s->scroll_y directly before the clicks below run, same one-shot
+         * gate as test_clicks_done. */
+        const char *scroll_spec = getenv("DANKC_SETTINGS_SCROLL");
+        if (scroll_spec)
+            s->scroll_y = (float)atof(scroll_spec);
         const char *spec = getenv("DANKC_SETTINGS_CLICK");
         while (spec && *spec) {
             double cx = 0, cy = 0;
