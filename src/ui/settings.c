@@ -2328,6 +2328,129 @@ static void tab_network(uictx *c)
         ui_value(c, "Connection", "Disconnected");
     }
     ui_hint(c, "Scan and join networks from the Control Center's Wi-Fi section");
+
+    /* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.2 extension: wired device,
+     * hotspot, and saved-network management, all native NetworkManager D-Bus
+     * (services/net.h) -- no nmcli popen()s on this path. */
+    ui_section(c, "ETHERNET");
+    dc_net_eth_info eth;
+    if (dc_net_ethernet(&eth) && eth.has_device) {
+        static const char *const eth_state_name[] = {"Unavailable", "No cable", "Disconnected",
+                                                     "Connecting\xe2\x80\xa6", "Connected"};
+        int si = (int)eth.state;
+        ui_value(c, "Device", eth.device_name);
+        ui_value(c, "State", eth_state_name[si >= 0 && si < 5 ? si : 0]);
+        if (eth.connection_name[0])
+            ui_value(c, "Connection", eth.connection_name);
+        if (eth.state == DC_NET_ETH_CONNECTED) {
+            char ipbuf[96];
+            snprintf(ipbuf, sizeof(ipbuf), "%s/%u", eth.ipv4_address, eth.ipv4_prefix);
+            ui_value(c, "IPv4 address", ipbuf);
+            ui_value(c, "Gateway", eth.ipv4_gateway[0] ? eth.ipv4_gateway : "-");
+            if (eth.ipv4_dns_count > 0) {
+                char dnsbuf[3 * 64] = "";
+                for (int i = 0; i < eth.ipv4_dns_count; i++) {
+                    if (i > 0)
+                        strncat(dnsbuf, ", ", sizeof(dnsbuf) - strlen(dnsbuf) - 1);
+                    strncat(dnsbuf, eth.ipv4_dns[i], sizeof(dnsbuf) - strlen(dnsbuf) - 1);
+                }
+                ui_value(c, "DNS", dnsbuf);
+            }
+            if (eth.link_speed_mbps > 0) {
+                char sp[32];
+                snprintf(sp, sizeof(sp), "%u Mbps", eth.link_speed_mbps);
+                ui_value(c, "Link speed", sp);
+            }
+        }
+        if (eth.mac[0])
+            ui_value(c, "MAC address", eth.mac);
+
+        bool can_connect = eth.state == DC_NET_ETH_DISCONNECTED;
+        bool can_disconnect =
+            eth.state == DC_NET_ETH_CONNECTED || eth.state == DC_NET_ETH_CONNECTING;
+        if (can_connect && ui_list_row(c, "Connect", NULL, IC_LINK, false) == 1)
+            dc_net_eth_connect();
+        if (can_disconnect && ui_list_row(c, "Disconnect", NULL, IC_REMOVE, false) == 1)
+            dc_net_eth_disconnect();
+    } else {
+        ui_hint(c, "No ethernet device found");
+    }
+
+    ui_section(c, "HOTSPOT");
+    char hs_ssid[64] = {0};
+    bool hs_active = dc_net_hotspot_active(hs_ssid, sizeof(hs_ssid));
+    static opt_flip hotspot_flip;
+    bool hs_on = flip_get(&hotspot_flip, hs_active);
+    if (ui_toggle(c, "Wi-Fi Hotspot", "Share your connection over Wi-Fi (access-point mode)",
+                 hs_on)) {
+        if (hs_on) {
+            dc_net_hotspot_stop();
+        } else {
+            const char *ssid =
+                c->s->net_hotspot_ssid[0] ? c->s->net_hotspot_ssid : "dankc-hotspot";
+            dc_net_hotspot_start(ssid, c->s->net_hotspot_password[0] ? c->s->net_hotspot_password
+                                                                     : NULL,
+                                 NULL);
+        }
+        flip_set(&hotspot_flip, !hs_on);
+    }
+    ui_hint(c, "A single Wi-Fi radio can't be a client and a hotspot at once --");
+    ui_hint(c, "starting this drops any current Wi-Fi client connection.");
+    if (hs_active) {
+        ui_value(c, "Active SSID", hs_ssid);
+    } else {
+        bool ssid_focus = c->s->focus_field == 9;
+        char ssidbuf[64];
+        if (ssid_focus)
+            copy_trunc(ssidbuf, sizeof(ssidbuf), c->s->edit_buf);
+        else
+            snprintf(ssidbuf, sizeof(ssidbuf), "%s", c->s->net_hotspot_ssid);
+        if (ui_textfield(c, "Hotspot name (SSID)", ssidbuf, ssid_focus)) {
+            c->s->focus_field = 9;
+            snprintf(c->s->edit_buf, sizeof(c->s->edit_buf), "%s", c->s->net_hotspot_ssid);
+        }
+
+        bool pw_focus = c->s->focus_field == 10;
+        char pw_source[64];
+        if (pw_focus)
+            copy_trunc(pw_source, sizeof(pw_source), c->s->edit_buf);
+        else
+            snprintf(pw_source, sizeof(pw_source), "%s", c->s->net_hotspot_password);
+        /* Masked display -- dots for whatever's typed so far, same length as
+         * the real value (no plaintext echo, matches a normal password
+         * field's UX; this tab has no other masked-field precedent to
+         * follow so the mask is built ad hoc here rather than in ui_textfield
+         * itself). */
+        char pwdisplay[64];
+        size_t pn = strlen(pw_source);
+        if (pn >= sizeof(pwdisplay))
+            pn = sizeof(pwdisplay) - 1;
+        memset(pwdisplay, '*', pn);
+        pwdisplay[pn] = '\0';
+        if (ui_textfield(c, "Password (blank = open network)", pwdisplay, pw_focus)) {
+            c->s->focus_field = 10;
+            snprintf(c->s->edit_buf, sizeof(c->s->edit_buf), "%s", c->s->net_hotspot_password);
+        }
+    }
+
+    ui_section(c, "SAVED WI-FI NETWORKS");
+    dc_net_saved_net saved[DC_NET_SAVED_MAX];
+    int sn = dc_net_saved_list(saved, DC_NET_SAVED_MAX);
+    if (sn == 0) {
+        ui_hint(c, "No saved networks");
+    } else {
+        for (int i = 0; i < sn; i++) {
+            const dc_net_saved_net *nw = &saved[i];
+            int clicked = ui_list_row(c, nw->id[0] ? nw->id : nw->ssid,
+                                      nw->autoconnect ? "Auto-connect" : "Manual", IC_REMOVE,
+                                      false);
+            if (clicked == 2)
+                dc_net_saved_forget(nw->path);
+            else if (clicked == 1)
+                dc_net_saved_set_autoconnect(nw->path, !nw->autoconnect);
+        }
+        ui_hint(c, "Click a network to toggle auto-connect, or the icon to forget it.");
+    }
 }
 
 static void tab_bluetooth(uictx *c)
