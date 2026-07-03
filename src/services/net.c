@@ -29,10 +29,45 @@
  * path below unconditionally.
  */
 #define DC_NM_DEST "org.freedesktop.NetworkManager"
+#define DC_NM_PATH "/org/freedesktop/NetworkManager"
 #define DC_NM_DEVICE_IFACE "org.freedesktop.NetworkManager.Device"
 #define DC_NM_WIRELESS_IFACE "org.freedesktop.NetworkManager.Device.Wireless"
+#define DC_NM_WIRED_IFACE "org.freedesktop.NetworkManager.Device.Wired"
 #define DC_NM_AP_IFACE "org.freedesktop.NetworkManager.AccessPoint"
+#define DC_NM_IP4CONFIG_IFACE "org.freedesktop.NetworkManager.IP4Config"
+#define DC_NM_ACTIVE_CONN_IFACE "org.freedesktop.NetworkManager.Connection.Active"
+#define DC_NM_SETTINGS_PATH "/org/freedesktop/NetworkManager/Settings"
+#define DC_NM_SETTINGS_IFACE "org.freedesktop.NetworkManager.Settings"
+#define DC_NM_SETTINGS_CONN_IFACE "org.freedesktop.NetworkManager.Settings.Connection"
 #define DC_NM_DEVICE_TYPE_WIFI 2
+#define DC_NM_DEVICE_TYPE_ETHERNET 1
+
+/* org.freedesktop.NetworkManager.Device.State (subset used to classify
+ * dc_net_eth_state -- see the NM D-Bus API spec's NM_DEVICE_STATE enum). */
+#define NM_DEVICE_STATE_UNAVAILABLE 20
+#define NM_DEVICE_STATE_DISCONNECTED 30
+#define NM_DEVICE_STATE_PREPARE 40
+#define NM_DEVICE_STATE_SECONDARIES 90
+#define NM_DEVICE_STATE_ACTIVATED 100
+#define NM_DEVICE_STATE_DEACTIVATING 110
+
+/* org.freedesktop.NetworkManager.Device.Wireless.Mode
+ * (NM_802_11_MODE_AP -- used by dc_net_hotspot_active()). */
+#define NM_802_11_MODE_AP 3
+
+/* DANKC_NET_DRYRUN (docs/18-WIFI-BT-PLAN.md) -- gates every *new* write path
+ * added alongside DANKC_WIFI_DRYRUN (ethernet connect/disconnect, hotspot
+ * start/stop, saved-network forget/autoconnect-toggle): instead of issuing
+ * the D-Bus call, log the exact destination/path/interface/method and args
+ * that would have been sent. Left as its own env var (rather than folded
+ * into DANKC_WIFI_DRYRUN) because it also covers ethernet and saved-network
+ * writes that have nothing to do with Wi-Fi; DANKC_WIFI_DRYRUN keeps gating
+ * only dc_net_wifi_connect_psk() exactly as it already did, so neither
+ * changes the other's behavior. */
+static bool net_dryrun(void)
+{
+    return getenv("DANKC_NET_DRYRUN") != NULL;
+}
 
 static struct {
     sd_bus *bus;
@@ -155,15 +190,17 @@ static int on_device_properties_changed(sd_bus_message *m, void *userdata, sd_bu
     return 0;
 }
 
-/* GetDevices() + DeviceType property reads to find the first Wi-Fi device
- * (NM_DEVICE_TYPE_WIFI == 2). A handful of small IPC round trips at startup
- * only -- never repeated, never a fork. */
-static bool nm_find_wifi_device(char *out, size_t out_sz)
+/* GetDevices() + DeviceType property reads to find the first device of
+ * `want_type` (NM_DEVICE_TYPE_WIFI == 2, NM_DEVICE_TYPE_ETHERNET == 1). A
+ * handful of small IPC round trips at startup only -- never repeated, never
+ * a fork. Shared by nm_find_wifi_device() and the ethernet device resolver
+ * below (dc_net_init()). */
+static bool nm_find_device_by_type(sd_bus *bus, uint32_t want_type, char *out, size_t out_sz)
 {
     sd_bus_error err = SD_BUS_ERROR_NULL;
     sd_bus_message *reply = NULL;
-    int r = sd_bus_call_method(g_nm.bus, DC_NM_DEST, "/org/freedesktop/NetworkManager", DC_NM_DEST,
-                               "GetDevices", &err, &reply, "");
+    int r = sd_bus_call_method(bus, DC_NM_DEST, DC_NM_PATH, DC_NM_DEST, "GetDevices", &err, &reply,
+                               "");
     sd_bus_error_free(&err);
     if (r < 0)
         return false;
@@ -174,10 +211,10 @@ static bool nm_find_wifi_device(char *out, size_t out_sz)
         while (!found && sd_bus_message_read_basic(reply, 'o', &dev_path) > 0) {
             uint32_t dtype = 0;
             sd_bus_error dt_err = SD_BUS_ERROR_NULL;
-            int dr = sd_bus_get_property_trivial(g_nm.bus, DC_NM_DEST, dev_path, DC_NM_DEVICE_IFACE,
+            int dr = sd_bus_get_property_trivial(bus, DC_NM_DEST, dev_path, DC_NM_DEVICE_IFACE,
                                                  "DeviceType", &dt_err, 'u', &dtype);
             sd_bus_error_free(&dt_err);
-            if (dr >= 0 && dtype == DC_NM_DEVICE_TYPE_WIFI) {
+            if (dr >= 0 && dtype == want_type) {
                 snprintf(out, out_sz, "%s", dev_path);
                 found = true;
             }
@@ -188,29 +225,58 @@ static bool nm_find_wifi_device(char *out, size_t out_sz)
     return found;
 }
 
+static bool nm_find_wifi_device(char *out, size_t out_sz)
+{
+    return nm_find_device_by_type(g_nm.bus, DC_NM_DEVICE_TYPE_WIFI, out, out_sz);
+}
+
+/* Shared system-bus handle for the ethernet/hotspot/saved-networks paths
+ * below (docs/18-WIFI-BT-PLAN.md). Kept separate from g_nm.bus, which
+ * dc_net_init() deliberately nulls out when no Wi-Fi device is found (so
+ * dc_net_wifi() knows to fall back to nmcli) -- that null-out must not also
+ * disable ethernet/saved-networks D-Bus access, since those don't depend on
+ * a Wi-Fi device existing. NULL if the system bus itself is unavailable. */
+static sd_bus *g_net_bus;
+
+static void nm_eth_init(sd_bus *bus);
+static void net_run_test_hook(void);
+
 void dc_net_init(struct dc_dbus *dbus)
 {
-    g_nm.bus = dbus ? dbus->system : NULL;
-    if (!g_nm.bus) {
+    sd_bus *bus = dbus ? dbus->system : NULL;
+    g_net_bus = bus;
+    if (!bus) {
         dc_info("net: no system bus; wifi status will use the nmcli fallback");
         return;
     }
+    g_nm.bus = bus;
 
     if (!nm_find_wifi_device(g_nm.device_path, sizeof(g_nm.device_path))) {
         dc_info("net: no NetworkManager Wi-Fi device found; wifi status will use the nmcli "
                 "fallback");
         g_nm.bus = NULL; /* dc_net_wifi() gates on g_nm.have_wifi_device, but be explicit */
-        return;
+    } else {
+        g_nm.have_wifi_device = true;
+
+        sd_bus_match_signal(g_nm.bus, &g_nm.device_slot, DC_NM_DEST, g_nm.device_path,
+                            "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                            on_device_properties_changed, NULL);
+        nm_resolve_ap_from_device();
+
+        dc_info("net: NetworkManager wifi device %s -- event-driven, no nmcli poll",
+                g_nm.device_path);
     }
-    g_nm.have_wifi_device = true;
 
-    sd_bus_match_signal(g_nm.bus, &g_nm.device_slot, DC_NM_DEST, g_nm.device_path,
-                        "org.freedesktop.DBus.Properties", "PropertiesChanged",
-                        on_device_properties_changed, NULL);
-    nm_resolve_ap_from_device();
+    nm_eth_init(bus);
 
-    dc_info("net: NetworkManager wifi device %s -- event-driven, no nmcli poll",
-            g_nm.device_path);
+    /* DANKC_NETSVC_TEST=1 (debug-only, env-gated -- same convention as every
+     * other DANKC_*_TEST/DANKC_*_DEMO hook in the codebase): exercise every
+     * read function added by docs/18-WIFI-BT-PLAN.md once at startup and log
+     * the results, so the ethernet/saved-networks/hotspot paths can be
+     * verified without controlcenter.c/settings.c UI wiring (a separate,
+     * later change owned elsewhere). No-op when unset. */
+    if (getenv("DANKC_NETSVC_TEST"))
+        net_run_test_hook();
 }
 
 /* SSID/signal via `nmcli` (a fork+popen, same shell-out style already used by
@@ -833,3 +899,1098 @@ dc_net_connect_state dc_net_wifi_connect_poll(char *err, size_t err_sz)
         snprintf(err, err_sz, "%s", g_connect.err);
     return g_connect.state;
 }
+
+/* --- Ethernet (wired) — NetworkManager D-Bus (docs/18-WIFI-BT-PLAN.md sec.2.1)
+ * ---------------------------------------------------------------------------
+ *
+ * Same event-driven shape as the Wi-Fi device tracking at the top of this
+ * file: resolve the wired device once at dc_net_init() time, subscribe to
+ * its PropertiesChanged, and additionally track its Ip4Config object -- NM
+ * replaces that object with a fresh path on every reconfigure (DHCP renew,
+ * cable replug, ...), so the IP4Config subscription has to be re-armed
+ * exactly like the Wi-Fi AP subscription is in nm_resolve_ap_from_device().
+ */
+static struct {
+    sd_bus *bus;
+    bool have_device;
+    char device_path[128];
+
+    char ip4_path[128];
+    sd_bus_slot *device_slot; /* PropertiesChanged on device_path */
+    sd_bus_slot *ip4_slot;    /* PropertiesChanged on ip4_path, re-armed on change */
+
+    dc_net_eth_info info;
+} g_eth;
+
+/* Read Device.Ip4Config's AddressData (first entry)/Gateway/NameserverData
+ * (up to DC_NET_ETH_DNS_MAX) into g_eth.info. Called whenever g_eth.ip4_path
+ * resolves to a new object and whenever that object itself signals a
+ * property change (DHCP lease renewal can change the gateway/DNS without the
+ * object path changing). */
+static void eth_read_ip4(void)
+{
+    dc_net_eth_info *info = &g_eth.info;
+    info->ipv4_address[0] = '\0';
+    info->ipv4_prefix = 0;
+    info->ipv4_gateway[0] = '\0';
+    info->ipv4_dns_count = 0;
+
+    if (!g_eth.ip4_path[0])
+        return;
+
+    char *gateway = NULL;
+    sd_bus_error gerr = SD_BUS_ERROR_NULL;
+    if (sd_bus_get_property_string(g_eth.bus, DC_NM_DEST, g_eth.ip4_path, DC_NM_IP4CONFIG_IFACE,
+                                   "Gateway", &gerr, &gateway) >= 0 &&
+        gateway)
+        snprintf(info->ipv4_gateway, sizeof(info->ipv4_gateway), "%s", gateway);
+    sd_bus_error_free(&gerr);
+    free(gateway);
+
+    /* AddressData / NameserverData: "aa{sv}" -- an array of dicts, each with
+     * an "address" (s) key (AddressData also has "prefix" (u)). Every entry
+     * has to be drained even though only the first (DC_NET_ETH_DNS_MAX for
+     * nameservers) is kept, or sd_bus_message_exit_container() below would
+     * be called with unread siblings still pending in the array frame. */
+    sd_bus_error aerr = SD_BUS_ERROR_NULL;
+    sd_bus_message *areply = NULL;
+    if (sd_bus_get_property(g_eth.bus, DC_NM_DEST, g_eth.ip4_path, DC_NM_IP4CONFIG_IFACE,
+                            "AddressData", &aerr, &areply, "aa{sv}") >= 0 &&
+        sd_bus_message_enter_container(areply, 'a', "{sv}") > 0) {
+        bool have_addr = false;
+        while (sd_bus_message_enter_container(areply, 'a', "{sv}") > 0) {
+            char address[64] = {0};
+            uint32_t prefix = 0;
+            while (sd_bus_message_enter_container(areply, 'e', "sv") > 0) {
+                const char *key = NULL;
+                sd_bus_message_read_basic(areply, 's', &key);
+                if (key && strcmp(key, "address") == 0) {
+                    const char *val = NULL;
+                    sd_bus_message_enter_container(areply, 'v', "s");
+                    sd_bus_message_read_basic(areply, 's', &val);
+                    sd_bus_message_exit_container(areply);
+                    if (val)
+                        snprintf(address, sizeof(address), "%s", val);
+                } else if (key && strcmp(key, "prefix") == 0) {
+                    sd_bus_message_enter_container(areply, 'v', "u");
+                    sd_bus_message_read_basic(areply, 'u', &prefix);
+                    sd_bus_message_exit_container(areply);
+                } else {
+                    sd_bus_message_skip(areply, "v");
+                }
+                sd_bus_message_exit_container(areply); /* e sv */
+            }
+            sd_bus_message_exit_container(areply); /* a{sv} */
+            if (!have_addr && address[0]) {
+                snprintf(info->ipv4_address, sizeof(info->ipv4_address), "%s", address);
+                info->ipv4_prefix = prefix;
+                have_addr = true;
+            }
+        }
+        sd_bus_message_exit_container(areply); /* aa{sv} */
+    }
+    sd_bus_error_free(&aerr);
+    sd_bus_message_unref(areply);
+
+    sd_bus_error nerr = SD_BUS_ERROR_NULL;
+    sd_bus_message *nreply = NULL;
+    if (sd_bus_get_property(g_eth.bus, DC_NM_DEST, g_eth.ip4_path, DC_NM_IP4CONFIG_IFACE,
+                            "NameserverData", &nerr, &nreply, "aa{sv}") >= 0 &&
+        sd_bus_message_enter_container(nreply, 'a', "{sv}") > 0) {
+        while (sd_bus_message_enter_container(nreply, 'a', "{sv}") > 0) {
+            char address[64] = {0};
+            while (sd_bus_message_enter_container(nreply, 'e', "sv") > 0) {
+                const char *key = NULL;
+                sd_bus_message_read_basic(nreply, 's', &key);
+                if (key && strcmp(key, "address") == 0) {
+                    const char *val = NULL;
+                    sd_bus_message_enter_container(nreply, 'v', "s");
+                    sd_bus_message_read_basic(nreply, 's', &val);
+                    sd_bus_message_exit_container(nreply);
+                    if (val)
+                        snprintf(address, sizeof(address), "%s", val);
+                } else {
+                    sd_bus_message_skip(nreply, "v");
+                }
+                sd_bus_message_exit_container(nreply); /* e sv */
+            }
+            sd_bus_message_exit_container(nreply); /* a{sv} */
+            if (address[0] && info->ipv4_dns_count < DC_NET_ETH_DNS_MAX)
+                snprintf(info->ipv4_dns[info->ipv4_dns_count++], sizeof(info->ipv4_dns[0]), "%s",
+                        address);
+        }
+        sd_bus_message_exit_container(nreply); /* aa{sv} */
+    }
+    sd_bus_error_free(&nerr);
+    sd_bus_message_unref(nreply);
+}
+
+static int on_eth_ip4_properties_changed(sd_bus_message *m, void *userdata, sd_bus_error *ret_error)
+{
+    DC_UNUSED(m);
+    DC_UNUSED(userdata);
+    DC_UNUSED(ret_error);
+    eth_read_ip4();
+    return 0;
+}
+
+/* Full re-read of the wired device: State + Wired.Carrier (classified into
+ * dc_net_eth_state), HwAddress, Wired.Speed, the active connection's display
+ * name, and -- if Device.Ip4Config points at a new object -- re-subscribing
+ * the IP4Config match before re-reading it via eth_read_ip4(). Called once at
+ * init and whenever the device itself signals a property change. */
+static void nm_eth_refresh(void)
+{
+    dc_net_eth_info *info = &g_eth.info;
+    info->has_device = true;
+
+    char *val = NULL;
+    sd_bus_error ierr = SD_BUS_ERROR_NULL;
+    if (sd_bus_get_property_string(g_eth.bus, DC_NM_DEST, g_eth.device_path, DC_NM_DEVICE_IFACE,
+                                   "Interface", &ierr, &val) >= 0 &&
+        val)
+        snprintf(info->device_name, sizeof(info->device_name), "%s", val);
+    sd_bus_error_free(&ierr);
+    free(val);
+    val = NULL;
+
+    uint32_t nm_state = 0;
+    sd_bus_error serr = SD_BUS_ERROR_NULL;
+    sd_bus_get_property_trivial(g_eth.bus, DC_NM_DEST, g_eth.device_path, DC_NM_DEVICE_IFACE,
+                                "State", &serr, 'u', &nm_state);
+    sd_bus_error_free(&serr);
+
+    int carrier = 0;
+    sd_bus_error cerr = SD_BUS_ERROR_NULL;
+    sd_bus_get_property_trivial(g_eth.bus, DC_NM_DEST, g_eth.device_path, DC_NM_WIRED_IFACE,
+                                "Carrier", &cerr, 'b', &carrier);
+    sd_bus_error_free(&cerr);
+
+    if (!carrier)
+        info->state = DC_NET_ETH_NO_CABLE;
+    else if (nm_state == NM_DEVICE_STATE_ACTIVATED)
+        info->state = DC_NET_ETH_CONNECTED;
+    else if (nm_state >= NM_DEVICE_STATE_PREPARE && nm_state <= NM_DEVICE_STATE_SECONDARIES)
+        info->state = DC_NET_ETH_CONNECTING;
+    else if (nm_state == NM_DEVICE_STATE_DISCONNECTED)
+        info->state = DC_NET_ETH_DISCONNECTED;
+    else /* UNAVAILABLE, UNMANAGED, DEACTIVATING, FAILED, UNKNOWN */
+        info->state = DC_NET_ETH_UNAVAILABLE;
+
+    info->mac[0] = '\0';
+    sd_bus_error werr = SD_BUS_ERROR_NULL;
+    if (sd_bus_get_property_string(g_eth.bus, DC_NM_DEST, g_eth.device_path, DC_NM_WIRED_IFACE,
+                                   "HwAddress", &werr, &val) >= 0 &&
+        val)
+        snprintf(info->mac, sizeof(info->mac), "%s", val);
+    sd_bus_error_free(&werr);
+    free(val);
+    val = NULL;
+    if (!info->mac[0]) { /* fall back to the generic Device.HwAddress */
+        sd_bus_error herr = SD_BUS_ERROR_NULL;
+        if (sd_bus_get_property_string(g_eth.bus, DC_NM_DEST, g_eth.device_path, DC_NM_DEVICE_IFACE,
+                                       "HwAddress", &herr, &val) >= 0 &&
+            val)
+            snprintf(info->mac, sizeof(info->mac), "%s", val);
+        sd_bus_error_free(&herr);
+        free(val);
+        val = NULL;
+    }
+
+    uint32_t speed = 0;
+    sd_bus_error sperr = SD_BUS_ERROR_NULL;
+    sd_bus_get_property_trivial(g_eth.bus, DC_NM_DEST, g_eth.device_path, DC_NM_WIRED_IFACE,
+                                "Speed", &sperr, 'u', &speed);
+    sd_bus_error_free(&sperr);
+    info->link_speed_mbps = (info->state == DC_NET_ETH_CONNECTED) ? speed : 0;
+
+    info->connection_name[0] = '\0';
+    sd_bus_error acerr = SD_BUS_ERROR_NULL;
+    sd_bus_message *acreply = NULL;
+    if (sd_bus_get_property(g_eth.bus, DC_NM_DEST, g_eth.device_path, DC_NM_DEVICE_IFACE,
+                            "ActiveConnection", &acerr, &acreply, "o") >= 0) {
+        const char *ac = NULL;
+        sd_bus_message_read_basic(acreply, 'o', &ac);
+        if (ac && ac[0] && strcmp(ac, "/") != 0) {
+            char *id = NULL;
+            sd_bus_error iderr = SD_BUS_ERROR_NULL;
+            if (sd_bus_get_property_string(g_eth.bus, DC_NM_DEST, ac, DC_NM_ACTIVE_CONN_IFACE, "Id",
+                                           &iderr, &id) >= 0 &&
+                id)
+                snprintf(info->connection_name, sizeof(info->connection_name), "%s", id);
+            sd_bus_error_free(&iderr);
+            free(id);
+        }
+    }
+    sd_bus_error_free(&acerr);
+    sd_bus_message_unref(acreply);
+
+    sd_bus_error ip4err = SD_BUS_ERROR_NULL;
+    sd_bus_message *ip4reply = NULL;
+    if (sd_bus_get_property(g_eth.bus, DC_NM_DEST, g_eth.device_path, DC_NM_DEVICE_IFACE,
+                            "Ip4Config", &ip4err, &ip4reply, "o") >= 0) {
+        const char *ip4_path = NULL;
+        sd_bus_message_read_basic(ip4reply, 'o', &ip4_path);
+        bool have_ip4 = ip4_path && ip4_path[0] && strcmp(ip4_path, "/") != 0;
+        if (have_ip4 && strcmp(g_eth.ip4_path, ip4_path) != 0) {
+            snprintf(g_eth.ip4_path, sizeof(g_eth.ip4_path), "%s", ip4_path);
+            if (g_eth.ip4_slot) {
+                sd_bus_slot_unref(g_eth.ip4_slot);
+                g_eth.ip4_slot = NULL;
+            }
+            sd_bus_match_signal(g_eth.bus, &g_eth.ip4_slot, DC_NM_DEST, g_eth.ip4_path,
+                                "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                                on_eth_ip4_properties_changed, NULL);
+        } else if (!have_ip4 && g_eth.ip4_path[0]) {
+            if (g_eth.ip4_slot) {
+                sd_bus_slot_unref(g_eth.ip4_slot);
+                g_eth.ip4_slot = NULL;
+            }
+            g_eth.ip4_path[0] = '\0';
+        }
+    }
+    sd_bus_error_free(&ip4err);
+    sd_bus_message_unref(ip4reply);
+
+    eth_read_ip4();
+}
+
+static int on_eth_device_properties_changed(sd_bus_message *m, void *userdata,
+                                            sd_bus_error *ret_error)
+{
+    DC_UNUSED(m);
+    DC_UNUSED(userdata);
+    DC_UNUSED(ret_error);
+    nm_eth_refresh();
+    return 0;
+}
+
+/* Resolve the first NM_DEVICE_TYPE_ETHERNET device (if any) and subscribe to
+ * it, mirroring dc_net_init()'s Wi-Fi device resolution above. Safe no-op
+ * (dc_net_ethernet() reports has_device=false) if `bus` is NULL or the
+ * system has no wired device known to NetworkManager. */
+static void nm_eth_init(sd_bus *bus)
+{
+    if (!bus)
+        return;
+    g_eth.bus = bus;
+
+    if (!nm_find_device_by_type(bus, DC_NM_DEVICE_TYPE_ETHERNET, g_eth.device_path,
+                                sizeof(g_eth.device_path))) {
+        dc_info("net: no NetworkManager ethernet device found");
+        return;
+    }
+    g_eth.have_device = true;
+
+    sd_bus_match_signal(g_eth.bus, &g_eth.device_slot, DC_NM_DEST, g_eth.device_path,
+                        "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                        on_eth_device_properties_changed, NULL);
+    nm_eth_refresh();
+
+    dc_info("net: NetworkManager ethernet device %s -- event-driven, no nmcli poll",
+            g_eth.device_path);
+}
+
+bool dc_net_ethernet(dc_net_eth_info *out)
+{
+    if (!g_eth.have_device) {
+        memset(out, 0, sizeof(*out));
+        return false;
+    }
+    *out = g_eth.info;
+    return true;
+}
+
+void dc_net_eth_connect(void)
+{
+    if (!g_eth.have_device) {
+        dc_warn("net: dc_net_eth_connect() called with no ethernet device present");
+        return;
+    }
+
+    /* Device.AvailableConnections is already filtered by NM to connections
+     * compatible with this device; use the first if any exist, else "/" so
+     * NetworkManager picks/creates a default profile for the device. */
+    char conn_path[128] = "/";
+    sd_bus_error aerr = SD_BUS_ERROR_NULL;
+    sd_bus_message *areply = NULL;
+    if (sd_bus_get_property(g_eth.bus, DC_NM_DEST, g_eth.device_path, DC_NM_DEVICE_IFACE,
+                            "AvailableConnections", &aerr, &areply, "ao") >= 0 &&
+        sd_bus_message_enter_container(areply, 'a', "o") > 0) {
+        const char *first = NULL;
+        if (sd_bus_message_read_basic(areply, 'o', &first) > 0 && first)
+            snprintf(conn_path, sizeof(conn_path), "%s", first);
+        sd_bus_message_exit_container(areply);
+    }
+    sd_bus_error_free(&aerr);
+    sd_bus_message_unref(areply);
+
+    if (net_dryrun()) {
+        dc_info("net: [DANKC_NET_DRYRUN] would call %s %s %s.ActivateConnection(\"%s\", \"%s\", "
+                "\"/\")",
+                DC_NM_DEST, DC_NM_PATH, DC_NM_DEST, conn_path, g_eth.device_path);
+        return;
+    }
+
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = NULL;
+    int r = sd_bus_call_method(g_eth.bus, DC_NM_DEST, DC_NM_PATH, DC_NM_DEST, "ActivateConnection",
+                               &err, &reply, "ooo", conn_path, g_eth.device_path, "/");
+    if (r < 0)
+        dc_warn("net: ActivateConnection (ethernet) failed: %s",
+                err.message ? err.message : strerror(-r));
+    sd_bus_error_free(&err);
+    sd_bus_message_unref(reply);
+}
+
+void dc_net_eth_disconnect(void)
+{
+    if (!g_eth.have_device)
+        return;
+
+    char active_path[128] = {0};
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = NULL;
+    if (sd_bus_get_property(g_eth.bus, DC_NM_DEST, g_eth.device_path, DC_NM_DEVICE_IFACE,
+                            "ActiveConnection", &err, &reply, "o") >= 0) {
+        const char *ac = NULL;
+        sd_bus_message_read_basic(reply, 'o', &ac);
+        if (ac && ac[0] && strcmp(ac, "/") != 0)
+            snprintf(active_path, sizeof(active_path), "%s", ac);
+    }
+    sd_bus_error_free(&err);
+    sd_bus_message_unref(reply);
+
+    if (!active_path[0])
+        return; /* nothing active to deactivate */
+
+    if (net_dryrun()) {
+        dc_info("net: [DANKC_NET_DRYRUN] would call %s %s %s.DeactivateConnection(\"%s\")",
+                DC_NM_DEST, DC_NM_PATH, DC_NM_DEST, active_path);
+        return;
+    }
+
+    sd_bus_error derr = SD_BUS_ERROR_NULL;
+    sd_bus_message *dreply = NULL;
+    int r = sd_bus_call_method(g_eth.bus, DC_NM_DEST, DC_NM_PATH, DC_NM_DEST,
+                               "DeactivateConnection", &derr, &dreply, "o", active_path);
+    if (r < 0)
+        dc_warn("net: DeactivateConnection (ethernet) failed: %s",
+                derr.message ? derr.message : strerror(-r));
+    sd_bus_error_free(&derr);
+    sd_bus_message_unref(dreply);
+}
+
+/* --- Wi-Fi known/saved networks — NetworkManager D-Bus (docs/18-WIFI-BT-PLAN.md
+ * sec.2.3) -------------------------------------------------------------------
+ *
+ * Unlike the scan list (services/weather.c-style fork+pipe, cached 8s),
+ * these are a handful of synchronous D-Bus round trips: ListConnections()
+ * returns object paths already resolved by NetworkManager, and each
+ * GetSettings() is a single small method call, no fork needed.
+ */
+
+/* Parse a Settings.Connection.GetSettings() a{sa{sv}} reply, pulling out
+ * connection.id/type/autoconnect and (if present) 802-11-wireless.ssid
+ * (an NM byte array, decoded here into a C string). Any out-param may be
+ * NULL if the caller doesn't need it. autoconnect defaults to true when the
+ * key is absent from the reply -- that's NM's own default, not just this
+ * function's. Returns false only if the GetSettings call itself failed. */
+static bool net_conn_read_settings(const char *conn_path, char *id_out, size_t id_len,
+                                   char *type_out, size_t type_len, bool *autoconnect_out,
+                                   char *ssid_out, size_t ssid_len)
+{
+    if (id_out && id_len)
+        id_out[0] = '\0';
+    if (type_out && type_len)
+        type_out[0] = '\0';
+    if (autoconnect_out)
+        *autoconnect_out = true;
+    if (ssid_out && ssid_len)
+        ssid_out[0] = '\0';
+
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = NULL;
+    int r = sd_bus_call_method(g_net_bus, DC_NM_DEST, conn_path, DC_NM_SETTINGS_CONN_IFACE,
+                               "GetSettings", &err, &reply, "");
+    sd_bus_error_free(&err);
+    if (r < 0)
+        return false;
+
+    if (sd_bus_message_enter_container(reply, 'a', "{sa{sv}}") > 0) {
+        while (sd_bus_message_enter_container(reply, 'e', "sa{sv}") > 0) {
+            const char *group = NULL;
+            sd_bus_message_read_basic(reply, 's', &group);
+            bool is_conn = group && strcmp(group, "connection") == 0;
+            bool is_wifi = group && strcmp(group, "802-11-wireless") == 0;
+
+            if ((is_conn || is_wifi) && sd_bus_message_enter_container(reply, 'a', "{sv}") > 0) {
+                while (sd_bus_message_enter_container(reply, 'e', "sv") > 0) {
+                    const char *key = NULL;
+                    sd_bus_message_read_basic(reply, 's', &key);
+                    if (is_conn && key && strcmp(key, "id") == 0 && id_out) {
+                        const char *v = NULL;
+                        sd_bus_message_enter_container(reply, 'v', "s");
+                        sd_bus_message_read_basic(reply, 's', &v);
+                        sd_bus_message_exit_container(reply);
+                        if (v)
+                            snprintf(id_out, id_len, "%s", v);
+                    } else if (is_conn && key && strcmp(key, "type") == 0 && type_out) {
+                        const char *v = NULL;
+                        sd_bus_message_enter_container(reply, 'v', "s");
+                        sd_bus_message_read_basic(reply, 's', &v);
+                        sd_bus_message_exit_container(reply);
+                        if (v)
+                            snprintf(type_out, type_len, "%s", v);
+                    } else if (is_conn && key && strcmp(key, "autoconnect") == 0 &&
+                              autoconnect_out) {
+                        int v = 1;
+                        sd_bus_message_enter_container(reply, 'v', "b");
+                        sd_bus_message_read_basic(reply, 'b', &v);
+                        sd_bus_message_exit_container(reply);
+                        *autoconnect_out = v != 0;
+                    } else if (is_wifi && key && strcmp(key, "ssid") == 0 && ssid_out) {
+                        const void *bytes = NULL;
+                        size_t n = 0;
+                        sd_bus_message_enter_container(reply, 'v', "ay");
+                        sd_bus_message_read_array(reply, 'y', &bytes, &n);
+                        sd_bus_message_exit_container(reply);
+                        if (bytes && n > 0) {
+                            size_t copy = n < ssid_len - 1 ? n : ssid_len - 1;
+                            memcpy(ssid_out, bytes, copy);
+                            ssid_out[copy] = '\0';
+                        }
+                    } else {
+                        sd_bus_message_skip(reply, "v");
+                    }
+                    sd_bus_message_exit_container(reply); /* e sv */
+                }
+                sd_bus_message_exit_container(reply); /* a{sv} */
+            } else if (!is_conn && !is_wifi) {
+                sd_bus_message_skip(reply, "a{sv}");
+            }
+            sd_bus_message_exit_container(reply); /* e sa{sv} */
+        }
+        sd_bus_message_exit_container(reply); /* a{sa{sv}} */
+    }
+    sd_bus_message_unref(reply);
+    return true;
+}
+
+/* Recursively duplicate the value at `src`'s current read position into the
+ * message being built at `dst`, generically for every D-Bus container type
+ * (array/struct/dict-entry/variant) plus all basic scalar types.
+ *
+ * Needed for dc_net_saved_set_autoconnect(): NetworkManager's
+ * Settings.Connection.Update() replaces the *entire* connection (there is no
+ * partial-merge API), so toggling one "connection.autoconnect" key means
+ * re-serializing every other group/key exactly as GetSettings() returned it.
+ * This is the generic "copy everything except the one key I'm patching"
+ * primitive that makes that safe without hand-writing a re-encoder for every
+ * settings group NetworkManager might have on a saved connection (802.1x,
+ * ipv6, proxy, bond/team/bridge sub-settings, ...). */
+static int net_copy_value(sd_bus_message *dst, sd_bus_message *src)
+{
+    char type = 0;
+    const char *contents = NULL;
+    int r = sd_bus_message_peek_type(src, &type, &contents);
+    if (r <= 0)
+        return r;
+
+    if (type == SD_BUS_TYPE_ARRAY || type == SD_BUS_TYPE_STRUCT ||
+        type == SD_BUS_TYPE_DICT_ENTRY || type == SD_BUS_TYPE_VARIANT) {
+        r = sd_bus_message_enter_container(src, type, contents);
+        if (r < 0)
+            return r;
+        r = sd_bus_message_open_container(dst, type, contents);
+        if (r < 0) {
+            sd_bus_message_exit_container(src);
+            return r;
+        }
+        while (sd_bus_message_at_end(src, false) == 0) {
+            r = net_copy_value(dst, src);
+            if (r < 0)
+                break;
+        }
+        sd_bus_message_exit_container(src);
+        sd_bus_message_close_container(dst);
+        return r;
+    }
+
+    /* Basic scalar type: read into a union big enough for any of them (the
+     * union's address is valid for every member since they share storage),
+     * then re-append with the same type code -- both calls dispatch on
+     * `type` internally, same as every other read_basic()/append() pair
+     * already used throughout this file. */
+    union {
+        uint8_t y;
+        int b;
+        int16_t n;
+        uint16_t q;
+        int32_t i;
+        uint32_t u;
+        int64_t x;
+        uint64_t t;
+        double d;
+        const char *s;
+    } val;
+    r = sd_bus_message_read_basic(src, type, &val);
+    if (r < 0)
+        return r;
+    return sd_bus_message_append_basic(dst, type, &val);
+}
+
+static struct {
+    dc_net_saved_net items[DC_NET_SAVED_MAX];
+    int count;
+} g_saved;
+
+int dc_net_saved_list(dc_net_saved_net *out, int max)
+{
+    g_saved.count = 0;
+
+    if (g_net_bus) {
+        sd_bus_error err = SD_BUS_ERROR_NULL;
+        sd_bus_message *reply = NULL;
+        int r = sd_bus_call_method(g_net_bus, DC_NM_DEST, DC_NM_SETTINGS_PATH, DC_NM_SETTINGS_IFACE,
+                                   "ListConnections", &err, &reply, "");
+        sd_bus_error_free(&err);
+
+        if (r >= 0 && sd_bus_message_enter_container(reply, 'a', "o") >= 0) {
+            const char *path = NULL;
+            while (g_saved.count < DC_NET_SAVED_MAX &&
+                  sd_bus_message_read_basic(reply, 'o', &path) > 0) {
+                char id[64], type[32], ssid[64];
+                bool autoconnect = true;
+                if (!net_conn_read_settings(path, id, sizeof(id), type, sizeof(type), &autoconnect,
+                                            ssid, sizeof(ssid)))
+                    continue;
+                if (strcmp(type, "802-11-wireless") != 0)
+                    continue;
+
+                dc_net_saved_net *s = &g_saved.items[g_saved.count++];
+                snprintf(s->path, sizeof(s->path), "%s", path);
+                snprintf(s->id, sizeof(s->id), "%s", id);
+                snprintf(s->ssid, sizeof(s->ssid), "%s", ssid);
+                s->autoconnect = autoconnect;
+            }
+            sd_bus_message_exit_container(reply);
+        }
+        sd_bus_message_unref(reply);
+    }
+
+    int n = g_saved.count < max ? g_saved.count : max;
+    if (n > 0 && out)
+        memcpy(out, g_saved.items, (size_t)n * sizeof(*out));
+    return n;
+}
+
+bool dc_net_saved_forget(const char *path)
+{
+    if (!path || !path[0] || !g_net_bus)
+        return false;
+
+    if (net_dryrun()) {
+        dc_info("net: [DANKC_NET_DRYRUN] would call %s %s %s.Delete()", DC_NM_DEST, path,
+                DC_NM_SETTINGS_CONN_IFACE);
+        return true;
+    }
+
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = NULL;
+    int r = sd_bus_call_method(g_net_bus, DC_NM_DEST, path, DC_NM_SETTINGS_CONN_IFACE, "Delete",
+                               &err, &reply, "");
+    if (r < 0)
+        dc_warn("net: Settings.Connection.Delete failed for %s: %s", path,
+                err.message ? err.message : strerror(-r));
+    sd_bus_error_free(&err);
+    sd_bus_message_unref(reply);
+    return r >= 0;
+}
+
+bool dc_net_saved_set_autoconnect(const char *path, bool enable)
+{
+    if (!path || !path[0] || !g_net_bus)
+        return false;
+
+    if (net_dryrun()) {
+        dc_info("net: [DANKC_NET_DRYRUN] would call %s %s %s.Update() with "
+                "connection.autoconnect=%s (all other settings preserved verbatim)",
+                DC_NM_DEST, path, DC_NM_SETTINGS_CONN_IFACE, enable ? "true" : "false");
+        return true;
+    }
+
+    sd_bus_error gerr = SD_BUS_ERROR_NULL;
+    sd_bus_message *greply = NULL;
+    int r = sd_bus_call_method(g_net_bus, DC_NM_DEST, path, DC_NM_SETTINGS_CONN_IFACE, "GetSettings",
+                               &gerr, &greply, "");
+    sd_bus_error_free(&gerr);
+    if (r < 0)
+        return false;
+
+    sd_bus_message *m = NULL;
+    r = sd_bus_message_new_method_call(g_net_bus, &m, DC_NM_DEST, path, DC_NM_SETTINGS_CONN_IFACE,
+                                       "Update");
+    if (r < 0) {
+        sd_bus_message_unref(greply);
+        return false;
+    }
+
+    bool ok = true;
+    if (sd_bus_message_enter_container(greply, 'a', "{sa{sv}}") > 0) {
+        sd_bus_message_open_container(m, 'a', "{sa{sv}}");
+
+        while (sd_bus_message_enter_container(greply, 'e', "sa{sv}") > 0) {
+            const char *group = NULL;
+            sd_bus_message_read_basic(greply, 's', &group);
+            bool is_conn = group && strcmp(group, "connection") == 0;
+
+            sd_bus_message_open_container(m, 'e', "sa{sv}");
+            sd_bus_message_append(m, "s", group);
+            sd_bus_message_open_container(m, 'a', "{sv}");
+
+            bool saw_autoconnect = false;
+            if (sd_bus_message_enter_container(greply, 'a', "{sv}") > 0) {
+                while (sd_bus_message_enter_container(greply, 'e', "sv") > 0) {
+                    const char *key = NULL;
+                    sd_bus_message_read_basic(greply, 's', &key);
+                    if (is_conn && key && strcmp(key, "autoconnect") == 0) {
+                        saw_autoconnect = true;
+                        sd_bus_message_skip(greply, "v"); /* discard the old value */
+                        sd_bus_message_open_container(m, 'e', "sv");
+                        sd_bus_message_append(m, "s", "autoconnect");
+                        sd_bus_message_open_container(m, 'v', "b");
+                        sd_bus_message_append(m, "b", enable ? 1 : 0);
+                        sd_bus_message_close_container(m);
+                        sd_bus_message_close_container(m);
+                    } else {
+                        sd_bus_message_open_container(m, 'e', "sv");
+                        sd_bus_message_append(m, "s", key);
+                        if (net_copy_value(m, greply) < 0)
+                            ok = false;
+                        sd_bus_message_close_container(m);
+                    }
+                    sd_bus_message_exit_container(greply); /* e sv */
+                }
+                sd_bus_message_exit_container(greply); /* a{sv} */
+            }
+
+            /* NM omits the "autoconnect" key entirely when it's at its
+             * default (true) -- add it explicitly if this connection didn't
+             * have it and it's being set to something (still just `enable`,
+             * writing true here is a no-op vs. NM's own default but keeps
+             * the round trip simple and explicit). */
+            if (is_conn && !saw_autoconnect) {
+                sd_bus_message_open_container(m, 'e', "sv");
+                sd_bus_message_append(m, "s", "autoconnect");
+                sd_bus_message_open_container(m, 'v', "b");
+                sd_bus_message_append(m, "b", enable ? 1 : 0);
+                sd_bus_message_close_container(m);
+                sd_bus_message_close_container(m);
+            }
+
+            sd_bus_message_close_container(m); /* a{sv} */
+            sd_bus_message_close_container(m); /* e sa{sv} */
+            sd_bus_message_exit_container(greply); /* e sa{sv} */
+        }
+
+        sd_bus_message_close_container(m); /* a{sa{sv}} */
+        sd_bus_message_exit_container(greply); /* a{sa{sv}} */
+    }
+    sd_bus_message_unref(greply);
+
+    if (!ok) {
+        sd_bus_message_unref(m);
+        return false;
+    }
+
+    sd_bus_error uerr = SD_BUS_ERROR_NULL;
+    sd_bus_message *ureply = NULL;
+    r = sd_bus_call(g_net_bus, m, 0, &uerr, &ureply);
+    sd_bus_message_unref(m);
+    if (r < 0)
+        dc_warn("net: Settings.Connection.Update (autoconnect) failed for %s: %s", path,
+                uerr.message ? uerr.message : strerror(-r));
+    sd_bus_error_free(&uerr);
+    sd_bus_message_unref(ureply);
+    return r >= 0;
+}
+
+const dc_net_saved_net *dc_net_saved_find_by_ssid(const char *ssid)
+{
+    if (!ssid || !ssid[0])
+        return NULL;
+    for (int i = 0; i < g_saved.count; i++)
+        if (strcmp(g_saved.items[i].ssid, ssid) == 0)
+            return &g_saved.items[i];
+    return NULL;
+}
+
+/* --- Hotspot (Wi-Fi AP mode) — NetworkManager D-Bus (docs/18-WIFI-BT-PLAN.md
+ * sec.2.2) ---------------------------------------------------------------- */
+
+/* Look up the Wi-Fi device's currently-active connection object path
+ * (Device.ActiveConnection, "/" or unset if none). Shared by
+ * dc_net_hotspot_stop()/dc_net_hotspot_active(); the ethernet equivalent of
+ * this same read lives inline in dc_net_eth_disconnect() above (small enough
+ * not to be worth sharing across the two very different device kinds). */
+static bool nm_active_connection_path(const char *device_path, char *out, size_t out_sz)
+{
+    out[0] = '\0';
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = NULL;
+    if (sd_bus_get_property(g_net_bus, DC_NM_DEST, device_path, DC_NM_DEVICE_IFACE,
+                            "ActiveConnection", &err, &reply, "o") >= 0) {
+        const char *ac = NULL;
+        sd_bus_message_read_basic(reply, 'o', &ac);
+        if (ac && ac[0] && strcmp(ac, "/") != 0)
+            snprintf(out, out_sz, "%s", ac);
+    }
+    sd_bus_error_free(&err);
+    sd_bus_message_unref(reply);
+    return out[0] != '\0';
+}
+
+/* Read Connection.Active's "Connection" property (the Settings/Connection
+ * object path backing this active connection) -- needed to Delete() the
+ * ephemeral hotspot connection once it's deactivated. */
+static bool nm_active_connection_settings_path(const char *active_path, char *out, size_t out_sz)
+{
+    out[0] = '\0';
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = NULL;
+    if (sd_bus_get_property(g_net_bus, DC_NM_DEST, active_path, DC_NM_ACTIVE_CONN_IFACE,
+                            "Connection", &err, &reply, "o") >= 0) {
+        const char *conn = NULL;
+        sd_bus_message_read_basic(reply, 'o', &conn);
+        if (conn)
+            snprintf(out, out_sz, "%s", conn);
+    }
+    sd_bus_error_free(&err);
+    sd_bus_message_unref(reply);
+    return out[0] != '\0';
+}
+
+bool dc_net_hotspot_active(char *ssid_out, size_t len)
+{
+    if (ssid_out && len)
+        ssid_out[0] = '\0';
+    if (!g_net_bus || !g_nm.have_wifi_device)
+        return false;
+
+    uint32_t mode = 0;
+    sd_bus_error merr = SD_BUS_ERROR_NULL;
+    int r = sd_bus_get_property_trivial(g_net_bus, DC_NM_DEST, g_nm.device_path,
+                                        DC_NM_WIRELESS_IFACE, "Mode", &merr, 'u', &mode);
+    sd_bus_error_free(&merr);
+    if (r < 0 || mode != NM_802_11_MODE_AP)
+        return false;
+
+    if (!ssid_out || !len)
+        return true;
+
+    /* No "current AP" object exists in AP mode the way there is for a
+     * client connection -- decode the SSID off the active connection's own
+     * saved 802-11-wireless.ssid via Settings.Connection.GetSettings()
+     * instead (net_conn_read_settings(), defined in the saved-networks
+     * section below). */
+    char active_path[128];
+    if (!nm_active_connection_path(g_nm.device_path, active_path, sizeof(active_path)))
+        return true; /* AP mode confirmed, just no active-connection object to read */
+
+    char settings_path[128];
+    if (!nm_active_connection_settings_path(active_path, settings_path, sizeof(settings_path)))
+        return true;
+
+    net_conn_read_settings(settings_path, NULL, 0, NULL, 0, NULL, ssid_out, len);
+    return true;
+}
+
+dc_net_hotspot_start_result dc_net_hotspot_start(const char *ssid, const char *password,
+                                                 const char *band)
+{
+    if (!ssid || !ssid[0])
+        return DC_NET_HOTSPOT_START_DBUS_FAILED;
+    if (!g_net_bus || !g_nm.have_wifi_device)
+        return DC_NET_HOTSPOT_START_NO_DEVICE;
+
+    /* g_nm.connected reflects whether the Wi-Fi device is currently a
+     * connected client (tracked by the PropertiesChanged subscription at the
+     * top of this file) -- see the "IMPORTANT" note in net.h. */
+    bool was_connected = g_nm.connected;
+
+    if (net_dryrun()) {
+        dc_info("net: [DANKC_NET_DRYRUN] would call %s %s %s.AddAndActivateConnection(...) on "
+                "device %s:",
+                DC_NM_DEST, DC_NM_PATH, DC_NM_DEST, g_nm.device_path);
+        dc_info("net: [DANKC_NET_DRYRUN]   connection: {id=\"%s\", type=802-11-wireless, "
+                "autoconnect=false}",
+                ssid);
+        if (band && band[0])
+            dc_info("net: [DANKC_NET_DRYRUN]   802-11-wireless: {mode=ap, ssid=\"%s\", band=%s%s}",
+                    ssid, band, password && password[0] ? ", security=802-11-wireless-security" : "");
+        else
+            dc_info("net: [DANKC_NET_DRYRUN]   802-11-wireless: {mode=ap, ssid=\"%s\"%s}", ssid,
+                    password && password[0] ? ", security=802-11-wireless-security" : "");
+        if (password && password[0])
+            dc_info("net: [DANKC_NET_DRYRUN]   802-11-wireless-security: {key-mgmt=wpa-psk, "
+                    "psk=\"%s\"}",
+                    password);
+        else
+            dc_info("net: [DANKC_NET_DRYRUN]   (open hotspot -- no 802-11-wireless-security group)");
+        dc_info("net: [DANKC_NET_DRYRUN]   ipv4: {method=shared}");
+        if (was_connected)
+            dc_warn("net: [DANKC_NET_DRYRUN] wifi device %s is currently a connected client "
+                    "(ssid \"%s\") -- starting the hotspot would drop that connection",
+                    g_nm.device_path, g_nm.ssid);
+        return was_connected ? DC_NET_HOTSPOT_START_WAS_CONNECTED : DC_NET_HOTSPOT_START_OK;
+    }
+
+    if (was_connected)
+        dc_warn("net: starting hotspot on %s will drop its active client connection (ssid \"%s\")",
+                g_nm.device_path, g_nm.ssid);
+
+    sd_bus_message *m = NULL;
+    int r = sd_bus_message_new_method_call(g_net_bus, &m, DC_NM_DEST, DC_NM_PATH, DC_NM_DEST,
+                                           "AddAndActivateConnection");
+    if (r < 0)
+        return DC_NET_HOTSPOT_START_DBUS_FAILED;
+
+    /* a{sa{sv}} settings dict, built by hand -- same nested-container shape
+     * as services/polkit.c's register_agent() (see its header comment). */
+    sd_bus_message_open_container(m, 'a', "{sa{sv}}");
+
+    /* "connection": {id, type, autoconnect} */
+    sd_bus_message_open_container(m, 'e', "sa{sv}");
+    sd_bus_message_append(m, "s", "connection");
+    sd_bus_message_open_container(m, 'a', "{sv}");
+    sd_bus_message_open_container(m, 'e', "sv");
+    sd_bus_message_append(m, "s", "id");
+    sd_bus_message_open_container(m, 'v', "s");
+    sd_bus_message_append(m, "s", ssid);
+    sd_bus_message_close_container(m);
+    sd_bus_message_close_container(m);
+    sd_bus_message_open_container(m, 'e', "sv");
+    sd_bus_message_append(m, "s", "type");
+    sd_bus_message_open_container(m, 'v', "s");
+    sd_bus_message_append(m, "s", "802-11-wireless");
+    sd_bus_message_close_container(m);
+    sd_bus_message_close_container(m);
+    sd_bus_message_open_container(m, 'e', "sv");
+    sd_bus_message_append(m, "s", "autoconnect");
+    sd_bus_message_open_container(m, 'v', "b");
+    sd_bus_message_append(m, "b", 0);
+    sd_bus_message_close_container(m);
+    sd_bus_message_close_container(m);
+    sd_bus_message_close_container(m); /* a{sv} */
+    sd_bus_message_close_container(m); /* e */
+
+    /* "802-11-wireless": {mode=ap, ssid, band?, security?} */
+    sd_bus_message_open_container(m, 'e', "sa{sv}");
+    sd_bus_message_append(m, "s", "802-11-wireless");
+    sd_bus_message_open_container(m, 'a', "{sv}");
+    sd_bus_message_open_container(m, 'e', "sv");
+    sd_bus_message_append(m, "s", "mode");
+    sd_bus_message_open_container(m, 'v', "s");
+    sd_bus_message_append(m, "s", "ap");
+    sd_bus_message_close_container(m);
+    sd_bus_message_close_container(m);
+    sd_bus_message_open_container(m, 'e', "sv");
+    sd_bus_message_append(m, "s", "ssid");
+    sd_bus_message_open_container(m, 'v', "ay");
+    sd_bus_message_append_array(m, 'y', ssid, strlen(ssid));
+    sd_bus_message_close_container(m);
+    sd_bus_message_close_container(m);
+    if (band && band[0]) {
+        sd_bus_message_open_container(m, 'e', "sv");
+        sd_bus_message_append(m, "s", "band");
+        sd_bus_message_open_container(m, 'v', "s");
+        sd_bus_message_append(m, "s", band);
+        sd_bus_message_close_container(m);
+        sd_bus_message_close_container(m);
+    }
+    if (password && password[0]) {
+        sd_bus_message_open_container(m, 'e', "sv");
+        sd_bus_message_append(m, "s", "security");
+        sd_bus_message_open_container(m, 'v', "s");
+        sd_bus_message_append(m, "s", "802-11-wireless-security");
+        sd_bus_message_close_container(m);
+        sd_bus_message_close_container(m);
+    }
+    sd_bus_message_close_container(m); /* a{sv} */
+    sd_bus_message_close_container(m); /* e */
+
+    /* "802-11-wireless-security": {key-mgmt=wpa-psk, psk} -- omitted entirely
+     * for an open hotspot. */
+    if (password && password[0]) {
+        sd_bus_message_open_container(m, 'e', "sa{sv}");
+        sd_bus_message_append(m, "s", "802-11-wireless-security");
+        sd_bus_message_open_container(m, 'a', "{sv}");
+        sd_bus_message_open_container(m, 'e', "sv");
+        sd_bus_message_append(m, "s", "key-mgmt");
+        sd_bus_message_open_container(m, 'v', "s");
+        sd_bus_message_append(m, "s", "wpa-psk");
+        sd_bus_message_close_container(m);
+        sd_bus_message_close_container(m);
+        sd_bus_message_open_container(m, 'e', "sv");
+        sd_bus_message_append(m, "s", "psk");
+        sd_bus_message_open_container(m, 'v', "s");
+        sd_bus_message_append(m, "s", password);
+        sd_bus_message_close_container(m);
+        sd_bus_message_close_container(m);
+        sd_bus_message_close_container(m); /* a{sv} */
+        sd_bus_message_close_container(m); /* e */
+    }
+
+    /* "ipv4": {method=shared} -- NM runs its own DHCP server + NAT for the
+     * lifetime of the AP-mode connection. */
+    sd_bus_message_open_container(m, 'e', "sa{sv}");
+    sd_bus_message_append(m, "s", "ipv4");
+    sd_bus_message_open_container(m, 'a', "{sv}");
+    sd_bus_message_open_container(m, 'e', "sv");
+    sd_bus_message_append(m, "s", "method");
+    sd_bus_message_open_container(m, 'v', "s");
+    sd_bus_message_append(m, "s", "shared");
+    sd_bus_message_close_container(m);
+    sd_bus_message_close_container(m);
+    sd_bus_message_close_container(m); /* a{sv} */
+    sd_bus_message_close_container(m); /* e */
+
+    sd_bus_message_close_container(m); /* a{sa{sv}} */
+
+    sd_bus_message_append(m, "oo", g_nm.device_path, "/");
+
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = NULL;
+    r = sd_bus_call(g_net_bus, m, 0, &err, &reply);
+    sd_bus_message_unref(m);
+    sd_bus_message_unref(reply);
+
+    if (r < 0) {
+        dc_warn("net: AddAndActivateConnection (hotspot) failed: %s",
+                err.message ? err.message : strerror(-r));
+        sd_bus_error_free(&err);
+        return DC_NET_HOTSPOT_START_DBUS_FAILED;
+    }
+    sd_bus_error_free(&err);
+
+    return was_connected ? DC_NET_HOTSPOT_START_WAS_CONNECTED : DC_NET_HOTSPOT_START_OK;
+}
+
+void dc_net_hotspot_stop(void)
+{
+    if (!g_net_bus || !g_nm.have_wifi_device)
+        return;
+
+    char ssid[64] = {0};
+    if (!dc_net_hotspot_active(ssid, sizeof(ssid))) {
+        dc_info("net: dc_net_hotspot_stop() called but no hotspot is active");
+        return;
+    }
+
+    char active_path[128];
+    if (!nm_active_connection_path(g_nm.device_path, active_path, sizeof(active_path)))
+        return;
+
+    char settings_path[128];
+    bool have_settings = nm_active_connection_settings_path(active_path, settings_path,
+                                                            sizeof(settings_path));
+
+    if (net_dryrun()) {
+        dc_info("net: [DANKC_NET_DRYRUN] would call %s %s %s.DeactivateConnection(\"%s\")",
+                DC_NM_DEST, DC_NM_PATH, DC_NM_DEST, active_path);
+        if (have_settings)
+            dc_info("net: [DANKC_NET_DRYRUN] would call %s %s %s.Delete() (hotspot \"%s\")",
+                    DC_NM_DEST, settings_path, DC_NM_SETTINGS_CONN_IFACE, ssid);
+        return;
+    }
+
+    sd_bus_error derr = SD_BUS_ERROR_NULL;
+    sd_bus_message *dreply = NULL;
+    int r = sd_bus_call_method(g_net_bus, DC_NM_DEST, DC_NM_PATH, DC_NM_DEST,
+                               "DeactivateConnection", &derr, &dreply, "o", active_path);
+    if (r < 0)
+        dc_warn("net: DeactivateConnection (hotspot) failed: %s",
+                derr.message ? derr.message : strerror(-r));
+    sd_bus_error_free(&derr);
+    sd_bus_message_unref(dreply);
+
+    if (have_settings) {
+        sd_bus_error delerr = SD_BUS_ERROR_NULL;
+        sd_bus_message *delreply = NULL;
+        int dr = sd_bus_call_method(g_net_bus, DC_NM_DEST, settings_path, DC_NM_SETTINGS_CONN_IFACE,
+                                    "Delete", &delerr, &delreply, "");
+        if (dr < 0)
+            dc_warn("net: Settings.Connection.Delete (hotspot) failed: %s",
+                    delerr.message ? delerr.message : strerror(-dr));
+        sd_bus_error_free(&delerr);
+        sd_bus_message_unref(delreply);
+    }
+}
+
+/* --- DANKC_NETSVC_TEST startup self-check (docs/18-WIFI-BT-PLAN.md) --------
+ *
+ * controlcenter.c/settings.c don't call any of the functions above yet (that
+ * UI wiring is a separate change, owned elsewhere) -- this is how the read
+ * paths get verified against a real machine's NetworkManager state without
+ * one. Exercises every new read function once and logs the results plainly;
+ * never touches a write path (those are exercised separately, manually,
+ * under DANKC_NET_DRYRUN). */
+static void net_run_test_hook(void)
+{
+    static const char *eth_state_names[] = {
+        "unavailable", "no-cable", "disconnected", "connecting", "connected",
+    };
+
+    dc_info("net: [DANKC_NETSVC_TEST] === ethernet ===");
+    dc_net_eth_info eth;
+    if (dc_net_ethernet(&eth)) {
+        dc_info("net: [DANKC_NETSVC_TEST] device=%s state=%s connection=\"%s\" mac=%s "
+                "speed=%uMb/s",
+                eth.device_name, eth_state_names[eth.state], eth.connection_name, eth.mac,
+                eth.link_speed_mbps);
+        if (eth.state == DC_NET_ETH_CONNECTED)
+            dc_info("net: [DANKC_NETSVC_TEST]   ipv4=%s/%u gateway=%s dns[0]=%s",
+                    eth.ipv4_address, eth.ipv4_prefix, eth.ipv4_gateway,
+                    eth.ipv4_dns_count > 0 ? eth.ipv4_dns[0] : "(none)");
+    } else {
+        dc_info("net: [DANKC_NETSVC_TEST] no wired device found");
+    }
+
+    dc_info("net: [DANKC_NETSVC_TEST] === saved wifi networks ===");
+    dc_net_saved_net saved[DC_NET_SAVED_MAX];
+    int n = dc_net_saved_list(saved, DC_NET_SAVED_MAX);
+    dc_info("net: [DANKC_NETSVC_TEST] %d saved 802-11-wireless connection(s)", n);
+    for (int i = 0; i < n; i++)
+        dc_info("net: [DANKC_NETSVC_TEST]   id=\"%s\" ssid=\"%s\" autoconnect=%s path=%s",
+                saved[i].id, saved[i].ssid, saved[i].autoconnect ? "yes" : "no", saved[i].path);
+
+    dc_info("net: [DANKC_NETSVC_TEST] === hotspot ===");
+    char hs_ssid[64];
+    if (dc_net_hotspot_active(hs_ssid, sizeof(hs_ssid)))
+        dc_info("net: [DANKC_NETSVC_TEST] hotspot active, ssid=\"%s\"", hs_ssid);
+    else
+        dc_info("net: [DANKC_NETSVC_TEST] no hotspot active");
+
+    /* Write-path verification: only when DANKC_NET_DRYRUN is *also* set, so
+     * this never issues a real D-Bus write -- dc_net_hotspot_start()/
+     * dc_net_saved_forget() see the dry-run gate before doing anything and
+     * just log what they would have sent (docs/18-WIFI-BT-PLAN.md's required
+     * verification scenario). */
+    if (net_dryrun()) {
+        dc_info("net: [DANKC_NETSVC_TEST] === write-path dry-run scenario ===");
+        dc_net_hotspot_start_result hr =
+            dc_net_hotspot_start("DankcTestHotspot", "testpassword123", "bg");
+        dc_info("net: [DANKC_NETSVC_TEST] dc_net_hotspot_start() -> %d", (int)hr);
+
+        if (n > 0) {
+            bool ok = dc_net_saved_forget(saved[0].path);
+            dc_info("net: [DANKC_NETSVC_TEST] dc_net_saved_forget(\"%s\") -> %s", saved[0].path,
+                    ok ? "ok" : "failed");
+        } else {
+            dc_info("net: [DANKC_NETSVC_TEST] no saved network to exercise "
+                    "dc_net_saved_forget() with");
+        }
+    }
+}
+
