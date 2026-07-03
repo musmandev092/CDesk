@@ -25,6 +25,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pwd.h>
+#include <sys/stat.h>
 #include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
@@ -83,6 +85,18 @@
 #define IC_LANGUAGE DC_ICON_LANGUAGE
 #define IC_APPS DC_ICON_APPS
 #define IC_COLOR_LENS DC_ICON_COLOR_LENS
+/* docs/14-COMPLETION-PLAN.md W3.2/W3.4: Lock Screen reuses the existing LOCK
+ * glyph (already used by ui/lock.c's password pill); Window Rules gets its
+ * own new glyph (render/icons.h). */
+#define IC_LOCK_SCREEN DC_ICON_LOCK
+#define IC_WINDOW_RULES DC_ICON_SELECT_WINDOW
+/* docs/14-COMPLETION-PLAN.md W5 stretch tabs. Users reuses the existing
+ * PERSON glyph (already used elsewhere), so no new render/icons.h entry was
+ * needed for it. */
+#define IC_MUX DC_ICON_TERMINAL
+#define IC_SYSTEM_UPDATER DC_ICON_UPDATE
+#define IC_PRINTER DC_ICON_PRINT
+#define IC_USERS DC_ICON_PERSON
 
 typedef enum {
     TAB_PERSONALIZATION = 0,
@@ -104,6 +118,12 @@ typedef enum {
     TAB_OSD,
     TAB_THEME_COLORS,
     TAB_POWER,
+    TAB_LOCKSCREEN,
+    TAB_WINDOW_RULES,
+    TAB_MUX,
+    TAB_SYSTEM_UPDATER,
+    TAB_PRINTER,
+    TAB_USERS,
     TAB_ABOUT,
     TAB_COUNT,
 } s_tab;
@@ -123,7 +143,10 @@ static const s_tab_def TABS[TAB_COUNT] = {
     {IC_GRID_VIEW, "Launcher"},           {IC_APPS, "Default Apps"},
     {IC_LANGUAGE, "Locale"},              {IC_COMPUTER, "System"},
     {IC_TUNE, "OSD"},                     {IC_COLOR_LENS, "Theme & Colors"},
-    {IC_POWER, "Power"},                  {IC_INFO, "About"},
+    {IC_POWER, "Power"},                  {IC_LOCK_SCREEN, "Lock Screen"},
+    {IC_WINDOW_RULES, "Window Rules"},    {IC_MUX, "Multiplexer"},
+    {IC_SYSTEM_UPDATER, "System Updater"}, {IC_PRINTER, "Printer"},
+    {IC_USERS, "Users"},                  {IC_INFO, "About"},
 };
 
 struct dc_settings {
@@ -160,6 +183,17 @@ struct dc_settings {
      * COMPLETION-PLAN.md W2.8) -- most sessions never open it, so this
      * avoids scanning every applications/ dir on every settings open. */
     dc_apps *apps;
+
+    /* niri Window Rules tab draft (docs/14-COMPLETION-PLAN.md W3.4): the
+     * in-progress "add a rule" form. Not part of dc_config/config.json --
+     * see wr_add_rule() below, which writes ~/.config/niri/dankc-rules.kdl
+     * instead. app-id text editing goes through the shared focus_field/
+     * edit_buf mechanism (focus_field == 6), committed here on Enter/blur. */
+    char wr_new_app_id[160];
+    bool wr_new_floating;
+    bool wr_new_maximized;
+    bool wr_new_opacity_enabled;
+    float wr_new_opacity;
 };
 
 /* Bounded string copy without gcc's -Wformat-truncation firing: several text
@@ -1900,6 +1934,1037 @@ static void tab_power(uictx *c)
     ui_hint(c, "Lock, suspend and power-off live in the power menu (bar \xc2\xb7 power button)");
 }
 
+/* ====================== niri Window Rules editor (W3.4) ======================
+ *
+ * docs/14-COMPLETION-PLAN.md W3.4 ("niri window-rules editor"). Safety design
+ * (see also the task's own "do NOT corrupt the user's niri config" mandate):
+ *
+ *   - dankc NEVER rewrites the user's hand-written config.kdl content. The
+ *     only rules dankc can add/remove through this UI live in a fully
+ *     dankc-owned file, ~/.config/niri/dankc-rules.kdl -- freely rewritten
+ *     from what this tab currently understands, same trust level as
+ *     config.json itself (we generated it, we can regenerate it).
+ *   - The ONE place this code touches the user's real config.kdl is adding a
+ *     single `include "dankc-rules.kdl"` line, and ONLY when the user clicks
+ *     an explicit "Enable" row (never automatically) -- gated behind a
+ *     mandatory timestamped backup written first (wr_ensure_include()).
+ *   - Rules already present in the user's config.kdl (or anything *it*
+ *     includes) are parsed and listed for visibility, but rendered
+ *     read-only -- no remove/edit affordance, matching the task's fallback
+ *     of "read + stage" for anything too risky to auto-apply.
+ *   - Parsing is intentionally tolerant, not a full KDL implementation --
+ *     same philosophy as src/ui/keybinds_modal.c's own doc comment, and this
+ *     block reuses that file's brace/quote-aware block-scanning approach
+ *     (kept as an independent copy here per this task's file-ownership
+ *     boundary: this agent owns settings.c only). Recognizes exactly the
+ *     grammar this editor itself writes (`match app-id="..."`,
+ *     `open-floating <bool>`, `open-maximized <bool>`, `opacity <float>`);
+ *     anything else in a window-rule block (geometry, default-column-width,
+ *     draw-border-with-background, ...) is silently ignored for display
+ *     purposes and left completely untouched on disk for read-only rules.
+ */
+#define DC_WR_MAX 32
+#define DC_WR_APPID_MAX 160
+#define DC_WR_MAX_INCLUDE_FILES 16
+#define DC_WR_MAX_DEPTH 6
+
+typedef struct {
+    char app_id[DC_WR_APPID_MAX]; /* first `match app-id="..."` value found, if any */
+    int extra_matches;            /* additional `match` lines beyond the first (OR'd) */
+    bool has_open_floating;
+    bool open_floating;
+    bool has_open_maximized;
+    bool open_maximized;
+    bool has_opacity;
+    float opacity;
+    bool managed; /* true => parsed from dankc-rules.kdl (safe to remove/rewrite) */
+} wr_rule;
+
+static wr_rule g_wr_rules[DC_WR_MAX];
+static int g_wr_n = 0;
+static bool g_wr_dirty = true; /* reparse from disk next time the tab is shown */
+static bool g_wr_managed_exists = false;
+static bool g_wr_include_present = false; /* config.kdl already has `include "dankc-rules.kdl"` */
+static char g_wr_managed_path[DC_CONFIG_PATH_MAX];
+static char g_wr_config_path[DC_CONFIG_PATH_MAX];
+
+static char *wr_read_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    long sz = ftell(f);
+    if (sz < 0 || sz > 4 * 1024 * 1024) { /* sanity cap, matches keybinds_modal.c's */
+        fclose(f);
+        return NULL;
+    }
+    rewind(f);
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    size_t n = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[n] = '\0';
+    return buf;
+}
+
+/* Blank out `// ...` line comments in place (same tolerant approach as
+ * keybinds_modal.c's kb_strip_comments -- doesn't special-case `//` inside a
+ * quoted string, which real niri configs never put there). */
+static void wr_strip_comments(char *text)
+{
+    for (char *p = text; *p; p++) {
+        if (p[0] == '/' && p[1] == '/') {
+            while (*p && *p != '\n')
+                *p++ = ' ';
+            if (!*p)
+                break;
+        }
+    }
+}
+
+typedef void (*wr_block_cb)(const char *inner, size_t len, void *ctx);
+
+/* Find every `<tag> { ... }` node anywhere in `text` (word-boundary checked,
+ * brace/quote aware so nested braces or braces-in-strings don't confuse the
+ * depth count) and hand its inner content to `cb`. Generalized copy of
+ * keybinds_modal.c's kb_scan_binds_blocks (parameterized by tag name; that
+ * file scans for "binds" specifically, this one for "window-rule"). */
+static void wr_scan_blocks(const char *text, const char *tag, wr_block_cb cb, void *ctx)
+{
+    size_t taglen = strlen(tag);
+    const char *p = text;
+    while ((p = strstr(p, tag)) != NULL) {
+        bool left_ok =
+            (p == text) || !(isalnum((unsigned char)p[-1]) || p[-1] == '_' || p[-1] == '-');
+        const char *after = p + taglen;
+        bool right_ok =
+            !(isalnum((unsigned char)after[0]) || after[0] == '_' || after[0] == '-');
+        if (left_ok && right_ok) {
+            const char *q = after;
+            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r')
+                q++;
+            if (*q == '{') {
+                const char *inner_start = q + 1;
+                int depth = 1;
+                const char *r = inner_start;
+                while (*r && depth > 0) {
+                    if (*r == '"') {
+                        r++;
+                        while (*r && *r != '"') {
+                            if (*r == '\\' && r[1])
+                                r++;
+                            r++;
+                        }
+                        if (*r)
+                            r++;
+                        continue;
+                    }
+                    if (*r == '{')
+                        depth++;
+                    else if (*r == '}') {
+                        depth--;
+                        if (depth == 0)
+                            break;
+                    }
+                    r++;
+                }
+                if (depth == 0) {
+                    cb(inner_start, (size_t)(r - inner_start), ctx);
+                    p = r + 1;
+                    continue;
+                }
+            }
+        }
+        p = after;
+    }
+}
+
+/* Word-boundary check for a keyword at `text[pos]`, bounded to [0, textlen). */
+static bool wr_word_at(const char *text, size_t pos, size_t textlen, const char *word)
+{
+    size_t wl = strlen(word);
+    if (pos + wl > textlen)
+        return false;
+    if (strncmp(text + pos, word, wl) != 0)
+        return false;
+    bool left_ok =
+        (pos == 0) || !(isalnum((unsigned char)text[pos - 1]) || text[pos - 1] == '_' ||
+                        text[pos - 1] == '-');
+    unsigned char right = (pos + wl < textlen) ? (unsigned char)text[pos + wl] : 0;
+    bool right_ok = !(isalnum(right) || right == '_' || right == '-');
+    return left_ok && right_ok;
+}
+
+/* Find `needle` (e.g. "app-id=") within [start,end) and copy the quoted value
+ * that follows it -- handles both plain `"foo"` and niri's raw-string
+ * `r#"foo"#`/`r##"foo"##` forms transparently, since only the content between
+ * the first `"` after `needle` and its matching closing `"` is copied (the
+ * leading `r#`/trailing `#` markers sit outside the quotes and are never
+ * touched). */
+static void wr_extract_quoted_in_range(const char *text, size_t start, size_t end,
+                                       const char *needle, char *out, size_t outsz)
+{
+    out[0] = '\0';
+    size_t nlen = strlen(needle);
+    size_t found = (size_t)-1;
+    for (size_t i = start; i + nlen <= end; i++) {
+        if (strncmp(text + i, needle, nlen) == 0) {
+            found = i;
+            break;
+        }
+    }
+    if (found == (size_t)-1)
+        return;
+    size_t p = found + nlen;
+    while (p < end && text[p] != '"') {
+        if (text[p] == ';' || text[p] == '\n')
+            return;
+        p++;
+    }
+    if (p >= end || text[p] != '"')
+        return;
+    p++;
+    size_t n = 0;
+    while (p < end && text[p] != '"' && n + 1 < outsz) {
+        if (text[p] == '\\' && p + 1 < end)
+            p++;
+        out[n++] = text[p++];
+    }
+    out[n] = '\0';
+}
+
+/* First "true"/"false" token in [start,end); bare/unrecognized defaults to
+ * true (every hand-written example seen uses an explicit bool, but a bare
+ * flag reads more naturally as "on" than "off" if that ever changes). */
+static bool wr_bool_after(const char *text, size_t start, size_t end)
+{
+    for (size_t i = start; i < end; i++) {
+        if (wr_word_at(text, i, end, "false"))
+            return false;
+        if (wr_word_at(text, i, end, "true"))
+            return true;
+    }
+    return true;
+}
+
+static float wr_float_after(const char *text, size_t start, size_t end)
+{
+    size_t i = start;
+    while (i < end && (text[i] == ' ' || text[i] == '\t'))
+        i++;
+    char buf[32];
+    size_t n = 0;
+    while (i < end && n + 1 < sizeof(buf) &&
+           (isdigit((unsigned char)text[i]) || text[i] == '.' || text[i] == '-'))
+        buf[n++] = text[i++];
+    buf[n] = '\0';
+    if (n == 0)
+        return 1.0f;
+    return (float)atof(buf);
+}
+
+/* Parse one `window-rule { ... }` block's inner content into a wr_rule.
+ * Walks top-level statements (depth-0, newline- or `{`-delimited; a quoted
+ * span is treated as opaque so a brace/newline inside a regex string can't
+ * end a statement early; a nested `key { ... }` block, e.g.
+ * default-column-width's, is swallowed whole via brace/quote-aware depth
+ * tracking without being individually inspected -- this editor doesn't
+ * understand or touch those properties). */
+static void wr_parse_rule_inner(const char *inner, size_t len, bool managed)
+{
+    if (g_wr_n >= DC_WR_MAX)
+        return;
+    wr_rule r;
+    memset(&r, 0, sizeof(r));
+    r.managed = managed;
+    int match_count = 0;
+
+    size_t i = 0;
+    while (i < len) {
+        while (i < len && isspace((unsigned char)inner[i]))
+            i++;
+        if (i >= len)
+            break;
+        size_t line_start = i;
+
+        size_t head_end = i;
+        while (head_end < len && inner[head_end] != '\n' && inner[head_end] != '{') {
+            if (inner[head_end] == '"') {
+                head_end++;
+                while (head_end < len && inner[head_end] != '"') {
+                    if (inner[head_end] == '\\' && head_end + 1 < len)
+                        head_end++;
+                    head_end++;
+                }
+                if (head_end < len)
+                    head_end++;
+                continue;
+            }
+            head_end++;
+        }
+
+        size_t stmt_end = head_end;
+        if (head_end < len && inner[head_end] == '{') {
+            int depth = 1;
+            size_t j = head_end + 1;
+            while (j < len && depth > 0) {
+                if (inner[j] == '"') {
+                    j++;
+                    while (j < len && inner[j] != '"') {
+                        if (inner[j] == '\\' && j + 1 < len)
+                            j++;
+                        j++;
+                    }
+                    if (j < len)
+                        j++;
+                    continue;
+                }
+                if (inner[j] == '{')
+                    depth++;
+                else if (inner[j] == '}')
+                    depth--;
+                j++;
+            }
+            stmt_end = j;
+        }
+
+        if (wr_word_at(inner, line_start, head_end, "match")) {
+            char appid[DC_WR_APPID_MAX];
+            wr_extract_quoted_in_range(inner, line_start, head_end, "app-id=", appid,
+                                       sizeof(appid));
+            if (match_count == 0 && appid[0])
+                copy_trunc(r.app_id, sizeof(r.app_id), appid);
+            else if (match_count > 0)
+                r.extra_matches++;
+            match_count++;
+        } else if (wr_word_at(inner, line_start, head_end, "open-floating")) {
+            r.has_open_floating = true;
+            r.open_floating = wr_bool_after(inner, line_start + strlen("open-floating"), head_end);
+        } else if (wr_word_at(inner, line_start, head_end, "open-maximized")) {
+            r.has_open_maximized = true;
+            r.open_maximized =
+                wr_bool_after(inner, line_start + strlen("open-maximized"), head_end);
+        } else if (wr_word_at(inner, line_start, head_end, "opacity")) {
+            r.has_opacity = true;
+            r.opacity = wr_float_after(inner, line_start + strlen("opacity"), head_end);
+        }
+
+        i = stmt_end;
+    }
+
+    if (g_wr_n < DC_WR_MAX)
+        g_wr_rules[g_wr_n++] = r;
+}
+
+static void wr_collect_cb(const char *inner, size_t len, void *ctx)
+{
+    bool managed = *(const bool *)ctx;
+    wr_parse_rule_inner(inner, len, managed);
+}
+
+/* Read one KDL file, scan it for window-rule blocks (tagged managed iff the
+ * file is exactly ~/.config/niri/dankc-rules.kdl), then follow its
+ * `include "..."` statements (same tolerant, depth+seen-guarded recursion as
+ * keybinds_modal.c's kb_parse_file, kept as an independent copy here). */
+static void wr_parse_file(const char *path, int depth, char seen[][DC_CONFIG_PATH_MAX],
+                          int *seen_n)
+{
+    if (depth > DC_WR_MAX_DEPTH)
+        return;
+    for (int i = 0; i < *seen_n; i++)
+        if (strcmp(seen[i], path) == 0)
+            return;
+    if (*seen_n < DC_WR_MAX_INCLUDE_FILES)
+        snprintf(seen[(*seen_n)++], DC_CONFIG_PATH_MAX, "%s", path);
+
+    char *text = wr_read_file(path);
+    if (!text)
+        return;
+    wr_strip_comments(text);
+
+    bool managed = strcmp(path, g_wr_managed_path) == 0;
+    wr_scan_blocks(text, "window-rule", wr_collect_cb, &managed);
+
+    char dir[DC_CONFIG_PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash)
+        *slash = '\0';
+    else
+        snprintf(dir, sizeof(dir), ".");
+
+    const char *p = text;
+    while ((p = strstr(p, "include")) != NULL) {
+        const char *q = p + 7;
+        while (*q == ' ' || *q == '\t')
+            q++;
+        if (*q == '"') {
+            q++;
+            const char *end = strchr(q, '"');
+            if (end && end > q) {
+                char rel[300];
+                size_t rl = (size_t)(end - q);
+                if (rl >= sizeof(rel))
+                    rl = sizeof(rel) - 1;
+                memcpy(rel, q, rl);
+                rel[rl] = '\0';
+                char childpath[sizeof(dir) + sizeof(rel) + 2];
+                snprintf(childpath, sizeof(childpath), "%s/%s", dir, rel);
+                wr_parse_file(childpath, depth + 1, seen, seen_n);
+            }
+            p = end ? end + 1 : q;
+        } else {
+            p = q;
+        }
+    }
+    free(text);
+}
+
+/* Entry point: resolve paths, check whether config.kdl already includes our
+ * managed file, then parse config.kdl (recursively) plus -- if not already
+ * reached via an include -- dankc-rules.kdl directly, so staged rules are
+ * still visible/manageable before the user clicks "Enable". */
+static void wr_load(void)
+{
+    g_wr_n = 0;
+    g_wr_include_present = false;
+    g_wr_managed_exists = false;
+
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) {
+        dc_warn("window rules: $HOME unset, cannot locate config.kdl");
+        return;
+    }
+    snprintf(g_wr_config_path, sizeof(g_wr_config_path), "%s/.config/niri/config.kdl", home);
+    snprintf(g_wr_managed_path, sizeof(g_wr_managed_path), "%s/.config/niri/dankc-rules.kdl",
+            home);
+
+    struct stat st;
+    g_wr_managed_exists = stat(g_wr_managed_path, &st) == 0;
+
+    char *cfg_text = wr_read_file(g_wr_config_path);
+    if (cfg_text) {
+        g_wr_include_present = strstr(cfg_text, "include \"dankc-rules.kdl\"") != NULL;
+        free(cfg_text);
+    }
+
+    char seen[DC_WR_MAX_INCLUDE_FILES][DC_CONFIG_PATH_MAX];
+    int seen_n = 0;
+    wr_parse_file(g_wr_config_path, 0, seen, &seen_n);
+
+    bool managed_seen = false;
+    for (int i = 0; i < seen_n; i++)
+        if (strcmp(seen[i], g_wr_managed_path) == 0)
+            managed_seen = true;
+    if (!managed_seen)
+        wr_parse_file(g_wr_managed_path, 0, seen, &seen_n);
+
+    dc_info("window rules: parsed %d rule(s) from %d file(s) (managed file %s, included=%d)",
+            g_wr_n, seen_n, g_wr_managed_exists ? "exists" : "absent", g_wr_include_present);
+}
+
+static void wr_ensure_loaded(void)
+{
+    if (g_wr_dirty) {
+        wr_load();
+        g_wr_dirty = false;
+    }
+}
+
+static void wr_serialize_rule(FILE *f, const wr_rule *r)
+{
+    fprintf(f, "window-rule {\n");
+    if (r->app_id[0])
+        fprintf(f, "    match app-id=\"%s\"\n", r->app_id);
+    if (r->has_open_floating)
+        fprintf(f, "    open-floating %s\n", r->open_floating ? "true" : "false");
+    if (r->has_open_maximized)
+        fprintf(f, "    open-maximized %s\n", r->open_maximized ? "true" : "false");
+    if (r->has_opacity)
+        fprintf(f, "    opacity %.2f\n", (double)r->opacity);
+    fprintf(f, "}\n");
+}
+
+/* Rewrite ~/.config/niri/dankc-rules.kdl from the in-memory MANAGED subset of
+ * g_wr_rules. Fully dankc-owned (see the block comment above) -- no backup
+ * needed, unlike wr_ensure_include() below. Anything in a prior hand-edited
+ * version of this file that this parser doesn't recognize is lost on the
+ * next add/remove through the UI; the header comment warns about this. */
+static bool wr_write_managed_file(void)
+{
+    if (!g_wr_managed_path[0])
+        return false;
+    FILE *f = fopen(g_wr_managed_path, "w");
+    if (!f) {
+        dc_warn("window rules: could not write %s", g_wr_managed_path);
+        return false;
+    }
+    fputs("// Managed by DankC's Settings > Window Rules tab.\n"
+         "// Hand edits are fine (dankc's tolerant parser will pick them up), but\n"
+         "// adding/removing a rule through the UI rewrites this whole file from\n"
+         "// what dankc currently understands -- anything it can't parse (KDL\n"
+         "// features beyond match app-id / open-floating / open-maximized /\n"
+         "// opacity) will be lost on the next UI edit.\n\n",
+         f);
+    for (int i = 0; i < g_wr_n; i++)
+        if (g_wr_rules[i].managed)
+            wr_serialize_rule(f, &g_wr_rules[i]);
+    fclose(f);
+    g_wr_managed_exists = true;
+    return true;
+}
+
+/* The ONE write to the user's real niri config.kdl this editor ever makes:
+ * appending a single `include "dankc-rules.kdl"` line, backed up first. Never
+ * called automatically -- only from an explicit "Enable" row click. */
+static bool wr_ensure_include(void)
+{
+    if (!g_wr_config_path[0])
+        wr_load();
+    if (!g_wr_config_path[0])
+        return false;
+
+    char *text = wr_read_file(g_wr_config_path);
+    if (!text) {
+        dc_warn("window rules: could not read %s to add the include", g_wr_config_path);
+        return false;
+    }
+    if (strstr(text, "include \"dankc-rules.kdl\"")) {
+        free(text);
+        g_wr_include_present = true;
+        return true; /* already there (e.g. added by hand) */
+    }
+
+    char backup_path[DC_CONFIG_PATH_MAX + 32];
+    snprintf(backup_path, sizeof(backup_path), "%s.bak-%ld", g_wr_config_path, (long)time(NULL));
+    FILE *bf = fopen(backup_path, "w");
+    if (!bf) {
+        dc_warn("window rules: could not create backup %s; aborting include", backup_path);
+        free(text);
+        return false;
+    }
+    fputs(text, bf);
+    fclose(bf);
+    free(text);
+
+    FILE *f = fopen(g_wr_config_path, "a");
+    if (!f) {
+        dc_warn("window rules: could not append to %s (backup at %s is safe to restore)",
+                g_wr_config_path, backup_path);
+        return false;
+    }
+    fprintf(f, "\n// Added by DankC Settings > Window Rules (backup: %s):\n", backup_path);
+    fputs("include \"dankc-rules.kdl\"\n", f);
+    fclose(f);
+    dc_info("window rules: added include to %s (backup %s)", g_wr_config_path, backup_path);
+    g_wr_include_present = true;
+    return true;
+}
+
+static void wr_add_rule(dc_settings *s)
+{
+    if (!s->wr_new_app_id[0] && !s->wr_new_floating && !s->wr_new_maximized &&
+        !s->wr_new_opacity_enabled)
+        return; /* nothing to add */
+    if (g_wr_n >= DC_WR_MAX) {
+        dc_warn("window rules: at the %d-rule display cap, not adding another", DC_WR_MAX);
+        return;
+    }
+    if (!g_wr_managed_path[0])
+        wr_load();
+
+    wr_rule r;
+    memset(&r, 0, sizeof(r));
+    r.managed = true;
+    copy_trunc(r.app_id, sizeof(r.app_id), s->wr_new_app_id);
+    if (s->wr_new_floating) {
+        r.has_open_floating = true;
+        r.open_floating = true;
+    }
+    if (s->wr_new_maximized) {
+        r.has_open_maximized = true;
+        r.open_maximized = true;
+    }
+    if (s->wr_new_opacity_enabled) {
+        r.has_opacity = true;
+        r.opacity = s->wr_new_opacity;
+    }
+
+    g_wr_rules[g_wr_n++] = r;
+    if (wr_write_managed_file()) {
+        s->wr_new_app_id[0] = '\0';
+        s->wr_new_floating = false;
+        s->wr_new_maximized = false;
+        s->wr_new_opacity_enabled = false;
+        s->wr_new_opacity = 1.0f;
+    }
+    g_wr_dirty = true; /* reparse so the list reflects our own canonical formatting */
+}
+
+static void wr_remove_rule(int idx)
+{
+    if (idx < 0 || idx >= g_wr_n || !g_wr_rules[idx].managed)
+        return;
+    for (int i = idx; i < g_wr_n - 1; i++)
+        g_wr_rules[i] = g_wr_rules[i + 1];
+    g_wr_n--;
+    wr_write_managed_file();
+    g_wr_dirty = true;
+}
+
+static void wr_summarize_actions(const wr_rule *r, char *out, size_t outsz)
+{
+    char parts[4][40];
+    int n = 0;
+    if (r->has_open_floating && r->open_floating && n < 4)
+        snprintf(parts[n++], sizeof(parts[0]), "float");
+    if (r->has_open_maximized && r->open_maximized && n < 4)
+        snprintf(parts[n++], sizeof(parts[0]), "maximized");
+    if (r->has_opacity && n < 4)
+        snprintf(parts[n++], sizeof(parts[0]), "opacity %.0f%%", (double)r->opacity * 100.0);
+    if (r->extra_matches > 0 && n < 4)
+        snprintf(parts[n++], sizeof(parts[0]), "+%d more match", r->extra_matches);
+    out[0] = '\0';
+    for (int i = 0; i < n; i++) {
+        if (i > 0)
+            snprintf(out + strlen(out), outsz - strlen(out), " \xc2\xb7 ");
+        snprintf(out + strlen(out), outsz - strlen(out), "%s", parts[i]);
+    }
+    if (n == 0)
+        snprintf(out, outsz, "no recognized actions");
+}
+
+/* docs/14-COMPLETION-PLAN.md W3.4: list existing rules (dankc-managed ones
+ * removable; everything else from the user's own config.kdl read-only) and a
+ * simple add-a-rule form (app-id match -> float/maximize/opacity), matching
+ * the task's own scoped-down subset of DMS's WindowRulesTab.qml/
+ * WindowRuleModal.qml. See the safety block comment above wr_scan_blocks(). */
+static void tab_window_rules(uictx *c)
+{
+    wr_ensure_loaded();
+
+    ui_section(c, "STATUS");
+    int managed_n = 0, unmanaged_n = 0;
+    for (int i = 0; i < g_wr_n; i++) {
+        if (g_wr_rules[i].managed)
+            managed_n++;
+        else
+            unmanaged_n++;
+    }
+    char status[96];
+    snprintf(status, sizeof(status), "%d dankc-managed, %d read-only", managed_n, unmanaged_n);
+    ui_value(c, "Rules found", status);
+    ui_value(c, "~/.config/niri/dankc-rules.kdl",
+             g_wr_managed_exists ? "exists" : "not created yet");
+
+    if (!g_wr_include_present) {
+        ui_hint(c, "niri isn't including dankc-rules.kdl yet -- rules added below");
+        ui_hint(c, "won't take effect until you enable it (backs up config.kdl first).");
+        if (ui_list_row(c, "Enable dankc-rules.kdl in niri config", NULL, IC_DONE, false) == 1) {
+            wr_ensure_include();
+        }
+    } else {
+        ui_hint(c, "config.kdl already includes dankc-rules.kdl -- niri picks up");
+        ui_hint(c, "new rules on its own (it watches the file for changes).");
+    }
+
+    if (managed_n > 0) {
+        ui_section(c, "YOUR RULES (dankc-managed)");
+        for (int i = 0; i < g_wr_n; i++) {
+            if (!g_wr_rules[i].managed)
+                continue;
+            char summary[128];
+            wr_summarize_actions(&g_wr_rules[i], summary, sizeof(summary));
+            const char *title = g_wr_rules[i].app_id[0] ? g_wr_rules[i].app_id : "(any window)";
+            if (ui_list_row(c, title, summary, IC_REMOVE, false) == 2) {
+                wr_remove_rule(i);
+                break; /* array shifted -- stop iterating this pass */
+            }
+        }
+    }
+
+    if (unmanaged_n > 0) {
+        ui_section(c, "EXISTING RULES (read-only, from your niri config)");
+        for (int i = 0; i < g_wr_n; i++) {
+            if (g_wr_rules[i].managed)
+                continue;
+            char summary[128];
+            wr_summarize_actions(&g_wr_rules[i], summary, sizeof(summary));
+            const char *title = g_wr_rules[i].app_id[0] ? g_wr_rules[i].app_id : "(any window)";
+            ui_list_row(c, title, summary, 0, false);
+        }
+    }
+    if (g_wr_n == 0)
+        ui_hint(c, "No window-rule blocks found in ~/.config/niri/config.kdl");
+
+    ui_section(c, "ADD RULE");
+    bool appid_focus = c->s->focus_field == 6;
+    char appidbuf[DC_WR_APPID_MAX];
+    if (appid_focus)
+        copy_trunc(appidbuf, sizeof(appidbuf), c->s->edit_buf);
+    else
+        copy_trunc(appidbuf, sizeof(appidbuf), c->s->wr_new_app_id);
+    if (ui_textfield(c, "App ID (e.g. \"firefox\" -- see `niri msg windows`)", appidbuf,
+                     appid_focus)) {
+        c->s->focus_field = 6;
+        copy_trunc(c->s->edit_buf, sizeof(c->s->edit_buf), c->s->wr_new_app_id);
+    }
+    if (ui_toggle(c, "Open floating", NULL, c->s->wr_new_floating))
+        c->s->wr_new_floating = !c->s->wr_new_floating;
+    if (ui_toggle(c, "Open maximized", NULL, c->s->wr_new_maximized))
+        c->s->wr_new_maximized = !c->s->wr_new_maximized;
+    if (ui_toggle(c, "Set opacity", NULL, c->s->wr_new_opacity_enabled))
+        c->s->wr_new_opacity_enabled = !c->s->wr_new_opacity_enabled;
+    if (c->s->wr_new_opacity_enabled) {
+        char ov[16];
+        snprintf(ov, sizeof(ov), "%.0f%%", (double)c->s->wr_new_opacity * 100.0);
+        ui_slider(c, "Opacity", &c->s->wr_new_opacity, 0.1f, 1.0f, ov);
+    }
+    bool can_add = c->s->wr_new_app_id[0] || c->s->wr_new_floating || c->s->wr_new_maximized ||
+                  c->s->wr_new_opacity_enabled;
+    if (ui_list_row(c,
+                    can_add ? "Add rule to dankc-rules.kdl"
+                            : "Add rule (fill in something above first)",
+                    NULL, IC_ADD, false) == 1 &&
+        can_add) {
+        wr_add_rule(c->s);
+    }
+}
+
+/* docs/14-COMPLETION-PLAN.md W3.2: a pragmatic subset of DMS's 23-setting
+ * LockScreenTab.qml -- only the options ui/lock.c can actually honor (no
+ * fingerprint/U2F/video-screensaver/per-monitor backend exists in dankc's
+ * lock screen). All four keys live-apply the next time the lock screen is
+ * shown (`dankc ctl lock`); none of them can be previewed while the lock
+ * isn't active, since ext-session-lock intentionally has no "peek" mode. */
+static void tab_lockscreen(uictx *c)
+{
+    ui_section(c, "CLOCK");
+    if (ui_toggle(c, "Show clock", "Big HH:MM clock on the lock screen", c->cfg->lock_show_clock)) {
+        c->cfg->lock_show_clock = !c->cfg->lock_show_clock;
+        c->changed = true;
+    }
+    if (ui_toggle(c, "Show date", "Weekday and date under the clock", c->cfg->lock_show_date)) {
+        c->cfg->lock_show_date = !c->cfg->lock_show_date;
+        c->changed = true;
+    }
+
+    ui_section(c, "PASSWORD FIELD");
+    if (ui_toggle(c, "Always show password field",
+                  "If off, the field appears once you start typing", c->cfg->lock_show_password_field)) {
+        c->cfg->lock_show_password_field = !c->cfg->lock_show_password_field;
+        c->changed = true;
+    }
+
+    ui_section(c, "BACKGROUND");
+    if (ui_toggle(c, "Use wallpaper background",
+                  "Blurred wallpaper instead of a flat color (needs Material",
+                  c->cfg->lock_use_wallpaper_bg)) {
+        c->cfg->lock_use_wallpaper_bg = !c->cfg->lock_use_wallpaper_bg;
+        c->changed = true;
+    }
+    ui_hint(c, "backgrounds + a wallpaper set on the Personalization tab)");
+
+    ui_hint(c, "Try it: run \"dankc ctl lock\" (Esc/wrong password stays locked;");
+    ui_hint(c, "unlock with your normal password).");
+}
+
+/* ====================== W5 stretch tabs (docs/14-COMPLETION-PLAN.md) ======================
+ *
+ * Lower-priority MISSING tabs, each read-only-safe: list real system state via
+ * a real command, never mutate anything the user didn't explicitly ask for
+ * (System Updater's "Check" button runs the read-only `checkupdates` query,
+ * never an actual upgrade -- matches the task's explicit "do NOT run updates
+ * automatically"). Multiplexer's "attach" action is the one exception that
+ * launches something (a terminal), which is the whole point of the feature.
+ */
+
+#define DC_MUX_MAX 8
+#define DC_MUX_NAME_MAX 64
+
+typedef struct {
+    char name[DC_MUX_NAME_MAX];
+    int windows; /* tmux only; -1 if unknown (zellij doesn't report this via list-sessions) */
+} mux_session;
+
+/* `tmux list-sessions -F '#{session_name}:#{session_windows}'` -> one
+ * "name:N" per line. */
+static int mux_tmux_list(mux_session *out, int max)
+{
+    int n = 0;
+    FILE *pipe = popen("tmux list-sessions -F '#{session_name}:#{session_windows}' 2>/dev/null", "r");
+    if (!pipe)
+        return 0;
+    char line[160];
+    while (n < max && fgets(line, sizeof(line), pipe)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        char *colon = strrchr(line, ':');
+        if (!colon)
+            continue;
+        *colon = '\0';
+        out[n].windows = atoi(colon + 1);
+        copy_trunc(out[n].name, sizeof(out[n].name), line);
+        n++;
+    }
+    pclose(pipe);
+    return n;
+}
+
+/* `zellij list-sessions` output is one session per line, name first
+ * (optionally followed by " [Created ...]"/"[current]" -- best-effort: take
+ * the first whitespace-delimited token). Zellij isn't installed on the dev
+ * machine this was written on, so this is unverified against real output;
+ * kept intentionally tolerant (worst case a session name mis-parses and is
+ * skipped, never a crash). */
+static int mux_zellij_list(mux_session *out, int max)
+{
+    int n = 0;
+    FILE *pipe = popen("zellij list-sessions 2>/dev/null", "r");
+    if (!pipe)
+        return 0;
+    char line[160];
+    while (n < max && fgets(line, sizeof(line), pipe)) {
+        size_t len = strcspn(line, " \t\n\r");
+        if (len == 0 || len >= sizeof(out[0].name))
+            continue;
+        memcpy(out[n].name, line, len);
+        out[n].name[len] = '\0';
+        out[n].windows = -1;
+        n++;
+    }
+    pclose(pipe);
+    return n;
+}
+
+#define DC_MUX_CMD_MAX 200
+
+/* Try a handful of common terminal emulators in order and run `inner_cmd`
+ * inside whichever is found first, detached (fire-and-forget, matching
+ * run_detached()'s existing DANKC_SETTINGS_DRYRUN gate below). `inner_cmd` is
+ * a fixed-size array (not just `const char *`) so its bound stays visible to
+ * the caller's -Wformat-truncation analysis all the way through -- see
+ * copy_trunc()'s doc comment at the top of this file for the same rationale. */
+static void mux_launch_terminal(const char inner_cmd[DC_MUX_CMD_MAX])
+{
+    char cmd[2 * DC_MUX_CMD_MAX + 200];
+    snprintf(cmd, sizeof(cmd),
+             "for t in foot kitty alacritty wezterm ghostty xterm; do "
+             "command -v \"$t\" >/dev/null 2>&1 || continue; "
+             "if [ \"$t\" = wezterm ]; then \"$t\" start -- sh -c '%s' & else "
+             "\"$t\" -e sh -c '%s' & fi; exit 0; done",
+             inner_cmd, inner_cmd);
+    run_detached(cmd);
+}
+
+/* docs/14-COMPLETION-PLAN.md W5.1: tmux/zellij session list, read-only, plus
+ * an "attach in terminal" action per session (the one launch this tab does --
+ * attaching to an existing session mutates nothing dankc doesn't already
+ * consider safe, same trust level as the launcher opening any other app). */
+static void tab_mux(uictx *c)
+{
+    ui_section(c, "TMUX");
+    mux_session tsessions[DC_MUX_MAX];
+    int tn = mux_tmux_list(tsessions, DC_MUX_MAX);
+    if (tn == 0) {
+        bool installed = system("command -v tmux >/dev/null 2>&1") == 0;
+        ui_hint(c, installed ? "No tmux sessions running" : "tmux not installed");
+    } else {
+        for (int i = 0; i < tn; i++) {
+            char status[32];
+            snprintf(status, sizeof(status), "%d window%s", tsessions[i].windows,
+                     tsessions[i].windows == 1 ? "" : "s");
+            if (ui_list_row(c, tsessions[i].name, status, IC_MUX, false) == 1) {
+                char name[DC_MUX_NAME_MAX];
+                copy_trunc(name, sizeof(name), tsessions[i].name);
+                char cmd[DC_MUX_CMD_MAX];
+                snprintf(cmd, sizeof(cmd), "tmux attach -t '%s'", name);
+                mux_launch_terminal(cmd);
+            }
+        }
+    }
+
+    ui_section(c, "ZELLIJ");
+    mux_session zsessions[DC_MUX_MAX];
+    int zn = mux_zellij_list(zsessions, DC_MUX_MAX);
+    if (zn == 0) {
+        bool installed = system("command -v zellij >/dev/null 2>&1") == 0;
+        ui_hint(c, installed ? "No zellij sessions running" : "zellij not installed");
+    } else {
+        for (int i = 0; i < zn; i++) {
+            if (ui_list_row(c, zsessions[i].name, NULL, IC_MUX, false) == 1) {
+                char name[DC_MUX_NAME_MAX];
+                copy_trunc(name, sizeof(name), zsessions[i].name);
+                char cmd[DC_MUX_CMD_MAX];
+                snprintf(cmd, sizeof(cmd), "zellij attach '%s'", name);
+                mux_launch_terminal(cmd);
+            }
+        }
+    }
+    ui_hint(c, "Read-only list; click a session to attach in a new terminal.");
+}
+
+/* docs/14-COMPLETION-PLAN.md W5.2: Arch's `checkupdates` (pacman-contrib) --
+ * a read-only sync-db-then-compare check that never touches the real pacman
+ * DB or installs anything. Explicitly NOT run automatically or on every
+ * render (it syncs a temp package DB over the network, which would be both
+ * slow -- blocking dankc's single-threaded event loop -- and rude to do
+ * unprompted): only a detached background run kicked off by the "Check for
+ * updates" button, polled via a small cache file so the render loop never
+ * blocks on it. */
+#define DC_UPDATES_CACHE "/tmp/dankc-checkupdates.out"
+
+static bool updates_backend_available(void)
+{
+    return system("command -v checkupdates >/dev/null 2>&1") == 0;
+}
+
+static void updates_check_now(void)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+             "{ checkupdates 2>/dev/null || true; } >" DC_UPDATES_CACHE ".tmp 2>/dev/null && "
+             "mv " DC_UPDATES_CACHE ".tmp " DC_UPDATES_CACHE);
+    run_detached(cmd);
+}
+
+/* Reads the last completed check's line count + the cache file's mtime (as
+ * "last checked"). Returns false if no check has completed yet. */
+static bool updates_read_cache(int *count, time_t *mtime)
+{
+    struct stat st;
+    if (stat(DC_UPDATES_CACHE, &st) != 0)
+        return false;
+    *mtime = st.st_mtime;
+    FILE *f = fopen(DC_UPDATES_CACHE, "r");
+    if (!f)
+        return false;
+    int n = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f))
+        if (line[0] != '\n')
+            n++;
+    fclose(f);
+    *count = n;
+    return true;
+}
+
+static void tab_system_updater(uictx *c)
+{
+    ui_section(c, "PACKAGE UPDATES (ARCH)");
+    if (!updates_backend_available()) {
+        ui_hint(c, "checkupdates not found (pacman-contrib package) -- Arch-only");
+        return;
+    }
+
+    int count = 0;
+    time_t mtime = 0;
+    if (updates_read_cache(&count, &mtime)) {
+        char cv[16];
+        snprintf(cv, sizeof(cv), "%d", count);
+        ui_value(c, "Updates available", cv);
+        char when[64];
+        struct tm tm;
+        localtime_r(&mtime, &tm);
+        strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &tm);
+        ui_value(c, "Last checked", when);
+    } else {
+        ui_hint(c, "Not checked yet this session");
+    }
+
+    if (ui_list_row(c, "Check for updates", NULL, IC_SYSTEM_UPDATER, false) == 1)
+        updates_check_now();
+
+    ui_hint(c, "Runs `checkupdates` (syncs a temp package DB, read-only) --");
+    ui_hint(c, "never installs or upgrades anything automatically.");
+}
+
+/* docs/14-COMPLETION-PLAN.md W5.3: CUPS printer list via `lpstat -p`,
+ * read-only (low priority per the task -- no printer-management UI, just
+ * visibility). Each line looks like "printer <name> is idle.  enabled ..."
+ * or "printer <name> disabled since ...". */
+#define DC_PRINTER_MAX 8
+
+typedef struct {
+    char name[64];
+    char status[96];
+} printer_entry;
+
+static int printers_read(printer_entry *out, int max)
+{
+    int n = 0;
+    FILE *pipe = popen("lpstat -p 2>/dev/null", "r");
+    if (!pipe)
+        return 0;
+    char line[256];
+    while (n < max && fgets(line, sizeof(line), pipe)) {
+        if (strncmp(line, "printer ", 8) != 0)
+            continue;
+        char *name = line + 8;
+        char *sp = strchr(name, ' ');
+        if (!sp)
+            continue;
+        size_t nlen = (size_t)(sp - name);
+        if (nlen >= sizeof(out[n].name))
+            nlen = sizeof(out[n].name) - 1;
+        memcpy(out[n].name, name, nlen);
+        out[n].name[nlen] = '\0';
+
+        char *rest = sp + 1;
+        size_t rl = strlen(rest);
+        while (rl > 0 && (rest[rl - 1] == '\n' || rest[rl - 1] == '\r'))
+            rest[--rl] = '\0';
+        copy_trunc(out[n].status, sizeof(out[n].status), rest);
+        n++;
+    }
+    pclose(pipe);
+    return n;
+}
+
+static void tab_printer(uictx *c)
+{
+    ui_section(c, "PRINTERS");
+    printer_entry printers[DC_PRINTER_MAX];
+    int n = printers_read(printers, DC_PRINTER_MAX);
+    if (n == 0) {
+        ui_hint(c, "No printers configured (CUPS `lpstat -p` returned nothing)");
+    } else {
+        for (int i = 0; i < n; i++)
+            ui_list_row(c, printers[i].name, printers[i].status, 0, false);
+    }
+    ui_hint(c, "Read-only -- manage printers via system-config-printer or");
+    ui_hint(c, "the CUPS web UI (http://localhost:631).");
+}
+
+/* docs/14-COMPLETION-PLAN.md W5.4: current-user info, read-only (lowest
+ * priority in the whole plan -- mostly irrelevant on a single-user desktop,
+ * per the task). No user-switching UI: dankc has no greeter/multi-seat
+ * story (see docs/14's "Deliberately out of scope" > Greeter). */
+static void tab_users(uictx *c)
+{
+    ui_section(c, "CURRENT USER");
+    struct passwd *pw = getpwuid(getuid());
+    ui_value(c, "Username", pw && pw->pw_name ? pw->pw_name : "(unknown)");
+    char uidbuf[16];
+    snprintf(uidbuf, sizeof(uidbuf), "%d", (int)getuid());
+    ui_value(c, "UID", uidbuf);
+    ui_value(c, "Home directory", pw && pw->pw_dir ? pw->pw_dir : "(unknown)");
+    ui_value(c, "Shell", pw && pw->pw_shell ? pw->pw_shell : "(unknown)");
+    char hostname[256] = "(unknown)";
+    gethostname(hostname, sizeof(hostname) - 1);
+    ui_value(c, "Hostname", hostname);
+    ui_hint(c, "Single-user desktop -- read-only; dankc has no user-switching");
+    ui_hint(c, "or account-management UI (see a real DE's Settings for that).");
+}
+
 static void tab_about(uictx *c)
 {
     if (c->mode == UI_RENDER) {
@@ -2017,6 +3082,24 @@ static void build_tab(uictx *c)
     case TAB_POWER:
         tab_power(c);
         break;
+    case TAB_LOCKSCREEN:
+        tab_lockscreen(c);
+        break;
+    case TAB_WINDOW_RULES:
+        tab_window_rules(c);
+        break;
+    case TAB_MUX:
+        tab_mux(c);
+        break;
+    case TAB_SYSTEM_UPDATER:
+        tab_system_updater(c);
+        break;
+    case TAB_PRINTER:
+        tab_printer(c);
+        break;
+    case TAB_USERS:
+        tab_users(c);
+        break;
     case TAB_ABOUT:
         tab_about(c);
         break;
@@ -2069,6 +3152,10 @@ static void commit_edit(dc_settings *s)
                        s->edit_buf);
             cfg->dock_pinned_n++;
         }
+        break;
+    case 6: /* niri window-rules "add" app-id draft -- not config.json state, see
+             * wr_add_rule() (writes ~/.config/niri/dankc-rules.kdl instead) */
+        copy_trunc(s->wr_new_app_id, sizeof(s->wr_new_app_id), s->edit_buf);
         break;
     default:
         break;
@@ -2322,6 +3409,7 @@ dc_settings *dc_settings_create(dc_wayland *wl, dc_egl *egl, dc_render *render)
     s->logical_width = DC_SET_WIDTH;
     s->logical_height = DC_SET_HEIGHT;
     s->scale120 = DC_SCALE_BASE;
+    s->wr_new_opacity = 1.0f;
     return s;
 }
 

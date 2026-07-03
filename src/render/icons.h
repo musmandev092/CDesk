@@ -193,4 +193,18 @@
 #define DC_ICON_LANGUAGE 0xe894     /* Locale tab */
 #define DC_ICON_COLOR_LENS 0xe3b0   /* Theme & Colors tab */
 
+/* Settings tabs added by docs/14-COMPLETION-PLAN.md W3/W5 (Lock Screen,
+ * niri Window Rules editor, Multiplexer, System Updater, Printer). Values
+ * verified against this repo's own vendored assets/fonts/MaterialSymbolsRounded.ttf
+ * cmap via fontTools (not just DMS's .codepoints file -- past entries in this
+ * header show the two can disagree). NOTE: "system_update" itself has no
+ * cmap entry in this vendored font revision; DC_ICON_UPDATE below uses the
+ * "update" glyph instead, confirmed present. Lock Screen tab reuses the
+ * existing DC_ICON_LOCK above; Users tab reuses the existing DC_ICON_PERSON
+ * above -- neither needs a new entry here. */
+#define DC_ICON_SELECT_WINDOW 0xe6fa /* niri Window Rules tab */
+#define DC_ICON_TERMINAL 0xeb8e      /* Multiplexer tab */
+#define DC_ICON_UPDATE 0xe923        /* System Updater tab */
+#define DC_ICON_PRINT 0xe8ad         /* Printer tab */
+
 #endif /* DC_RENDER_ICONS_H */
