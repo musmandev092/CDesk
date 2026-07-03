@@ -435,7 +435,24 @@ static void draw_ring(dc_render *r, float cx, float cy, float radius, float valu
 
     nvgFontFaceId(vg, r->font_ui);
     nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
-    nvgFontSize(vg, 13.0f);
+    /* Auto-shrink the label to fit inside the ring: at a fixed 13px it's
+     * fine for a short "3%" (CPU) but a memory value like "3.6 GB" measures
+     * wider than the ring's own diameter and overflows past the track/arc
+     * stroke on both sides (reproduced live: the "B" in "3.6 GB" rendered
+     * outside the circle). Step the font size down until it fits the
+     * available chord width, floor at 9px (still legible; a value that
+     * doesn't fit even there is an extreme edge case not worth clipping
+     * further for). */
+    float max_label_w = 2.0f * radius - thickness * 2.0f - 4.0f;
+    float label_size = 13.0f;
+    nvgFontSize(vg, label_size);
+    float b[4];
+    nvgTextBounds(vg, 0.0f, 0.0f, label, NULL, b);
+    while (b[2] - b[0] > max_label_w && label_size > 9.0f) {
+        label_size -= 1.0f;
+        nvgFontSize(vg, label_size);
+        nvgTextBounds(vg, 0.0f, 0.0f, label, NULL, b);
+    }
     nvgFillColor(vg, tc(t->surface_text));
     nvgText(vg, cx, ly, label, NULL);
 
