@@ -25,9 +25,19 @@ static const char *const FONT_CANDIDATES[] = {
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
 };
 
+/* docs/POLISH.md P7 item 3: the vendored variable font is 14.5MB, but dankc
+ * only ever draws a fixed, small set of codepoints (render/icons.h's
+ * DC_ICON_* — see scripts/subset-fonts.sh). A pyftsubset'd copy covering
+ * exactly those codepoints is ~248KB and renders identically (same default
+ * variable-font instance; no axis coordinates are set anywhere in this
+ * file). The subset is preferred; the full font is kept in the repo only as
+ * the regeneration source (scripts/subset-fonts.sh reads it) and as a
+ * last-resort dev fallback if the subset is ever missing — it is NOT
+ * installed (see meson.build), so packaged installs only ship the subset. */
 static const char *const ICON_FONT_CANDIDATES[] = {
+    "assets/fonts/MaterialSymbolsRounded.subset.ttf",
+    "/usr/share/dankc/fonts/MaterialSymbolsRounded.subset.ttf",
     "assets/fonts/MaterialSymbolsRounded.ttf",
-    "/usr/share/dankc/fonts/MaterialSymbolsRounded.ttf",
 };
 
 /* --- TTF/OTF cmap coverage (docs/12-BAR-SPEC.md: no-tofu for non-Latin text)
