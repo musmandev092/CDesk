@@ -132,7 +132,7 @@ src = files(
   'src/services/display.c',
   'src/services/autostart.c',
   'src/services/sound.c', 'src/services/polkit.c',
-  'src/services/nightlight.c',
+  'src/services/nightlight.c', 'src/services/firewall.c',
   'src/niri/niri.c',
   'src/theme/theme.c',
   'src/ipc/control.c',
