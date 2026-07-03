@@ -893,6 +893,26 @@ static void polkit_demo_cancel(void *user_data)
     dc_polkit_modal_hide(m);
 }
 
+/* docs/16-PERF2-PLAN.md T1.3: dc_autostart_run() (scan + detached spawn of
+ * XDG autostart entries) has zero dependency on the bar and used to run
+ * synchronously before bar creation, delaying first paint by 5-25ms for no
+ * benefit. It's now armed as a one-shot timerfd (see main()) that fires from
+ * inside dc_loop_run(), comfortably after the first layer-surface configure
+ * + first render have already gone out. Fires once, then unregisters and
+ * closes itself -- if the read() is ever short/fails (spurious wakeup), we
+ * still run autostart and still clean up the fd rather than leaking a live
+ * timerfd in the loop forever. */
+static void autostart_timer_cb(int fd, uint32_t revents, void *user_data)
+{
+    DC_UNUSED(revents);
+    DC_UNUSED(user_data);
+    uint64_t expirations;
+    (void)read(fd, &expirations, sizeof(expirations));
+    dc_autostart_run();
+    dc_loop_remove_fd(g_loop, fd);
+    close(fd);
+}
+
 int main(int argc, char **argv)
 {
     /* Client modes exit immediately without starting the shell. */
@@ -927,11 +947,11 @@ int main(int argc, char **argv)
     dc_notifications *notifications = dc_notifications_create(dbus);
     dc_tray *tray = dc_tray_create(dbus);
 
-    /* XDG session autostart (docs/14-COMPLETION-PLAN.md W1.2): one-shot scan
-     * + detached spawn of ~/.config/autostart + /etc/xdg/autostart entries.
-     * Runs exactly once here, after Wayland + niri IPC are up, never from a
-     * render/tick path. */
-    dc_autostart_run();
+    /* XDG session autostart (docs/14-COMPLETION-PLAN.md W1.2): scan +
+     * detached spawn of ~/.config/autostart + /etc/xdg/autostart entries.
+     * docs/16-PERF2-PLAN.md T1.3: no longer run inline here -- see the
+     * one-shot timerfd armed near the other loop integrations below, and
+     * autostart_timer_cb() above. */
 
     /* Bar weather widget (docs/12-BAR-SPEC.md sec.4): only arm the fetch loop
      * when enabled — dc_weather_get() just reports "no reading yet" (widget
@@ -1003,6 +1023,23 @@ int main(int argc, char **argv)
     dc_dbus_integrate(dbus, g_loop);
     dc_osd_integrate(osd, g_loop);
     dc_loop_set_tick(g_loop, clock_tick, &tick, 1000);
+
+    /* docs/16-PERF2-PLAN.md T1.3: arm the deferred-autostart timer. It starts
+     * counting immediately but only fires from inside dc_loop_run() below --
+     * by then the first layer-surface configure + first dc_bar_render() have
+     * long since gone out (measured at ~3-4ms for the configure alone); 50ms
+     * is a comfortable safety margin, not a tuned minimum. Falls back to a
+     * synchronous run if the timerfd can't be created (better than silently
+     * never running autostart). */
+    int autostart_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (autostart_timer_fd >= 0) {
+        struct itimerspec autostart_spec = {.it_value = {.tv_nsec = 50000000L}};
+        timerfd_settime(autostart_timer_fd, 0, &autostart_spec, NULL);
+        dc_loop_add_fd(g_loop, autostart_timer_fd, POLLIN, autostart_timer_cb, NULL);
+    } else {
+        dc_warn("autostart timer create failed; running autostart synchronously");
+        dc_autostart_run();
+    }
 
     dc_clipboard *clipboard = dc_clipboard_create(wl, g_loop);
     dc_clip_picker *clip_picker = dc_clip_picker_create(wl, &egl, &render, clipboard);
