@@ -208,12 +208,30 @@ static bool ui_click_in(uictx *c, float x, float y, float w, float h)
            c->cy <= y + h;
 }
 
+/* Font-scale (docs/14-COMPLETION-PLAN.md W2.4, Typography & Motion tab's
+ * config.h font_scale key): applied to every text size drawn by the shared
+ * ui_*() widget helpers below (and tab_about()'s own text) so the slider has
+ * a genuine, visible live-apply effect on Settings' own content -- see
+ * config.h's font_scale comment for why this doesn't (yet) propagate to the
+ * bar/other panels (hundreds of direct nvgFontSize() call sites elsewhere;
+ * out of scope here per the task's own escape hatch for this item).
+ * Clamped defensively; the config loader already clamps 0.8..1.5. */
+static inline float ui_fs(const uictx *c, float base)
+{
+    float scale = c->cfg ? c->cfg->font_scale : 1.0f;
+    if (scale < 0.5f)
+        scale = 0.5f;
+    if (scale > 2.0f)
+        scale = 2.0f;
+    return base * scale;
+}
+
 static void ui_section(uictx *c, const char *label)
 {
     c->y += 18.0f;
     if (c->mode == UI_RENDER) {
         nvgFontFaceId(c->vg, c->s->render->font_ui);
-        nvgFontSize(c->vg, 12.0f);
+        nvgFontSize(c->vg, ui_fs(c, 12.0f));
         nvgTextAlign(c->vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(c->vg, tc(c->t->primary));
         nvgText(c->vg, 0, c->y + 6.0f, label, NULL);
@@ -249,12 +267,12 @@ static bool ui_toggle(uictx *c, const char *label, const char *desc, bool value)
     if (c->mode == UI_RENDER) {
         NVGcontext *vg = c->vg;
         nvgFontFaceId(vg, c->s->render->font_ui);
-        nvgFontSize(vg, 14.0f);
+        nvgFontSize(vg, ui_fs(c, 14.0f));
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(c->t->surface_text));
         nvgText(vg, 0, c->y + (desc ? 18.0f : rh / 2.0f), label, NULL);
         if (desc) {
-            nvgFontSize(vg, 12.0f);
+            nvgFontSize(vg, ui_fs(c, 12.0f));
             nvgFillColor(vg, tc(c->t->surface_variant_text));
             nvgText(vg, 0, c->y + 38.0f, desc, NULL);
         }
@@ -282,7 +300,7 @@ static bool ui_slider(uictx *c, const char *label, float *value, float lo, float
     if (c->mode == UI_RENDER) {
         NVGcontext *vg = c->vg;
         nvgFontFaceId(vg, c->s->render->font_ui);
-        nvgFontSize(vg, 14.0f);
+        nvgFontSize(vg, ui_fs(c, 14.0f));
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(c->t->surface_text));
         nvgText(vg, 0, c->y + 14.0f, label, NULL);
@@ -330,7 +348,7 @@ static bool ui_stepper(uictx *c, const char *label, int *value, int lo, int hi, 
     if (c->mode == UI_RENDER) {
         NVGcontext *vg = c->vg;
         nvgFontFaceId(vg, c->s->render->font_ui);
-        nvgFontSize(vg, 14.0f);
+        nvgFontSize(vg, ui_fs(c, 14.0f));
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(c->t->surface_text));
         nvgText(vg, 0, cy, label, NULL);
@@ -347,7 +365,7 @@ static bool ui_stepper(uictx *c, const char *label, int *value, int lo, int hi, 
         char buf[16];
         snprintf(buf, sizeof(buf), "%d", *value);
         nvgFontFaceId(vg, c->s->render->font_ui);
-        nvgFontSize(vg, 14.0f);
+        nvgFontSize(vg, ui_fs(c, 14.0f));
         nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(c->t->surface_text));
         nvgText(vg, (minus_x + bw + plus_x) / 2.0f, cy, buf, NULL);
@@ -382,7 +400,7 @@ static int ui_segmented(uictx *c, const char *label, const char *const *opts, in
     if (c->mode == UI_RENDER) {
         NVGcontext *vg = c->vg;
         nvgFontFaceId(vg, c->s->render->font_ui);
-        nvgFontSize(vg, 14.0f);
+        nvgFontSize(vg, ui_fs(c, 14.0f));
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(c->t->surface_text));
         nvgText(vg, 0, c->y + 8.0f, label, NULL);
@@ -393,7 +411,7 @@ static int ui_segmented(uictx *c, const char *label, const char *const *opts, in
             nvgRoundedRect(vg, bx, btn_y, bw, bh, 12.0f);
             nvgFillColor(vg, sel ? tc(c->t->primary) : tc(c->t->surface_container_highest));
             nvgFill(vg);
-            nvgFontSize(vg, 14.0f);
+            nvgFontSize(vg, ui_fs(c, 14.0f));
             nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
             nvgFillColor(vg, sel ? tc(c->t->primary_text) : tc(c->t->surface_text));
             nvgText(vg, bx + bw / 2.0f, btn_y + bh / 2.0f, opts[i], NULL);
@@ -425,7 +443,7 @@ static bool ui_textfield(uictx *c, const char *label, const char *text, bool foc
     if (c->mode == UI_RENDER) {
         NVGcontext *vg = c->vg;
         nvgFontFaceId(vg, c->s->render->font_ui);
-        nvgFontSize(vg, 14.0f);
+        nvgFontSize(vg, ui_fs(c, 14.0f));
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(c->t->surface_variant_text));
         nvgText(vg, 0, c->y + 8.0f, label, NULL);
@@ -438,7 +456,7 @@ static bool ui_textfield(uictx *c, const char *label, const char *text, bool foc
         nvgStroke(vg);
         nvgSave(vg);
         nvgScissor(vg, 0, box_y, c->w, bh);
-        nvgFontSize(vg, 14.0f);
+        nvgFontSize(vg, ui_fs(c, 14.0f));
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(c->t->surface_text));
         nvgText(vg, 12.0f, box_y + bh / 2.0f, text && text[0] ? text : " ", NULL);
@@ -464,7 +482,7 @@ static void ui_hint(uictx *c, const char *text)
     if (c->mode == UI_RENDER) {
         NVGcontext *vg = c->vg;
         nvgFontFaceId(vg, c->s->render->font_ui);
-        nvgFontSize(vg, 12.0f);
+        nvgFontSize(vg, ui_fs(c, 12.0f));
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc_a(c->t->surface_variant_text, 170));
         nvgText(vg, 0, c->y + 8.0f, text, NULL);
@@ -478,7 +496,7 @@ static void ui_value(uictx *c, const char *label, const char *value)
     if (c->mode == UI_RENDER) {
         NVGcontext *vg = c->vg;
         nvgFontFaceId(vg, c->s->render->font_ui);
-        nvgFontSize(vg, 14.0f);
+        nvgFontSize(vg, ui_fs(c, 14.0f));
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(c->t->surface_text));
         nvgText(vg, 0, c->y + 20.0f, label, NULL);
@@ -506,7 +524,7 @@ static int ui_list_row(uictx *c, const char *title, const char *status, int trai
         nvgFillColor(vg, active ? tc_a(c->t->primary, 46) : tc(c->t->surface_container_highest));
         nvgFill(vg);
         nvgFontFaceId(vg, c->s->render->font_ui);
-        nvgFontSize(vg, 14.0f);
+        nvgFontSize(vg, ui_fs(c, 14.0f));
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, active ? tc(c->t->primary) : tc(c->t->surface_text));
         nvgSave(vg);
@@ -514,7 +532,7 @@ static int ui_list_row(uictx *c, const char *title, const char *status, int trai
         nvgText(vg, 12.0f, c->y + rh / 2.0f, title, NULL);
         nvgRestore(vg);
         if (status) {
-            nvgFontSize(vg, 12.0f);
+            nvgFontSize(vg, ui_fs(c, 12.0f));
             nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
             nvgFillColor(vg, tc(c->t->surface_variant_text));
             nvgText(vg, row_w - 12.0f, c->y + rh / 2.0f, status, NULL);
@@ -1462,11 +1480,11 @@ static void tab_about(uictx *c)
     if (c->mode == UI_RENDER) {
         NVGcontext *vg = c->vg;
         nvgFontFaceId(vg, c->s->render->font_ui);
-        nvgFontSize(vg, 20.0f);
+        nvgFontSize(vg, ui_fs(c, 20.0f));
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_TOP);
         nvgFillColor(vg, tc(c->t->surface_text));
         nvgText(vg, 0, c->y + 8.0f, "DankC", NULL);
-        nvgFontSize(vg, 14.0f);
+        nvgFontSize(vg, ui_fs(c, 14.0f));
         nvgFillColor(vg, tc(c->t->surface_variant_text));
         nvgText(vg, 0, c->y + 44.0f, "Version " DC_VERSION, NULL);
         nvgText(vg, 0, c->y + 66.0f,
@@ -1483,7 +1501,7 @@ static void tab_about(uictx *c)
             snprintf(buf, sizeof(buf), "%.1f MB", rss / 1024.0);
         else
             snprintf(buf, sizeof(buf), "unavailable");
-        nvgFontSize(vg, 14.0f);
+        nvgFontSize(vg, ui_fs(c, 14.0f));
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(c->t->surface_text));
         nvgText(vg, 0, c->y + 14.0f, "Memory usage (RSS)", NULL);
@@ -1501,7 +1519,7 @@ static void tab_about(uictx *c)
             dc_render_icon(c->s->render, IC_LINK, 8.0f, c->y + 16.0f, 18.0f, c->t->primary,
                            NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
             nvgFontFaceId(c->vg, c->s->render->font_ui);
-            nvgFontSize(c->vg, 14.0f);
+            nvgFontSize(c->vg, ui_fs(c, 14.0f));
             nvgTextAlign(c->vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
             nvgFillColor(c->vg, tc(c->t->primary));
             nvgText(c->vg, 28.0f, c->y + 16.0f, links[i], NULL);
