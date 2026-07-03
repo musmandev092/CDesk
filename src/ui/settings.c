@@ -3462,60 +3462,60 @@ static void tab_system_updater(uictx *c)
     ui_hint(c, "never installs or upgrades anything automatically.");
 }
 
-/* docs/14-COMPLETION-PLAN.md W5.3: CUPS printer list via `lpstat -p`,
- * read-only (low priority per the task -- no printer-management UI, just
- * visibility). Each line looks like "printer <name> is idle.  enabled ..."
- * or "printer <name> disabled since ...". */
-#define DC_PRINTER_MAX 8
-
-typedef struct {
-    char name[64];
-    char status[96];
-} printer_entry;
-
-static int printers_read(printer_entry *out, int max)
-{
-    int n = 0;
-    FILE *pipe = popen("lpstat -p 2>/dev/null", "r");
-    if (!pipe)
-        return 0;
-    char line[256];
-    while (n < max && fgets(line, sizeof(line), pipe)) {
-        if (strncmp(line, "printer ", 8) != 0)
-            continue;
-        char *name = line + 8;
-        char *sp = strchr(name, ' ');
-        if (!sp)
-            continue;
-        size_t nlen = (size_t)(sp - name);
-        if (nlen >= sizeof(out[n].name))
-            nlen = sizeof(out[n].name) - 1;
-        memcpy(out[n].name, name, nlen);
-        out[n].name[nlen] = '\0';
-
-        char *rest = sp + 1;
-        size_t rl = strlen(rest);
-        while (rl > 0 && (rest[rl - 1] == '\n' || rest[rl - 1] == '\r'))
-            rest[--rl] = '\0';
-        copy_trunc(out[n].status, sizeof(out[n].status), rest);
-        n++;
-    }
-    pclose(pipe);
-    return n;
-}
-
+/* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.6: CUPS printers, now backed by
+ * services/printers.h (dc_printers_list()/set_default()/test_page()/jobs())
+ * instead of this tab's own inline `lpstat -p` popen() parser -- both writes
+ * are per-user, no root (see printers.h's file header). Adding/removing
+ * queues (`lpadmin`) is still out of scope -- punt to system-config-printer
+ * or the CUPS web UI, same as before. */
 static void tab_printer(uictx *c)
 {
     ui_section(c, "PRINTERS");
-    printer_entry printers[DC_PRINTER_MAX];
-    int n = printers_read(printers, DC_PRINTER_MAX);
-    if (n == 0) {
-        ui_hint(c, "No printers configured (CUPS `lpstat -p` returned nothing)");
-    } else {
-        for (int i = 0; i < n; i++)
-            ui_list_row(c, printers[i].name, printers[i].status, 0, false);
+    if (!dc_printers_available()) {
+        ui_hint(c, "CUPS not running (no `lpstat` on PATH, or no daemon).");
+        ui_hint(c, "Install/start cups, or manage printers via");
+        ui_hint(c, "system-config-printer / http://localhost:631.");
+        return;
     }
-    ui_hint(c, "Read-only -- manage printers via system-config-printer or");
+
+    dc_printer_info printers[DC_PRINTERS_MAX];
+    int n = dc_printers_list(printers);
+    if (n == 0) {
+        ui_hint(c, "No printers configured (CUPS has no queues set up).");
+    } else {
+        for (int i = 0; i < n; i++) {
+            const dc_printer_info *p = &printers[i];
+            char status[DC_PRINTER_TEXT_MAX + 16];
+            snprintf(status, sizeof(status), "%s%s", p->is_default ? "Default \xe2\x80\xa2 " : "",
+                    dc_printer_state_name(p->state));
+            ui_list_row(c, p->name, status, 0, p->is_default);
+            if (p->description[0] || p->location[0]) {
+                char meta[2 * DC_PRINTER_TEXT_MAX];
+                snprintf(meta, sizeof(meta), "%s%s%s", p->description,
+                        (p->description[0] && p->location[0]) ? " -- " : "", p->location);
+                ui_hint(c, meta);
+            }
+            if (!p->is_default && ui_list_row(c, "Set as default", NULL, IC_DONE, false) == 1)
+                dc_printers_set_default(p->name);
+            if (ui_list_row(c, "Print test page", NULL, IC_PRINTER, false) == 1)
+                dc_printers_test_page(p->name);
+        }
+    }
+
+    ui_section(c, "JOB QUEUE");
+    dc_printer_job jobs[DC_PRINTER_JOBS_MAX];
+    int jn = dc_printers_jobs(NULL, jobs);
+    if (jn == 0) {
+        ui_hint(c, "No active jobs");
+    } else {
+        for (int i = 0; i < jn; i++) {
+            char val[64 + DC_PRINTER_TEXT_MAX];
+            snprintf(val, sizeof(val), "%s -- %s", jobs[i].user, jobs[i].info);
+            ui_value(c, jobs[i].id, val);
+        }
+    }
+
+    ui_hint(c, "Adding/removing queues needs system-config-printer or");
     ui_hint(c, "the CUPS web UI (http://localhost:631).");
 }
 
