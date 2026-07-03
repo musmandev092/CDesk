@@ -116,4 +116,61 @@ dc_net_connect_state dc_net_wifi_connect_poll(char *err, size_t err_sz);
  * password prompt. */
 void dc_net_wifi_connect_reset(void);
 
+/* --- Ethernet (wired) -----------------------------------------------------
+ * docs/18-WIFI-BT-PLAN.md sec.2.1 -- native NetworkManager D-Bus, no nmcli.
+ * dc_net_init() resolves the first NM_DEVICE_TYPE_ETHERNET device (if any)
+ * the same way it resolves the Wi-Fi device, and subscribes to its
+ * PropertiesChanged (device object) plus its current Ip4Config object's
+ * PropertiesChanged (re-subscribed whenever Device.Ip4Config points at a new
+ * object, which NM does on every reconfigure) -- event-driven, zero forks. */
+typedef enum {
+    DC_NET_ETH_UNAVAILABLE = 0, /* device missing/unmanaged, or NM reports UNAVAILABLE with a
+                                 * cable present (rfkilled, no driver, etc.) */
+    DC_NET_ETH_NO_CABLE,        /* device present but Wired.Carrier == false (unplugged) */
+    DC_NET_ETH_DISCONNECTED,    /* cable present, no active connection */
+    DC_NET_ETH_CONNECTING,      /* activating (NM_DEVICE_STATE_PREPARE..SECONDARIES) */
+    DC_NET_ETH_CONNECTED,       /* NM_DEVICE_STATE_ACTIVATED, IP configured */
+} dc_net_eth_state;
+
+typedef struct dc_net_eth_info {
+    bool has_device; /* an ethernet Device exists on this system at all */
+    dc_net_eth_state state;
+
+    char device_name[32];     /* Device.Interface, e.g. "enp0s31f6" */
+    char connection_name[64]; /* active connection's Id; empty if none active */
+    char mac[32];              /* Wired.HwAddress (falls back to Device.HwAddress) */
+    unsigned link_speed_mbps;  /* Wired.Speed; 0 if link is down/unknown */
+
+    /* IPv4, from the active Device.Ip4Config object. All empty/zero if not
+     * connected. Only the first address/gateway is surfaced (multi-address
+     * setups are rare enough not to need a full list here). */
+    char ipv4_address[64];
+    unsigned ipv4_prefix;
+    char ipv4_gateway[64];
+#define DC_NET_ETH_DNS_MAX 3
+    char ipv4_dns[DC_NET_ETH_DNS_MAX][64];
+    int ipv4_dns_count;
+} dc_net_eth_info;
+
+/* Refresh (from the live D-Bus cache maintained by dc_net_init()'s
+ * subscriptions -- no I/O on this call) and copy the current wired-device
+ * state into `out`. Returns `out->has_device`. Safe to call every frame. */
+bool dc_net_ethernet(dc_net_eth_info *out);
+
+/* Activate the wired device: NetworkManager.ActivateConnection() with the
+ * device's first NM-reported AvailableConnections entry if one exists, else
+ * "/" (let NM pick/auto-create a profile for the device). Fire-and-forget,
+ * same contract as dc_net_wifi_connect(). No-op if there is no ethernet
+ * device. Gated by DANKC_NET_DRYRUN (see the header comment above
+ * dc_net_hotspot_start() for the shared dry-run convention) -- logs the exact
+ * ActivateConnection args instead of calling. */
+void dc_net_eth_connect(void);
+
+/* Deactivate the wired device's current active connection
+ * (NetworkManager.DeactivateConnection() on Device.ActiveConnection).
+ * No-op if the device has no active connection. Same DANKC_NET_DRYRUN gate
+ * as dc_net_eth_connect(). */
+void dc_net_eth_disconnect(void);
+
+
 #endif /* DC_SERVICES_NET_H */
