@@ -24,7 +24,32 @@ INCLUDES := -Isrc -Iprotocol/generated -Ithird_party/nanovg -Ithird_party/nanosv
 BASE_CFLAGS := -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE $(INCLUDES) $(FRIBIDI_CFLAGS) \
 	$(shell $(PKG_CONFIG) --cflags $(PKGS))
 
-CFLAGS   ?= -O2 -g
+# RELEASE=1 selects the shipped/packaged optimization profile: no -g (smaller,
+# no debug bloat), -DNDEBUG (strips assert() overhead in vendored nanovg/
+# nanosvg/cJSON — first-party code has no asserts but third_party does),
+# -fno-plt (skip the PLT indirection on every D-Bus/GL call site) and
+# -fvisibility=hidden (smaller symbol table, lets the compiler devirtualize/
+# inline more aggressively across TUs since it can prove nothing outside the
+# binary references a given symbol — safe here, dankc is an executable, not a
+# shared library, so nothing needs those symbols exported).
+#
+# -flto=auto is on in BOTH profiles (dev and release): it lets gcc inline
+# across translation units at link time, which matters on the hot
+# text-shaping (render/shape.c) and nanovg-tessellation call paths that cross
+# .c file boundaries. -flto must be passed at both compile *and* link time,
+# or the compiler silently falls back to non-LTO codegen.
+#
+# Dev and release builds are NOT flag-compatible at the object-file level
+# (LTO bytecode + -DNDEBUG differ) — always `make clean` before switching
+# profiles (the `release` target below does this for you).
+RELEASE ?= 0
+ifeq ($(RELEASE),1)
+OPT_FLAGS := -O2 -flto=auto -DNDEBUG -fno-plt -fvisibility=hidden
+else
+OPT_FLAGS := -O2 -g -flto=auto
+endif
+
+CFLAGS   ?= $(OPT_FLAGS)
 # -MMD -MP: emit .d dependency files so header edits rebuild every affected
 # object. Without this, a struct change in a header leaves stale .o files with
 # the OLD field offsets silently linked together (caused real cross-module
@@ -32,15 +57,21 @@ CFLAGS   ?= -O2 -g
 CFLAGS   += $(BASE_CFLAGS) $(WARNINGS) -MMD -MP
 
 # C++ is used for exactly one module (theme/dynamic.cpp, Material colour math).
-CXXFLAGS ?= -O2 -g
+CXXFLAGS ?= $(OPT_FLAGS)
 CXXFLAGS += -std=c++17 $(INCLUDES) $(shell $(PKG_CONFIG) --cflags $(PKGS)) -Wall -Wextra \
 	-Wno-unused-parameter -MMD -MP
 
 # Vendored third-party code (nanovg, cJSON): compile with warnings suppressed so
-# our own -Wextra output stays meaningful.
-TP_CFLAGS := -O2 -g $(BASE_CFLAGS) -w
+# our own -Wextra output stays meaningful. Same optimization profile so its
+# objects stay LTO-compatible with the rest of the binary.
+TP_CFLAGS := $(OPT_FLAGS) $(BASE_CFLAGS) -w
 
 LDLIBS   += $(shell $(PKG_CONFIG) --libs $(PKGS)) -lm
+# LTO needs -flto at link time too (it's where the actual cross-TU
+# optimization/codegen happens); -O2/-DNDEBUG/-fno-plt/-fvisibility on the
+# link line are harmless no-ops for the linker but keep the link driver
+# invocation consistent with how the objects were compiled.
+LDFLAGS  ?= $(OPT_FLAGS)
 
 PROTO_XML := $(wildcard protocol/*.xml)
 PROTO_H   := $(patsubst protocol/%.xml,protocol/generated/%-client-protocol.h,$(PROTO_XML))
@@ -65,7 +96,7 @@ all: $(BIN)
 # Link with the C++ driver so libstdc++ is pulled in for the one C++ module.
 $(BIN): $(OBJ) $(CXX_OBJ) $(TP_OBJ) $(PROTO_O)
 	@mkdir -p bin
-	$(CXX) -o $@ $^ $(LDLIBS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 # Generated Wayland protocol glue.
 protocol/generated/%-client-protocol.h: protocol/%.xml
@@ -108,4 +139,11 @@ bin/test_calc: tests/test_calc.c src/services/calc.c src/services/calc.h
 test-calc: bin/test_calc
 	./bin/test_calc
 
-.PHONY: all clean test-calc
+# Shipped/packaged build: -O2 -flto -DNDEBUG, no -g (see OPT_FLAGS above).
+# Object files from a dev build aren't LTO/flag-compatible, so always start
+# from clean.
+release:
+	$(MAKE) clean
+	$(MAKE) RELEASE=1 all
+
+.PHONY: all clean test-calc release

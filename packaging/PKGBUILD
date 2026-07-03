@@ -24,7 +24,17 @@ source=()
 sha256sums=()
 
 build() {
-  arch-meson "$srcdir/.." build
+  # Explicit debug=false + b_ndebug=true + optimization=2 (rather than
+  # --buildtype=release, which implies -O3): -O3's more aggressive inlining,
+  # combined with meson.build's project-wide b_lto=true, triggers
+  # false-positive -Wstringop-overflow/-Wstringop-overread warnings (a known
+  # GCC diagnostic issue at higher optimization levels, seen both in vendored
+  # third_party/nanovg's bundled stb_image.h and in src/services/apps.c) that
+  # don't appear at -O2. -O2 matches the Makefile's release profile and is
+  # plenty for this codebase; this combo still drops -g and adds -DNDEBUG on
+  # top of the b_lto=true set in meson.build, so the packaged binary is the
+  # fully optimized, non-debug, LTO'd, warning-clean build.
+  arch-meson "$srcdir/.." build -Doptimization=2 -Ddebug=false -Db_ndebug=true
   meson compile -C build
 }
 
