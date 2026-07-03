@@ -8,6 +8,7 @@
 #include "render/nvg.h"
 #include "services/audio.h"
 #include "services/bluez.h"
+#include "services/mpris.h"
 #include "services/net.h"
 #include "theme/theme.h"
 #include "ui/bar/bar_tokens.h"
@@ -20,6 +21,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <limits.h>
+#include <math.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,7 +67,23 @@ typedef enum {
     CC_HOVER_TILE_1_1,
     CC_HOVER_TILE_2_0,
     CC_HOVER_TILE_2_1,
+    /* Wi-Fi/bluetooth tile expand chevrons (docs/13-POPOUTS-SPEC.md sec.1
+     * item 1/2: expandable network/bluetooth sections). */
+    CC_HOVER_WIFI_CHEVRON,
+    CC_HOVER_BT_CHEVRON,
+    /* Media transport row (shown only while an MPRIS player is active). */
+    CC_HOVER_MEDIA_PREV,
+    CC_HOVER_MEDIA_PLAY,
+    CC_HOVER_MEDIA_NEXT,
+    /* Rows of whichever expand panel (network or bluetooth) is currently
+     * open -- CC_MAX_EXPAND_ROWS consecutive ids starting here, one per
+     * visible row (mutually exclusive with the other panel, so the id alone
+     * plus cc->net_expanded/bt_expanded disambiguates which list a row hit
+     * belongs to). */
+    CC_HOVER_EXPAND_ROW_BASE,
 } cc_hover_id;
+
+#define CC_MAX_EXPAND_ROWS 5
 
 struct dc_control_center {
     dc_wayland *wl;
@@ -109,6 +127,20 @@ struct dc_control_center {
     bool slider_dragging;
     int slider_drag_slot; /* 0 = volume, 1 = brightness */
     float slider_drag_value;
+
+    /* Expandable network/bluetooth sections (docs/13-POPOUTS-SPEC.md sec.1
+     * items 1/2): mutually exclusive (opening one closes the other, so both
+     * never need vertical space at once). The card grows to fit the open
+     * panel's rows -- see cc_get_layout()'s total_h and the resize-on-render
+     * logic in cc_render(). */
+    bool net_expanded;
+    bool bt_expanded;
+
+    /* A secured, not-yet-known SSID was clicked: no inline password entry
+     * (TODO), so that row shows a "Needs Password" hint instead of
+     * connecting until the panel is collapsed or another row is picked. */
+    bool net_hint_active;
+    char net_hint_ssid[64];
 
     bool visible;
     bool configured;
@@ -161,16 +193,46 @@ typedef struct {
     float slot_x[2]; /* volume, brightness */
     float slot_w;
 
+    /* Media transport row (docs/13-POPOUTS-SPEC.md sec.1 item 4), only
+     * present (media_h > 0) while an MPRIS player is active. */
+    bool media_active;
+    float media_y, media_h;
+    float media_art_cx, media_art_cy, media_art_r;
+    float media_text_x, media_text_w;
+    float media_btn_cx[3]; /* prev, play/pause, next */
+    float media_btn_cy, media_btn_r;
+
     float tiles_y0, tile_w, tile_h, gap;
+
+    /* Expand panel (network or bluetooth list), appended below the tile
+     * grid -- 0 = collapsed (expand_h == 0), 1 = network, 2 = bluetooth. */
+    int expand_kind;
+    int expand_rows;
+    float expand_y0, expand_h;
+    float expand_header_y;
+    float expand_row_y0, expand_row_h;
+    float wifi_chevron_cx, wifi_chevron_cy;
+    float bt_chevron_cx, bt_chevron_cy;
+    float chevron_r;
+
+    /* Total content height (pad-to-pad, i.e. the card's own height) --
+     * cc_render() resizes the layer-surface to this when it changes. */
+    float total_h;
 } cc_layout;
 
-static cc_layout cc_get_layout(float w)
+/* `media_active`: an MPRIS player is present (adds the transport row).
+ * `expand_kind`/`expand_rows`: 0/1/2 = none/network/bluetooth and how many
+ * rows that panel is currently showing (0..CC_MAX_EXPAND_ROWS) -- both
+ * gathered once per render/click/motion by cc_gather_state() so every
+ * layout consumer agrees on the card's current size. */
+static cc_layout cc_get_layout(float w, bool media_active, int expand_kind, int expand_rows)
 {
     const float pad = 6.0f;   /* room for the drop shadow */
     const float margin = 16.0f; /* content inset from the card edge (~Theme.spacingL) */
     const float gap = 8.0f;     /* ~Theme.spacingS, used between every stacked row */
 
     cc_layout l;
+    memset(&l, 0, sizeof(l));
     l.ix = pad + margin;
     l.iw = w - 2.0f * l.ix;
 
@@ -193,10 +255,61 @@ static cc_layout cc_get_layout(float w)
     l.slot_x[0] = l.ix;
     l.slot_x[1] = l.ix + l.slot_w + gap;
 
-    l.tiles_y0 = l.sliders_y + l.slider_h + gap;
+    float after_sliders = l.sliders_y + l.slider_h + gap;
+
+    l.media_active = media_active;
+    if (media_active) {
+        l.media_y = after_sliders;
+        l.media_h = 56.0f;
+        l.media_art_r = 20.0f;
+        l.media_art_cx = l.ix + l.media_art_r;
+        l.media_art_cy = l.media_y + l.media_h / 2.0f;
+        l.media_btn_r = 15.0f;
+        l.media_btn_cy = l.media_art_cy;
+        l.media_btn_cx[2] = l.ix + l.iw - l.media_btn_r;               /* next */
+        l.media_btn_cx[1] = l.media_btn_cx[2] - 2.0f * l.media_btn_r - 10.0f; /* play/pause */
+        l.media_btn_cx[0] = l.media_btn_cx[1] - 2.0f * l.media_btn_r - 10.0f; /* prev */
+        l.media_text_x = l.media_art_cx + l.media_art_r + 10.0f;
+        l.media_text_w = (l.media_btn_cx[0] - l.media_btn_r - 8.0f) - l.media_text_x;
+        l.tiles_y0 = l.media_y + l.media_h + gap;
+    } else {
+        l.tiles_y0 = after_sliders;
+    }
+
     l.gap = gap;
     l.tile_w = (l.iw - gap) / 2.0f;
     l.tile_h = 60.0f;
+
+    float tiles_end = l.tiles_y0 + 3.0f * l.tile_h + 2.0f * gap;
+
+    /* Row 0 of the tile grid is wifi (col 0) / bluetooth (col 1) -- matches
+     * cc_tile_x()/cc_tile_y()'s formulas (defined below; inlined here since
+     * this function runs before those are declared). */
+    float tile0_x = l.ix;
+    float tile1_x = l.ix + l.tile_w + gap;
+    float row0_y = l.tiles_y0;
+    l.chevron_r = 11.0f;
+    l.wifi_chevron_cx = tile0_x + l.tile_w - 16.0f;
+    l.wifi_chevron_cy = row0_y + l.tile_h / 2.0f;
+    l.bt_chevron_cx = tile1_x + l.tile_w - 16.0f;
+    l.bt_chevron_cy = row0_y + l.tile_h / 2.0f;
+
+    l.expand_kind = expand_kind;
+    l.expand_rows = expand_rows;
+    if (expand_kind != 0) {
+        int rows = expand_rows > 0 ? expand_rows : 1; /* room for an empty-state line */
+        if (rows > CC_MAX_EXPAND_ROWS)
+            rows = CC_MAX_EXPAND_ROWS;
+        l.expand_y0 = tiles_end + gap;
+        l.expand_header_y = l.expand_y0 + 10.0f;
+        l.expand_row_h = 28.0f;
+        l.expand_row_y0 = l.expand_y0 + 22.0f;
+        l.expand_h = 22.0f + (float)rows * l.expand_row_h + 6.0f;
+        l.total_h = l.expand_y0 + l.expand_h + margin + pad;
+    } else {
+        l.total_h = tiles_end + margin + pad;
+    }
+
     return l;
 }
 
@@ -210,6 +323,20 @@ static float cc_tile_y(const cc_layout *l, int row)
     return l->tiles_y0 + (float)row * (l->tile_h + l->gap);
 }
 
+/* Top y of expand-panel row `i` (0-based, within whichever of net/bt is
+ * currently open) -- shared by draw + hittest + click, same convention as
+ * cc_tile_x()/cc_tile_y(). */
+static float cc_expand_row_y(const cc_layout *l, int i)
+{
+    return l->expand_row_y0 + (float)i * l->expand_row_h;
+}
+
+/* Reserved on the trailing edge of every slider track for its live "NN%"
+ * label (docs/13-POPOUTS-SPEC.md sec.1 item 3) -- shared by draw_slider()
+ * and cc_slider_track() so the label never overlaps the fill and drag
+ * hit-testing still maps a pointer x to the same fraction the fill shows. */
+#define CC_SLIDER_LABEL_W 32.0f
+
 /* Track geometry for slider `slot` (0=volume, 1=brightness) — the fill/track
  * inset (32px, past the leading icon) is shared by draw_slider(), the click
  * handler, and the drag-motion handler, so all three agree on where a
@@ -217,7 +344,7 @@ static float cc_tile_y(const cc_layout *l, int row)
 static void cc_slider_track(const cc_layout *l, int slot, float *track_x, float *track_w)
 {
     *track_x = l->slot_x[slot] + 32.0f;
-    *track_w = l->slot_w - 32.0f;
+    *track_w = l->slot_w - 32.0f - CC_SLIDER_LABEL_W;
 }
 
 static float cc_slider_frac_at(const cc_layout *l, int slot, double x)
@@ -262,6 +389,39 @@ static cc_hover_id cc_hittest(const cc_layout *l, double x, double y)
             if (x < (double)rx || x > (double)(rx + l->tile_w))
                 continue;
             return (cc_hover_id)(CC_HOVER_TILE_0_0 + row * 2 + col);
+        }
+    }
+
+    /* Wifi/bluetooth expand chevrons sit on top of row-0's tiles -- checked
+     * after the tile grid above so a chevron hit wins over the tile it
+     * overlaps (matches the click handler's own ordering). */
+    {
+        double dx = x - (double)l->wifi_chevron_cx, dy = y - (double)l->wifi_chevron_cy;
+        if (dx * dx + dy * dy <= (double)(l->chevron_r * l->chevron_r))
+            return CC_HOVER_WIFI_CHEVRON;
+        dx = x - (double)l->bt_chevron_cx;
+        dy = y - (double)l->bt_chevron_cy;
+        if (dx * dx + dy * dy <= (double)(l->chevron_r * l->chevron_r))
+            return CC_HOVER_BT_CHEVRON;
+    }
+
+    if (l->media_active) {
+        for (int i = 0; i < 3; i++) {
+            double dx = x - (double)l->media_btn_cx[i], dy = y - (double)l->media_btn_cy;
+            if (dx * dx + dy * dy <= (double)(l->media_btn_r * l->media_btn_r))
+                return (cc_hover_id)(CC_HOVER_MEDIA_PREV + i);
+        }
+    }
+
+    if (l->expand_kind != 0 && l->expand_rows > 0) {
+        int rows = l->expand_rows > CC_MAX_EXPAND_ROWS ? CC_MAX_EXPAND_ROWS : l->expand_rows;
+        for (int i = 0; i < rows; i++) {
+            float ry = cc_expand_row_y(l, i);
+            if (y < (double)ry || y > (double)(ry + l->expand_row_h))
+                continue;
+            if (x < (double)l->ix || x > (double)(l->ix + l->iw))
+                continue;
+            return (cc_hover_id)(CC_HOVER_EXPAND_ROW_BASE + i);
         }
     }
 
@@ -557,6 +717,42 @@ static void read_audio_device_names(char *sink_name, size_t sink_sz, char *sourc
     snprintf(source_name, source_sz, "%s", cached_source);
 }
 
+/* Media-active + expand-panel state, gathered once per render/click/motion
+ * call so cc_get_layout()'s card size and the actual drawn/clickable rows
+ * never disagree (same "single source of truth" discipline as cc_layout
+ * itself). All three reads below are cheap, cached service calls (MPRIS: a
+ * ~1/s sd-bus round trip; wifi scan: services/net.c's async fetch, drained
+ * non-blocking; bluez: a cached sd-bus GetManagedObjects) -- safe to call
+ * from pointer-motion, which fires every frame of a drag. */
+typedef struct {
+    bool media_active;
+    dc_mpris_info media;
+
+    int expand_kind; /* 0 none, 1 network, 2 bluetooth */
+    int expand_rows;
+    dc_net_wifi_ap net_aps[CC_MAX_EXPAND_ROWS];
+    dc_bluez_device bt_devs[CC_MAX_EXPAND_ROWS];
+} cc_state;
+
+static void cc_gather_state(dc_control_center *cc, cc_state *st)
+{
+    memset(st, 0, sizeof(*st));
+    st->media_active = dc_mpris_read(&st->media);
+
+    if (cc->net_expanded) {
+        st->expand_kind = 1;
+        st->expand_rows = dc_net_wifi_scan(st->net_aps, CC_MAX_EXPAND_ROWS);
+    } else if (cc->bt_expanded) {
+        dc_bluez_info bt;
+        dc_bluez_read(&bt);
+        int n = bt.device_count < CC_MAX_EXPAND_ROWS ? bt.device_count : CC_MAX_EXPAND_ROWS;
+        if (n > 0)
+            memcpy(st->bt_devs, bt.devices, (size_t)n * sizeof(bt.devices[0]));
+        st->expand_kind = 2;
+        st->expand_rows = n;
+    }
+}
+
 /* CompoundPill-style tile (Widgets/CompoundPill.qml): pill background stays
  * constant, only the icon chip fills solid-primary when active; two stacked
  * text lines (title/subtitle) to the right. Used for wifi/bluetooth/
@@ -634,8 +830,9 @@ static void draw_toggle_tile(dc_render *r, float x, float y, float w, float h, i
     nvgText(vg, x + 48.0f, y + h / 2.0f, label, NULL);
 }
 
-/* A horizontal slider: icon + rounded track + primary fill (docs/13-POPOUTS-
- * SPEC.md sec.1: "green fill, rounded, ~12px tall track"). */
+/* A horizontal slider: icon + rounded track + primary fill + a live "NN%"
+ * label on the trailing edge (docs/13-POPOUTS-SPEC.md sec.1: "green fill,
+ * rounded, ~12px tall track" + item 3 numeric value). */
 static void draw_slider(dc_render *r, float x, float cy, float w, int icon, float value)
 {
     NVGcontext *vg = r->vg;
@@ -648,7 +845,7 @@ static void draw_slider(dc_render *r, float x, float cy, float w, int icon, floa
     dc_render_icon(r, icon, x, cy, 20.0f, t->surface_text, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
 
     const float tx = x + 32.0f;
-    const float tw = w - 32.0f;
+    const float tw = w - 32.0f - CC_SLIDER_LABEL_W;
     const float th = 12.0f;
 
     nvgBeginPath(vg);
@@ -663,6 +860,104 @@ static void draw_slider(dc_render *r, float x, float cy, float w, int icon, floa
     nvgRoundedRect(vg, tx, cy - th / 2.0f, fw, th, th / 2.0f);
     nvgFillColor(vg, tc(t->primary));
     nvgFill(vg);
+
+    char pct[8];
+    snprintf(pct, sizeof(pct), "%d%%", (int)(value * 100.0f + 0.5f));
+    nvgFontFaceId(vg, r->font_ui);
+    nvgFontSize(vg, 12.0f);
+    nvgFillColor(vg, tc(t->surface_variant_text));
+    nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
+    nvgText(vg, x + w, cy, pct, NULL);
+}
+
+/* One row of the network/bluetooth expand panel: small leading icon, title
+ * (ellipsized), trailing status text (colored `status_primary` when it
+ * should stand out -- "Connected"/in-use, or a warning tone for the
+ * password hint). Deliberately flatter than draw_pill_tile() (no icon
+ * chip/background) since these are dense list rows, not tiles. */
+static void draw_expand_row(dc_render *r, float x, float y, float w, float h, int icon,
+                            const char *title, const char *status, bool status_primary,
+                            bool status_warn)
+{
+    NVGcontext *vg = r->vg;
+    const dc_theme *t = dc_theme_current;
+
+    dc_render_icon(r, icon, x + 12.0f, y + h / 2.0f, 15.0f,
+                   status_primary ? t->primary : t->surface_variant_text,
+                   NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+
+    char status_buf[32];
+    snprintf(status_buf, sizeof(status_buf), "%s", status ? status : "");
+    nvgFontFaceId(vg, r->font_ui);
+    nvgFontSize(vg, 12.0f);
+    float sbounds[4];
+    nvgTextBounds(vg, 0, 0, status_buf, NULL, sbounds);
+    float status_w = status_buf[0] ? (sbounds[2] - sbounds[0]) + 8.0f : 0.0f;
+
+    char title_buf[96];
+    snprintf(title_buf, sizeof(title_buf), "%s", title ? title : "");
+    nvgFontSize(vg, 13.0f);
+    cc_ellipsize(vg, title_buf, sizeof(title_buf), w - 30.0f - status_w);
+    nvgFillColor(vg, tc(t->surface_text));
+    nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+    nvgText(vg, x + 30.0f, y + h / 2.0f, title_buf, NULL);
+
+    if (status_buf[0]) {
+        nvgFontSize(vg, 12.0f);
+        nvgFillColor(vg, tc(status_warn ? t->warning : (status_primary ? t->primary : t->surface_variant_text)));
+        nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
+        nvgText(vg, x + w - 4.0f, y + h / 2.0f, status_buf, NULL);
+    }
+}
+
+/* Media transport row (docs/13-POPOUTS-SPEC.md sec.1 item 4): art-circle
+ * placeholder + title/artist + prev/play-pause/next, shown only while an
+ * MPRIS player is active. Mirrors the bar's media widget colors (title
+ * normal text, artist in the primary/green accent per the dashboard Media
+ * tab spec) rather than pulling in album art decoding (out of scope here --
+ * that's the Dashboard Media tab's job, docs/13-POPOUTS-SPEC.md sec.5). */
+static void draw_media_row(dc_render *r, const cc_layout *l, const dc_mpris_info *mp)
+{
+    NVGcontext *vg = r->vg;
+    const dc_theme *t = dc_theme_current;
+
+    nvgBeginPath(vg);
+    nvgCircle(vg, l->media_art_cx, l->media_art_cy, l->media_art_r);
+    nvgFillColor(vg, tc(t->surface_container_highest));
+    nvgFill(vg);
+    dc_render_icon(r, DC_ICON_MUSIC_NOTE, l->media_art_cx, l->media_art_cy, 18.0f, t->primary,
+                   NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+
+    char title[sizeof(mp->title)];
+    snprintf(title, sizeof(title), "%s", mp->title[0] ? mp->title : "Not playing");
+    nvgFontFaceId(vg, r->font_ui);
+    nvgFontSize(vg, 13.0f);
+    cc_ellipsize(vg, title, sizeof(title), l->media_text_w);
+    nvgFillColor(vg, tc(t->surface_text));
+    nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+    nvgText(vg, l->media_text_x, l->media_art_cy - 9.0f, title, NULL);
+
+    if (mp->artist[0]) {
+        char artist[sizeof(mp->artist)];
+        snprintf(artist, sizeof(artist), "%s", mp->artist);
+        nvgFontSize(vg, DC_BAR_TEXT_SIZE);
+        cc_ellipsize(vg, artist, sizeof(artist), l->media_text_w);
+        nvgFillColor(vg, tc(t->primary));
+        nvgText(vg, l->media_text_x, l->media_art_cy + 9.0f, artist, NULL);
+    }
+
+    dc_render_icon(r, DC_ICON_SKIP_PREVIOUS, l->media_btn_cx[0], l->media_btn_cy, 16.0f,
+                   t->surface_text, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+
+    nvgBeginPath(vg);
+    nvgCircle(vg, l->media_btn_cx[1], l->media_btn_cy, l->media_btn_r);
+    nvgFillColor(vg, tc(t->primary));
+    nvgFill(vg);
+    dc_render_icon(r, mp->playing ? DC_ICON_PAUSE : DC_ICON_PLAY_ARROW, l->media_btn_cx[1],
+                   l->media_btn_cy, 16.0f, t->primary_text, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+
+    dc_render_icon(r, DC_ICON_SKIP_NEXT, l->media_btn_cx[2], l->media_btn_cy, 16.0f,
+                   t->surface_text, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
 }
 
 static void recompute_physical(dc_control_center *cc)
@@ -713,6 +1008,35 @@ static void draw_cc_hover(dc_control_center *cc, const cc_layout *l)
         nvgRoundedRect(vg, rx, ry, l->tile_w, l->tile_h, 12.0f);
         nvgFillColor(vg, col);
         nvgFill(vg);
+        return;
+    }
+
+    if (cc->hover_id == CC_HOVER_WIFI_CHEVRON || cc->hover_id == CC_HOVER_BT_CHEVRON) {
+        float cx = cc->hover_id == CC_HOVER_WIFI_CHEVRON ? l->wifi_chevron_cx : l->bt_chevron_cx;
+        float cy = cc->hover_id == CC_HOVER_WIFI_CHEVRON ? l->wifi_chevron_cy : l->bt_chevron_cy;
+        nvgBeginPath(vg);
+        nvgCircle(vg, cx, cy, l->chevron_r);
+        nvgFillColor(vg, col);
+        nvgFill(vg);
+        return;
+    }
+
+    if (cc->hover_id >= CC_HOVER_MEDIA_PREV && cc->hover_id <= CC_HOVER_MEDIA_NEXT) {
+        int i = cc->hover_id - CC_HOVER_MEDIA_PREV;
+        nvgBeginPath(vg);
+        nvgCircle(vg, l->media_btn_cx[i], l->media_btn_cy, l->media_btn_r);
+        nvgFillColor(vg, col);
+        nvgFill(vg);
+        return;
+    }
+
+    if (cc->hover_id >= CC_HOVER_EXPAND_ROW_BASE) {
+        int i = cc->hover_id - CC_HOVER_EXPAND_ROW_BASE;
+        float ry = cc_expand_row_y(l, i);
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, l->ix, ry, l->iw, l->expand_row_h, 8.0f);
+        nvgFillColor(vg, col);
+        nvgFill(vg);
     }
 }
 
@@ -720,6 +1044,31 @@ static void cc_render(dc_control_center *cc)
 {
     if (!cc->configured || cc->phys_width <= 0)
         return;
+
+    /* Gather media/expand state and compute the layout *before* touching the
+     * EGL window, since an expanded network/bluetooth section or an active
+     * media player changes the card's total height -- cc_get_layout()'s
+     * total_h is this frame's authoritative height, and the layer-surface is
+     * resized (protocol-level) to match right here so draw + hit-test + the
+     * actual mapped surface size never disagree (docs/13-POPOUTS-SPEC.md
+     * sec.1 items 1/2/4). */
+    cc_state st;
+    cc_gather_state(cc, &st);
+    cc_layout l = cc_get_layout((float)cc->logical_width, st.media_active, st.expand_kind,
+                                st.expand_rows);
+
+    int desired_h = (int)ceilf(l.total_h);
+    if (desired_h != cc->logical_height && cc->layer_surface) {
+        cc->logical_height = desired_h;
+        recompute_physical(cc);
+        zwlr_layer_surface_v1_set_size(cc->layer_surface, (uint32_t)DC_CC_WIDTH,
+                                       (uint32_t)desired_h);
+        /* Applies the pending set_size (double-buffered, like every other
+         * layer-shell request) without waiting for the compositor's
+         * configure ack -- same "optimistic" client-side sizing the initial
+         * cc_show()/layer_surface_handle_configure() path already relies on. */
+        wl_surface_commit(cc->surface);
+    }
 
     if (!cc->egl_ready) {
         if (!dc_egl_window_init(&cc->egl_window, cc->egl, cc->surface, cc->phys_width,
@@ -786,8 +1135,6 @@ static void cc_render(dc_control_center *cc)
     nvgStrokeColor(vg, nvgRGBA(t->outline.r, t->outline.g, t->outline.b, 40));
     nvgStrokeWidth(vg, 1.0f);
     nvgStroke(vg);
-
-    cc_layout l = cc_get_layout(w);
 
     /* --- User header card (HeaderPane.qml) --------------------------- */
     nvgBeginPath(vg);
@@ -884,6 +1231,12 @@ static void cc_render(dc_control_center *cc)
     draw_slider(cc->render, l.slot_x[1], l.sliders_y + l.slider_h / 2.0f, l.slot_w,
                DC_ICON_BRIGHTNESS_MEDIUM, bright_frac);
 
+    /* --- Media transport row (docs/13-POPOUTS-SPEC.md sec.1 item 4), only
+     * when an MPRIS player is present -- cc_get_layout() already reserved
+     * (or didn't reserve) the vertical space for this via st.media_active. */
+    if (st.media_active)
+        draw_media_row(cc->render, &l, &st.media);
+
     /* --- Tile grid: wifi/bluetooth, audioOutput/audioInput, nightMode/
      * darkMode (order per the user's controlCenterWidgets config) -------- */
     char wifi_title[64], wifi_sub[32];
@@ -899,16 +1252,35 @@ static void cc_render(dc_control_center *cc)
     }
     draw_pill_tile(cc->render, cc_tile_x(&l, 0), cc_tile_y(&l, 0), l.tile_w, l.tile_h, DC_ICON_WIFI,
                   wifi_title, wifi_sub, net.connected);
+    /* Expand chevron (docs/13-POPOUTS-SPEC.md sec.1 item 1): points right
+     * when collapsed, down while the network list is open, painted on top
+     * of the pill tile it shares. */
+    dc_render_icon(cc->render, cc->net_expanded ? DC_ICON_EXPAND_MORE : DC_ICON_CHEVRON_RIGHT,
+                  l.wifi_chevron_cx, l.wifi_chevron_cy, 16.0f, t->surface_variant_text,
+                  NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
 
-    /* NOTE: "active" (icon chip fill) tracks adapter *powered* state, not
+    /* "active" (icon chip fill) tracks adapter *powered* state, not
      * device-connected -- matches the reference screenshot (chip is solid
-     * green with 0 connected devices). bluez.h has no device-count field
-     * (out of touch-scope to add one), so the subtitle is "Connected"/"No
-     * devices" rather than the reference's exact "N connected". */
+     * green with 0 connected devices). Subtitle now uses the real device
+     * count (bluez.c was extended with a device[] list for the expand
+     * panel below) rather than the previous flat "Connected"/"No devices". */
     const char *bt_title = (have_bt && bt.powered) ? "Enabled" : "Disabled";
-    const char *bt_sub = (have_bt && bt.connected) ? "Connected" : "No devices";
+    char bt_sub[24];
+    if (!have_bt || !bt.powered)
+        snprintf(bt_sub, sizeof(bt_sub), "No devices");
+    else if (bt.connected) {
+        int n_conn = 0;
+        for (int i = 0; i < bt.device_count; i++)
+            n_conn += bt.devices[i].connected ? 1 : 0;
+        snprintf(bt_sub, sizeof(bt_sub), "%d connected", n_conn);
+    } else {
+        snprintf(bt_sub, sizeof(bt_sub), "No devices");
+    }
     draw_pill_tile(cc->render, cc_tile_x(&l, 1), cc_tile_y(&l, 0), l.tile_w, l.tile_h,
                   DC_ICON_BLUETOOTH, bt_title, bt_sub, have_bt && bt.powered);
+    dc_render_icon(cc->render, cc->bt_expanded ? DC_ICON_EXPAND_MORE : DC_ICON_CHEVRON_RIGHT,
+                  l.bt_chevron_cx, l.bt_chevron_cy, 16.0f, t->surface_variant_text,
+                  NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
 
     char out_title[64], out_sub[16];
     snprintf(out_title, sizeof(out_title), "%s", sink_name[0] ? sink_name : "Speakers");
@@ -929,15 +1301,69 @@ static void cc_render(dc_control_center *cc)
     draw_pill_tile(cc->render, cc_tile_x(&l, 1), cc_tile_y(&l, 1), l.tile_w, l.tile_h,
                   in_muted ? DC_ICON_MIC_OFF : DC_ICON_MIC, in_title, in_sub, !in_muted);
 
-    /* nightMode/darkMode: dankc has no real dark/night-mode service state
-     * yet, so these stay the same hardcoded placeholders the previous
-     * implementation used (one active, one not) -- restyled only, per this
-     * task's "logic should NOT change" instruction. This means it won't
-     * match the reference screenshot's both-active look. */
+    /* nightMode: dankc has no real night-mode (gammastep) service hook wired
+     * to a live toggle state yet (out of this task's scope, see docs/POLISH
+     * P4 item order), so it stays the same hardcoded placeholder -- restyled
+     * only. darkMode: dankc's stock themes (theme/stock_themes.inc) are all
+     * DARK-only, there's no light variant to flip to (docs/13-POPOUTS-
+     * SPEC.md sec.1 asked to wire this to "something real" if no light
+     * variant exists) -- repurposed to toggle dynamic color (theme derived
+     * from the wallpaper via theme/dynamic.cpp) instead, since that's the
+     * other config-driven, already-wired palette switch (settings.c's
+     * "Dynamic color" toggle does the exact same apply+save+notify). */
     draw_toggle_tile(cc->render, cc_tile_x(&l, 0), cc_tile_y(&l, 2), l.tile_w, l.tile_h,
                      DC_ICON_NIGHTLIGHT, "Night Mode", false);
     draw_toggle_tile(cc->render, cc_tile_x(&l, 1), cc_tile_y(&l, 2), l.tile_w, l.tile_h,
-                     DC_ICON_CONTRAST, "Dark Mode", true);
+                     DC_ICON_CONTRAST, "Dark Mode", dc_config_current->dynamic_color);
+
+    /* --- Expand panel: network scan list or bluetooth device list
+     * (docs/13-POPOUTS-SPEC.md sec.1 items 1/2), mutually exclusive with
+     * each other -- cc_get_layout() already sized the card to fit whichever
+     * is open. */
+    if (l.expand_kind != 0) {
+        nvgFontFaceId(vg, cc->render->font_ui);
+        nvgFontSize(vg, 12.0f);
+        nvgFillColor(vg, tc(t->surface_variant_text));
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        nvgText(vg, l.ix, l.expand_header_y, l.expand_kind == 1 ? "NETWORKS" : "BLUETOOTH DEVICES",
+               NULL);
+
+        if (st.expand_rows == 0) {
+            nvgFontSize(vg, 13.0f);
+            nvgFillColor(vg, tc(t->surface_variant_text));
+            nvgText(vg, l.ix, cc_expand_row_y(&l, 0) + l.expand_row_h / 2.0f,
+                   l.expand_kind == 1 ? "Scanning\xe2\x80\xa6" : "No paired devices", NULL);
+        }
+
+        for (int i = 0; i < st.expand_rows && i < CC_MAX_EXPAND_ROWS; i++) {
+            float ry = cc_expand_row_y(&l, i);
+            if (l.expand_kind == 1) {
+                const dc_net_wifi_ap *ap = &st.net_aps[i];
+                bool hinted =
+                    cc->net_hint_active && strcmp(cc->net_hint_ssid, ap->ssid) == 0;
+                char status[24];
+                bool warn = false;
+                if (hinted) {
+                    snprintf(status, sizeof(status), "Needs Password");
+                    warn = true;
+                } else if (ap->in_use)
+                    snprintf(status, sizeof(status), "Connected");
+                else if (ap->secured)
+                    snprintf(status, sizeof(status), "%d%%", ap->signal_percent);
+                else
+                    snprintf(status, sizeof(status), "Open \xc2\xb7 %d%%", ap->signal_percent);
+                draw_expand_row(cc->render, l.ix, ry, l.iw, l.expand_row_h,
+                                ap->secured ? DC_ICON_LOCK : DC_ICON_WIFI, ap->ssid, status,
+                                ap->in_use, warn);
+            } else {
+                const dc_bluez_device *d = &st.bt_devs[i];
+                draw_expand_row(cc->render, l.ix, ry, l.iw, l.expand_row_h,
+                                d->connected ? DC_ICON_BLUETOOTH_CONNECTED : DC_ICON_BLUETOOTH,
+                                d->name, d->connected ? "Connected" : "Tap to connect",
+                                d->connected, false);
+            }
+        }
+    }
 
     draw_cc_hover(cc, &l);
 
@@ -1066,6 +1492,11 @@ static void cc_teardown(dc_control_center *cc)
     cc->closing = false;
     cc->hover_id = CC_HOVER_NONE;
     cc->slider_dragging = false;
+    /* Next open starts collapsed (docs/13-POPOUTS-SPEC.md sec.1 items 1/2) --
+     * matches every other popout's "closed == reset" convention. */
+    cc->net_expanded = false;
+    cc->bt_expanded = false;
+    cc->net_hint_active = false;
     dc_debug("control center hidden");
 }
 
@@ -1110,7 +1541,10 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
     if (!cc->visible || cc->closing)
         return;
 
-    cc_layout l = cc_get_layout((float)cc->logical_width);
+    cc_state st;
+    cc_gather_state(cc, &st);
+    cc_layout l = cc_get_layout((float)cc->logical_width, st.media_active, st.expand_kind,
+                                st.expand_rows);
 
     /* Header action buttons: lock, power, settings, edit. */
     for (int i = 0; i < 4; i++) {
@@ -1165,11 +1599,54 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
         return;
     }
 
+    /* Wifi/bluetooth expand chevrons (docs/13-POPOUTS-SPEC.md sec.1 items
+     * 1/2) -- checked before the tile grid below since the chevron sits
+     * inside the wifi/bluetooth tile's own bounds (top-right corner). Only
+     * one panel is ever open: picking one closes the other and clears any
+     * pending password hint. */
+    {
+        double dx = x - (double)l.wifi_chevron_cx, dy = y - (double)l.wifi_chevron_cy;
+        if (dx * dx + dy * dy <= (double)(l.chevron_r * l.chevron_r)) {
+            cc->net_expanded = !cc->net_expanded;
+            cc->bt_expanded = false;
+            cc->net_hint_active = false;
+            cc_render(cc);
+            return;
+        }
+        dx = x - (double)l.bt_chevron_cx;
+        dy = y - (double)l.bt_chevron_cy;
+        if (dx * dx + dy * dy <= (double)(l.chevron_r * l.chevron_r)) {
+            cc->bt_expanded = !cc->bt_expanded;
+            cc->net_expanded = false;
+            cc->net_hint_active = false;
+            cc_render(cc);
+            return;
+        }
+    }
+
+    /* Media transport row (docs/13-POPOUTS-SPEC.md sec.1 item 4). */
+    if (l.media_active) {
+        for (int i = 0; i < 3; i++) {
+            double dx = x - (double)l.media_btn_cx[i], dy = y - (double)l.media_btn_cy;
+            if (dx * dx + dy * dy > (double)(l.media_btn_r * l.media_btn_r))
+                continue;
+            if (i == 0)
+                dc_mpris_previous();
+            else if (i == 1)
+                dc_mpris_play_pause();
+            else
+                dc_mpris_next();
+            cc_render(cc);
+            return;
+        }
+    }
+
     /* Tile grid: wifi/bluetooth toggle rfkill (unchanged from before);
      * audioOutput/audioInput toggle mute via the same wpctl already used by
      * the sliders above (new, but reuses the exact tool/pattern -- these
-     * tiles didn't exist as clickable elements before this task);
-     * nightMode/darkMode stay no-ops (no backing service yet). */
+     * tiles didn't exist as clickable elements before this task); darkMode
+     * toggles dynamic color (see cc_render()'s comment); nightMode stays a
+     * no-op (no backing service yet). */
     for (int row = 0; row < 3; row++) {
         float ry = cc_tile_y(&l, row);
         if (y < (double)ry || y > (double)(ry + l.tile_h))
@@ -1186,8 +1663,50 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
                 run_detached("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
             else if (row == 1 && col == 1)
                 run_detached("wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle");
-            else
-                dc_debug("control center: night/dark toggle (no-op)");
+            else if (row == 2 && col == 1) {
+                dc_config *cfg = dc_config_mut();
+                cfg->dynamic_color = !cfg->dynamic_color;
+                dc_config_reapply();
+                dc_config_save();
+                dc_config_notify_changed();
+            } else
+                dc_debug("control center: night toggle (no-op)");
+            cc_render(cc);
+            return;
+        }
+    }
+
+    /* Expand panel rows: connect/disconnect a bluetooth device, or connect
+     * to an open/known Wi-Fi network (secured+unknown SSIDs show a "needs
+     * password" hint instead -- no inline password entry yet, docs/13-
+     * POPOUTS-SPEC.md sec.1 item 1 TODO). */
+    if (l.expand_kind != 0 && st.expand_rows > 0) {
+        int rows = st.expand_rows > CC_MAX_EXPAND_ROWS ? CC_MAX_EXPAND_ROWS : st.expand_rows;
+        for (int i = 0; i < rows; i++) {
+            float ry = cc_expand_row_y(&l, i);
+            if (y < (double)ry || y > (double)(ry + l.expand_row_h))
+                continue;
+            if (x < (double)l.ix || x > (double)(l.ix + l.iw))
+                continue;
+
+            if (l.expand_kind == 1) {
+                const dc_net_wifi_ap *ap = &st.net_aps[i];
+                if (ap->in_use) {
+                    /* already connected -- nothing to do */
+                } else if (!ap->secured || ap->known) {
+                    cc->net_hint_active = false;
+                    dc_net_wifi_connect(ap->ssid);
+                } else {
+                    cc->net_hint_active = true;
+                    snprintf(cc->net_hint_ssid, sizeof(cc->net_hint_ssid), "%s", ap->ssid);
+                }
+            } else {
+                const dc_bluez_device *d = &st.bt_devs[i];
+                if (d->connected)
+                    dc_bluez_disconnect(d->mac);
+                else
+                    dc_bluez_connect(d->mac);
+            }
             cc_render(cc);
             return;
         }
@@ -1204,7 +1723,10 @@ void dc_control_center_handle_motion(dc_control_center *cc, double x, double y)
     if (!cc->visible || cc->closing)
         return;
 
-    cc_layout l = cc_get_layout((float)cc->logical_width);
+    cc_state st;
+    cc_gather_state(cc, &st);
+    cc_layout l = cc_get_layout((float)cc->logical_width, st.media_active, st.expand_kind,
+                                st.expand_rows);
 
     if (cc->slider_dragging) {
         float frac = cc_slider_frac_at(&l, cc->slider_drag_slot, x);
