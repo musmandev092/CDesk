@@ -74,7 +74,7 @@ static const s_tab_def TABS[TAB_COUNT] = {
     {IC_PALETTE, "Personalization", true},   {IC_SCHEDULE, "Time & Date", true},
     {IC_TOOLBAR, "Bar", true},               {IC_WIDGETS, "Widgets", true},
     {IC_CLOUD, "Weather", true},             {IC_MONITOR, "Displays", false},
-    {IC_NOTIFICATIONS, "Notifications", false}, {IC_GRID_VIEW, "Launcher", false},
+    {IC_NOTIFICATIONS, "Notifications", true}, {IC_GRID_VIEW, "Launcher", true},
     {IC_SECURITY, "Power", false},           {IC_INFO, "About", true},
 };
 
@@ -101,9 +101,24 @@ struct dc_settings {
     float scroll_y;
     float content_h; /* recomputed each render, drives scroll clamp */
 
-    int focus_field; /* 0 none, 1 latitude, 2 longitude */
-    char edit_buf[48];
+    int focus_field; /* 0 none, 1 latitude, 2 longitude, 3 weather location, 4 wallpaper path */
+    char edit_buf[256];
 };
+
+/* Bounded string copy without gcc's -Wformat-truncation firing: several text
+ * fields copy between buffers of different fixed sizes (edit_buf <-> the
+ * underlying config field), and snprintf(dst, sizeof(dst), "%s", src) trips
+ * the warning whenever src's declared capacity exceeds dst's, even though the
+ * intentional behavior here (truncate to fit) is exactly what snprintf
+ * already does safely. */
+static void copy_trunc(char *dst, size_t dstsz, const char *src)
+{
+    size_t n = strlen(src);
+    if (n >= dstsz)
+        n = dstsz - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
 
 static inline NVGcolor tc(dc_color c)
 {
@@ -397,6 +412,8 @@ static bool ui_textfield(uictx *c, const char *label, const char *text, bool foc
         nvgStrokeWidth(vg, focused ? 2.0f : 1.0f);
         nvgStrokeColor(vg, focused ? tc(c->t->primary) : tc_a(c->t->outline, 90));
         nvgStroke(vg);
+        nvgSave(vg);
+        nvgScissor(vg, 0, box_y, c->w, bh);
         nvgFontSize(vg, 15.0f);
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc(c->t->surface_text));
@@ -408,6 +425,7 @@ static bool ui_textfield(uictx *c, const char *label, const char *text, bool foc
             nvgFillColor(vg, tc(c->t->primary));
             nvgFill(vg);
         }
+        nvgRestore(vg);
     }
     bool clicked = ui_click_in(c, 0, box_y, c->w, bh);
     if (clicked)
@@ -561,6 +579,18 @@ static void tab_personalization(uictx *c)
         c->changed = true;
         c->reapply = true;
     }
+    if (c->cfg->dynamic_color) {
+        bool wp_focus = c->s->focus_field == 4;
+        char wpbuf[256];
+        if (wp_focus)
+            snprintf(wpbuf, sizeof(wpbuf), "%s", c->s->edit_buf);
+        else
+            copy_trunc(wpbuf, sizeof(wpbuf), c->cfg->wallpaper);
+        if (ui_textfield(c, "Wallpaper image path", wpbuf, wp_focus)) {
+            c->s->focus_field = 4;
+            copy_trunc(c->s->edit_buf, sizeof(c->s->edit_buf), c->cfg->wallpaper);
+        }
+    }
     if (ui_toggle(c, "Animations", "Panel entrance/exit animations",
                   c->cfg->animations_enabled)) {
         c->cfg->animations_enabled = !c->cfg->animations_enabled;
@@ -628,12 +658,27 @@ static void tab_bar(uictx *c)
         c->changed = true;
         c->bars = true;
     }
+    char wv[16];
+    snprintf(wv, sizeof(wv), "%d%%", (int)lroundf(c->cfg->bar_widget_transparency * 100.0f));
+    if (ui_slider(c, "Widget opacity", &c->cfg->bar_widget_transparency, 0.0f, 1.0f, wv)) {
+        c->changed = true;
+        c->bars = true;
+    }
 }
+
+/* WIDGET_ROWS is grouped by section (0 left, 1 center, 2 right) already; emit
+ * a section header each time it changes so the tab visually mirrors the bar's
+ * L/C/R widget-host arrays (docs/08-SETTINGS-UI.md DANK BAR > Widgets). */
+static const char *const WIDGET_SECTION_NAMES[3] = {"LEFT", "CENTER", "RIGHT"};
 
 static void tab_widgets(uictx *c)
 {
-    ui_section(c, "BAR WIDGETS");
+    int last_section = -1;
     for (int i = 0; i < WIDGET_ROWS_N; i++) {
+        if (WIDGET_ROWS[i].section != last_section) {
+            last_section = WIDGET_ROWS[i].section;
+            ui_section(c, WIDGET_SECTION_NAMES[last_section]);
+        }
         if (ui_toggle(c, WIDGET_ROWS[i].label, NULL, widget_enabled(c->cfg, WIDGET_ROWS[i].id))) {
             widget_toggle(c->cfg, &WIDGET_ROWS[i]);
             c->changed = true;
@@ -661,15 +706,26 @@ static void tab_weather(uictx *c)
     }
 
     ui_section(c, "LOCATION");
+    bool name_focus = c->s->focus_field == 3;
+    char namebuf[64];
+    if (name_focus)
+        copy_trunc(namebuf, sizeof(namebuf), c->s->edit_buf);
+    else
+        snprintf(namebuf, sizeof(namebuf), "%s", c->cfg->weather_location);
+    if (ui_textfield(c, "Location name", namebuf, name_focus)) {
+        c->s->focus_field = 3;
+        snprintf(c->s->edit_buf, sizeof(c->s->edit_buf), "%s", c->cfg->weather_location);
+    }
+
     char latbuf[48], lonbuf[48];
     bool lat_focus = c->s->focus_field == 1;
     bool lon_focus = c->s->focus_field == 2;
     if (lat_focus)
-        snprintf(latbuf, sizeof(latbuf), "%s", c->s->edit_buf);
+        copy_trunc(latbuf, sizeof(latbuf), c->s->edit_buf);
     else
         snprintf(latbuf, sizeof(latbuf), "%.4f", c->cfg->weather_lat);
     if (lon_focus)
-        snprintf(lonbuf, sizeof(lonbuf), "%s", c->s->edit_buf);
+        copy_trunc(lonbuf, sizeof(lonbuf), c->s->edit_buf);
     else
         snprintf(lonbuf, sizeof(lonbuf), "%.4f", c->cfg->weather_lon);
 
@@ -680,6 +736,37 @@ static void tab_weather(uictx *c)
     if (ui_textfield(c, "Longitude", lonbuf, lon_focus)) {
         c->s->focus_field = 2;
         snprintf(c->s->edit_buf, sizeof(c->s->edit_buf), "%.4f", c->cfg->weather_lon);
+    }
+}
+
+static void tab_notifications(uictx *c)
+{
+    ui_section(c, "DO NOT DISTURB");
+    if (ui_toggle(c, "Do not disturb", "Suppress new toast popups (still saved to history)",
+                  c->cfg->dnd_enabled)) {
+        c->cfg->dnd_enabled = !c->cfg->dnd_enabled;
+        c->changed = true;
+    }
+
+    ui_section(c, "POPUP TIMEOUTS (SECONDS)");
+    if (ui_stepper(c, "Low urgency", &c->cfg->notif_timeout_low_sec, 1, 120, 1))
+        c->changed = true;
+    if (ui_stepper(c, "Normal urgency", &c->cfg->notif_timeout_normal_sec, 1, 120, 1))
+        c->changed = true;
+    if (ui_stepper(c, "Critical urgency (0 = never)", &c->cfg->notif_timeout_critical_sec, 0, 120,
+                   5))
+        c->changed = true;
+}
+
+static void tab_launcher(uictx *c)
+{
+    ui_section(c, "VIEW");
+    static const char *const view_opts[2] = {"List", "Grid"};
+    int cur = c->cfg->launcher_grid_view ? 1 : 0;
+    int clicked = ui_segmented(c, "Default view mode", view_opts, 2, cur);
+    if (clicked >= 0 && clicked != cur) {
+        c->cfg->launcher_grid_view = clicked == 1;
+        c->changed = true;
     }
 }
 
@@ -736,6 +823,10 @@ static void tab_about(uictx *c)
     }
 }
 
+/* focus_field values >= this edit free text (weather location, wallpaper
+ * path); below it (1,2) are numeric lat/lon fields with digit-only input. */
+#define DC_FOCUS_TEXT_MIN 3
+
 static void build_tab(uictx *c)
 {
     switch (c->s->active_tab) {
@@ -754,6 +845,12 @@ static void build_tab(uictx *c)
     case TAB_WEATHER:
         tab_weather(c);
         break;
+    case TAB_NOTIFICATIONS:
+        tab_notifications(c);
+        break;
+    case TAB_LAUNCHER:
+        tab_launcher(c);
+        break;
     case TAB_ABOUT:
         tab_about(c);
         break;
@@ -763,31 +860,53 @@ static void build_tab(uictx *c)
     }
 }
 
-/* Commit an in-progress text-field edit into the config (parse + clamp). */
+/* Commit an in-progress text-field edit into the config (parse + clamp for
+ * numeric fields, direct copy for free-text fields). */
 static void commit_edit(dc_settings *s)
 {
     if (!s->focus_field)
         return;
     dc_config *cfg = dc_config_mut();
-    double v = atof(s->edit_buf);
-    if (s->focus_field == 1) {
+    bool geo_changed = false;
+    bool wallpaper_changed = false;
+    switch (s->focus_field) {
+    case 1: {
+        double v = atof(s->edit_buf);
         if (v < -90.0)
             v = -90.0;
         if (v > 90.0)
             v = 90.0;
         cfg->weather_lat = v;
-    } else if (s->focus_field == 2) {
+        geo_changed = true;
+        break;
+    }
+    case 2: {
+        double v = atof(s->edit_buf);
         if (v < -180.0)
             v = -180.0;
         if (v > 180.0)
             v = 180.0;
         cfg->weather_lon = v;
+        geo_changed = true;
+        break;
+    }
+    case 3:
+        copy_trunc(cfg->weather_location, sizeof(cfg->weather_location), s->edit_buf);
+        break;
+    case 4:
+        snprintf(cfg->wallpaper, sizeof(cfg->wallpaper), "%s", s->edit_buf);
+        wallpaper_changed = true;
+        break;
+    default:
+        break;
     }
     s->focus_field = 0;
     s->edit_buf[0] = '\0';
     dc_config_save();
-    if (cfg->weather_enabled)
+    if (geo_changed && cfg->weather_enabled)
         dc_weather_init(cfg->weather_lat, cfg->weather_lon, cfg->weather_fahrenheit);
+    if (wallpaper_changed && cfg->dynamic_color)
+        dc_config_reapply();
     dc_config_notify_changed();
 }
 
@@ -1211,12 +1330,28 @@ void dc_settings_handle_key(dc_settings *s, uint32_t keysym, const char *utf8)
         return;
     }
     default:
-        if (utf8 && utf8[0] &&
-            (utf8[0] == '.' || utf8[0] == '-' || (utf8[0] >= '0' && utf8[0] <= '9'))) {
+        if (!utf8 || !utf8[0])
+            return;
+        if (s->focus_field < DC_FOCUS_TEXT_MIN) {
+            /* Numeric fields (latitude/longitude): digits + sign/decimal only. */
+            if (!(utf8[0] == '.' || utf8[0] == '-' || (utf8[0] >= '0' && utf8[0] <= '9')))
+                return;
             size_t n = strlen(s->edit_buf);
             if (n + 1 < sizeof(s->edit_buf)) {
                 s->edit_buf[n] = utf8[0];
                 s->edit_buf[n + 1] = '\0';
+                s_render(s);
+            }
+        } else {
+            /* Free-text fields (weather location, wallpaper path): accept the
+             * whole UTF-8 sequence for the key, skip control characters. */
+            if ((unsigned char)utf8[0] < 0x20)
+                return;
+            size_t addlen = strlen(utf8);
+            size_t n = strlen(s->edit_buf);
+            if (n + addlen < sizeof(s->edit_buf)) {
+                memcpy(s->edit_buf + n, utf8, addlen);
+                s->edit_buf[n + addlen] = '\0';
                 s_render(s);
             }
         }

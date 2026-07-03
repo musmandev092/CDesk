@@ -1017,6 +1017,10 @@ static void launcher_show(dc_launcher *l, dc_output *output)
     l->configured = false;
     l->egl_ready = false;
     l->scale120 = (output && output->scale > 0 ? output->scale : 1) * DC_SCALE_BASE;
+    /* Settings-UI default view mode (Launcher tab): re-read on every open so
+     * a change live-applies without needing a restart. */
+    l->view_mode =
+        dc_config_current->launcher_grid_view ? DC_LAUNCHER_VIEW_GRID : DC_LAUNCHER_VIEW_LIST;
     /* DANKC_LAUNCHER_QUERY: pre-fill the search field on open, for
      * verification without needing real keyboard input synthesis (docs/
      * POLISH.md P4 verification note) -- e.g. DANKC_LAUNCHER_QUERY="2+2*3"
