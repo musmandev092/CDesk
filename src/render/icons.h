@@ -59,6 +59,7 @@
 #define DC_ICON_DONE 0xe876
 #define DC_ICON_CHEVRON_RIGHT 0xe5cc
 #define DC_ICON_EXPAND_MORE 0xe5cf
+#define DC_ICON_EXPAND_LESS 0xe5ce
 #define DC_ICON_EDIT 0xf097
 #define DC_ICON_PERSON 0xf0d3
 /* Control Center's nightMode/darkMode toggle tiles use these two, not
