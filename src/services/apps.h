@@ -12,6 +12,13 @@
 #define DC_APP_ID 128
 #define DC_APP_DESC 192
 
+/* Raw ';'-joined MimeType=/Categories= values straight from the .desktop
+ * file, used by dc_apps_find_by_mime()/dc_apps_find_by_category() below (the
+ * Default Apps settings tab, docs/17-DEFAULT-APPS-PLAN.md) instead of
+ * guessing from the app's name/id. */
+#define DC_APP_MIME_MAX 512
+#define DC_APP_CATS_MAX 256
+
 /* Desktop-entry "Actions=" (docs/POLISH.md P4 item 3) — extra commands a
  * .desktop file advertises beyond its main Exec=, e.g. a browser's "New
  * Private Window". Declared via `[Desktop Action <id>]` groups; see
@@ -32,6 +39,11 @@ typedef struct {
      * (launcher rows then show the name only). */
     char desc[DC_APP_DESC];
     int score; /* scratch, set during search */
+
+    /* Raw ';'-terminated MimeType=/Categories= values (empty if the entry has
+     * neither); see dc_apps_find_by_mime()/dc_apps_find_by_category(). */
+    char mimetypes[DC_APP_MIME_MAX];
+    char categories[DC_APP_CATS_MAX];
 
     dc_app_action actions[DC_APP_ACTION_MAX];
     int action_count;
@@ -55,6 +67,22 @@ int dc_apps_search(dc_apps *apps, const char *query, const dc_app **out, int max
  * pinned-apps launch path (ui/dock.c) and niri app_id -> icon/name mapping.
  * Returns NULL if no indexed entry matches. */
 const dc_app *dc_apps_find(const dc_apps *apps, const char *id);
+
+/* Apps whose MimeType= contains `mime` as an exact ';'-delimited token (not a
+ * substring match -- "audio/mp" won't match "audio/mpeg"). Writes up to `max`
+ * pointers into `out` (pointers into the index, in the same alphabetical
+ * order as dc_apps_load() sorted them) and returns the count. Used by the
+ * Default Apps settings tab (docs/17-DEFAULT-APPS-PLAN.md) to enumerate real
+ * per-category candidates instead of a name-keyword heuristic. */
+int dc_apps_find_by_mime(const dc_apps *apps, const char *mime, const dc_app **out, int max);
+
+/* Apps whose Categories= contains `category` as an exact ';'-delimited token.
+ * Used for the three role-based rows that aren't MIME-typed at all (Web
+ * Browser -> "WebBrowser", File Manager -> "FileManager", Terminal ->
+ * "TerminalEmulator"), matching KDE's/DMS's own Categories=-based filtering
+ * for those roles (docs/17-DEFAULT-APPS-PLAN.md sec 1.6/1.7). */
+int dc_apps_find_by_category(const dc_apps *apps, const char *category, const dc_app **out,
+                             int max);
 
 /* Launch an app's Exec line, detached from DankC. */
 void dc_app_launch(const dc_app *app);

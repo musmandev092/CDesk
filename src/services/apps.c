@@ -4,6 +4,7 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -142,6 +143,11 @@ static int parse_desktop(const char *path, const char *id, dc_app *app)
     char comment[DC_APP_DESC] = {0};
     char generic[DC_APP_DESC] = {0};
     char actions_raw[256] = {0}; /* raw Actions= value, e.g. "new-window;new-private-window;" */
+    /* Raw ';'-joined MimeType=/Categories= values, kept verbatim (including
+     * the trailing ';' the spec requires) for dc_apps_find_by_mime()/
+     * dc_apps_find_by_category()'s exact-token matching below. */
+    char mimetypes[DC_APP_MIME_MAX] = {0};
+    char categories[DC_APP_CATS_MAX] = {0};
     int is_application = 1;      /* assume Application unless Type says otherwise */
     int hidden = 0;
     int in_entry = 0;
@@ -174,6 +180,10 @@ static int parse_desktop(const char *path, const char *id, dc_app *app)
         } else if (strncmp(line, "Actions=", 8) == 0 && !actions_raw[0]) {
             snprintf(actions_raw, sizeof(actions_raw), "%.*s", (int)sizeof(actions_raw) - 1,
                      line + 8);
+        } else if (strncmp(line, "MimeType=", 9) == 0 && !mimetypes[0]) {
+            snprintf(mimetypes, sizeof(mimetypes), "%.*s", DC_APP_MIME_MAX - 1, line + 9);
+        } else if (strncmp(line, "Categories=", 11) == 0 && !categories[0]) {
+            snprintf(categories, sizeof(categories), "%.*s", DC_APP_CATS_MAX - 1, line + 11);
         } else if (strncmp(line, "Type=", 5) == 0) {
             is_application = strcmp(line + 5, "Application") == 0;
         } else if (strncmp(line, "NoDisplay=", 10) == 0) {
@@ -191,6 +201,8 @@ static int parse_desktop(const char *path, const char *id, dc_app *app)
     snprintf(app->exec, sizeof(app->exec), "%s", exec);
     snprintf(app->id, sizeof(app->id), "%s", id);
     snprintf(app->desc, sizeof(app->desc), "%s", comment[0] ? comment : generic);
+    snprintf(app->mimetypes, sizeof(app->mimetypes), "%s", mimetypes);
+    snprintf(app->categories, sizeof(app->categories), "%s", categories);
     app->score = 0;
     app->action_count = 0;
     if (actions_raw[0])
@@ -299,6 +311,52 @@ const dc_app *dc_apps_find(const dc_apps *apps, const char *id)
         if (strcasecmp(apps->items[i].id, id) == 0)
             return &apps->items[i];
     return NULL;
+}
+
+/* True if `needle` appears in `field` (a raw ';'-joined MimeType=/
+ * Categories= value) as a whole ';'-delimited token -- e.g. "audio/mp" must
+ * not match "audio/mpeg". Case-sensitive: both MIME types and Categories=
+ * tokens are conventionally lowercase/CamelCase-exact per the desktop-entry
+ * spec, and the caller-supplied needles in settings.c are written to match. */
+static bool field_has_token(const char *field, const char *needle)
+{
+    size_t nlen = strlen(needle);
+    if (!field[0] || nlen == 0)
+        return false;
+    const char *p = field;
+    while (*p) {
+        const char *sep = strchr(p, ';');
+        size_t toklen = sep ? (size_t)(sep - p) : strlen(p);
+        if (toklen == nlen && strncmp(p, needle, nlen) == 0)
+            return true;
+        if (!sep)
+            break;
+        p = sep + 1;
+    }
+    return false;
+}
+
+int dc_apps_find_by_mime(const dc_apps *apps, const char *mime, const dc_app **out, int max)
+{
+    if (!apps || !mime || max <= 0)
+        return 0;
+    int n = 0;
+    for (int i = 0; i < apps->count && n < max; i++)
+        if (field_has_token(apps->items[i].mimetypes, mime))
+            out[n++] = &apps->items[i];
+    return n;
+}
+
+int dc_apps_find_by_category(const dc_apps *apps, const char *category, const dc_app **out,
+                             int max)
+{
+    if (!apps || !category || max <= 0)
+        return 0;
+    int n = 0;
+    for (int i = 0; i < apps->count && n < max; i++)
+        if (field_has_token(apps->items[i].categories, category))
+            out[n++] = &apps->items[i];
+    return n;
 }
 
 /* Score `name` against the lowercased `q`. Higher is better; 0 = no match.
