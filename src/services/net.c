@@ -365,6 +365,24 @@ int dc_net_wifi_scan(dc_net_wifi_ap *out, int max)
     int n = g_scan.count < max ? g_scan.count : max;
     if (n > 0)
         memcpy(out, g_scan.aps, (size_t)n * sizeof(*out));
+
+    /* DANKC_WIFI_FAKE_AP=<ssid> (debug-only, env-gated -- same convention as
+     * services/battery.c's DANKC_FAKE_BATTERY): append one synthetic
+     * secured, not-yet-known, not-in-use AP so the inline password panel
+     * (W1.1) can be screenshotted on a machine whose real scan results don't
+     * happen to include an unknown secured network. No-op when unset. */
+    const char *fake_ssid = getenv("DANKC_WIFI_FAKE_AP");
+    if (fake_ssid && fake_ssid[0] && n < max) {
+        dc_net_wifi_ap *ap = &out[n];
+        memset(ap, 0, sizeof(*ap));
+        snprintf(ap->ssid, sizeof(ap->ssid), "%s", fake_ssid);
+        ap->signal_percent = 62;
+        ap->secured = true;
+        ap->in_use = false;
+        ap->known = false;
+        n++;
+    }
+
     return n;
 }
 
