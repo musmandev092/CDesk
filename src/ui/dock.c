@@ -273,6 +273,7 @@ static void dock_set_revealed(dc_dock *d, bool target)
     if (d->revealed == target)
         return;
     d->revealed = target;
+    dc_debug("dock: %s (hot-zone/hover-driven auto-hide)", target ? "revealing" : "hiding");
     dc_anim_start(&d->reveal_anim, DC_DUR_DOCK_SLIDE, DC_EASE_STANDARD);
     dock_apply_input_region(d);
     dock_render(d);
