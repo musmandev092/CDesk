@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,15 +12,218 @@
 #include <unistd.h>
 
 #include "core/log.h"
+#include "dc.h"
+#include "services/dbus.h"
+
+/* --- NetworkManager D-Bus subscription (docs/15-PERF-PLAN.md T2.2) --------
+ *
+ * Preferred SSID/signal source: subscribe once to the Wi-Fi device's (and
+ * its currently-active access point's) org.freedesktop.DBus.Properties
+ * PropertiesChanged signal on the system bus (services/dbus.c already pumps
+ * it on the event loop) and cache the last-known reading. No forking, no
+ * polling -- the cache only changes when NetworkManager emits a signal.
+ *
+ * Only a single Wi-Fi device is tracked (resolved once at dc_net_init()
+ * time) -- the common case of one built-in adapter. If NM has none, or the
+ * system bus is unavailable, dc_net_wifi() falls back to the nmcli-popen
+ * path below unconditionally.
+ */
+#define DC_NM_DEST "org.freedesktop.NetworkManager"
+#define DC_NM_DEVICE_IFACE "org.freedesktop.NetworkManager.Device"
+#define DC_NM_WIRELESS_IFACE "org.freedesktop.NetworkManager.Device.Wireless"
+#define DC_NM_AP_IFACE "org.freedesktop.NetworkManager.AccessPoint"
+#define DC_NM_DEVICE_TYPE_WIFI 2
+
+static struct {
+    sd_bus *bus;
+    bool have_wifi_device;
+    char device_path[128];
+
+    char ap_path[128];
+    bool connected;
+    char ssid[64];
+    int signal_percent; /* -1 if unknown */
+
+    sd_bus_slot *device_slot; /* PropertiesChanged on device_path (any iface) */
+    sd_bus_slot *ap_slot;     /* PropertiesChanged on ap_path (Ssid/Strength) */
+} g_nm = {.signal_percent = -1};
+
+/* Read the active access point's Ssid (ay -- raw bytes, not NUL-terminated)
+ * + Strength (y, 0-100) into the cache. Called once whenever g_nm.ap_path
+ * resolves to a new object (not on every signal -- PropertiesChanged doesn't
+ * repeat properties that haven't changed, so a plain re-Get is simpler and
+ * still just an IPC round trip, never a fork). */
+static void nm_read_ap_properties(void)
+{
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = NULL;
+    int r = sd_bus_get_property(g_nm.bus, DC_NM_DEST, g_nm.ap_path, DC_NM_AP_IFACE, "Ssid", &err,
+                                &reply, "ay");
+    if (r >= 0) {
+        const void *bytes = NULL;
+        size_t n = 0;
+        if (sd_bus_message_read_array(reply, 'y', &bytes, &n) >= 0 && bytes && n > 0) {
+            size_t copy = n < sizeof(g_nm.ssid) - 1 ? n : sizeof(g_nm.ssid) - 1;
+            memcpy(g_nm.ssid, bytes, copy);
+            g_nm.ssid[copy] = '\0';
+        } else {
+            g_nm.ssid[0] = '\0';
+        }
+    } else {
+        g_nm.ssid[0] = '\0';
+    }
+    sd_bus_error_free(&err);
+    sd_bus_message_unref(reply);
+
+    uint8_t strength = 0;
+    sd_bus_error err2 = SD_BUS_ERROR_NULL;
+    r = sd_bus_get_property_trivial(g_nm.bus, DC_NM_DEST, g_nm.ap_path, DC_NM_AP_IFACE, "Strength",
+                                    &err2, 'y', &strength);
+    sd_bus_error_free(&err2);
+    g_nm.signal_percent = r >= 0 ? (int)strength : -1;
+}
+
+static int on_ap_properties_changed(sd_bus_message *m, void *userdata, sd_bus_error *ret_error)
+{
+    DC_UNUSED(m);
+    DC_UNUSED(userdata);
+    DC_UNUSED(ret_error);
+    if (g_nm.ap_path[0])
+        nm_read_ap_properties();
+    return 0;
+}
+
+/* Re-read the Wi-Fi device's ActiveAccessPoint and, if it points at a new
+ * (or no) access point, re-subscribe the AP-level match and refresh the
+ * cached Ssid/Strength. Called once at init and whenever the device itself
+ * signals a property change (cheaper to just re-check than to parse which
+ * property changed out of the signal payload -- this is a rare event, not a
+ * per-frame one). */
+static void nm_resolve_ap_from_device(void)
+{
+    /* ActiveAccessPoint is an object-path property (signature "o"), *not*
+     * a string ("s") -- sd_bus_get_property_string() hardcodes "s" and
+     * fails outright on an "o" property, so this has to go through the
+     * generic sd_bus_get_property() + sd_bus_message_read_basic('o', ...)
+     * pair instead (same shape as nm_read_ap_properties()'s Ssid read). */
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = NULL;
+    int r = sd_bus_get_property(g_nm.bus, DC_NM_DEST, g_nm.device_path, DC_NM_WIRELESS_IFACE,
+                                "ActiveAccessPoint", &err, &reply, "o");
+    sd_bus_error_free(&err);
+
+    const char *ap_path = NULL;
+    if (r >= 0)
+        sd_bus_message_read_basic(reply, 'o', &ap_path);
+
+    bool have_ap = ap_path && ap_path[0] && strcmp(ap_path, "/") != 0;
+    if (!have_ap) {
+        sd_bus_message_unref(reply);
+        if (g_nm.ap_slot) {
+            sd_bus_slot_unref(g_nm.ap_slot);
+            g_nm.ap_slot = NULL;
+        }
+        g_nm.ap_path[0] = '\0';
+        g_nm.connected = false;
+        g_nm.ssid[0] = '\0';
+        g_nm.signal_percent = -1;
+        return;
+    }
+
+    if (strcmp(g_nm.ap_path, ap_path) != 0) {
+        snprintf(g_nm.ap_path, sizeof(g_nm.ap_path), "%s", ap_path);
+        if (g_nm.ap_slot) {
+            sd_bus_slot_unref(g_nm.ap_slot);
+            g_nm.ap_slot = NULL;
+        }
+        sd_bus_match_signal(g_nm.bus, &g_nm.ap_slot, DC_NM_DEST, g_nm.ap_path,
+                            "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                            on_ap_properties_changed, NULL);
+    }
+    sd_bus_message_unref(reply);
+
+    g_nm.connected = true;
+    nm_read_ap_properties();
+}
+
+static int on_device_properties_changed(sd_bus_message *m, void *userdata, sd_bus_error *ret_error)
+{
+    DC_UNUSED(m);
+    DC_UNUSED(userdata);
+    DC_UNUSED(ret_error);
+    nm_resolve_ap_from_device();
+    return 0;
+}
+
+/* GetDevices() + DeviceType property reads to find the first Wi-Fi device
+ * (NM_DEVICE_TYPE_WIFI == 2). A handful of small IPC round trips at startup
+ * only -- never repeated, never a fork. */
+static bool nm_find_wifi_device(char *out, size_t out_sz)
+{
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = NULL;
+    int r = sd_bus_call_method(g_nm.bus, DC_NM_DEST, "/org/freedesktop/NetworkManager", DC_NM_DEST,
+                               "GetDevices", &err, &reply, "");
+    sd_bus_error_free(&err);
+    if (r < 0)
+        return false;
+
+    bool found = false;
+    if (sd_bus_message_enter_container(reply, 'a', "o") >= 0) {
+        const char *dev_path = NULL;
+        while (!found && sd_bus_message_read_basic(reply, 'o', &dev_path) > 0) {
+            uint32_t dtype = 0;
+            sd_bus_error dt_err = SD_BUS_ERROR_NULL;
+            int dr = sd_bus_get_property_trivial(g_nm.bus, DC_NM_DEST, dev_path, DC_NM_DEVICE_IFACE,
+                                                 "DeviceType", &dt_err, 'u', &dtype);
+            sd_bus_error_free(&dt_err);
+            if (dr >= 0 && dtype == DC_NM_DEVICE_TYPE_WIFI) {
+                snprintf(out, out_sz, "%s", dev_path);
+                found = true;
+            }
+        }
+        sd_bus_message_exit_container(reply);
+    }
+    sd_bus_message_unref(reply);
+    return found;
+}
+
+void dc_net_init(struct dc_dbus *dbus)
+{
+    g_nm.bus = dbus ? dbus->system : NULL;
+    if (!g_nm.bus) {
+        dc_info("net: no system bus; wifi status will use the nmcli fallback");
+        return;
+    }
+
+    if (!nm_find_wifi_device(g_nm.device_path, sizeof(g_nm.device_path))) {
+        dc_info("net: no NetworkManager Wi-Fi device found; wifi status will use the nmcli "
+                "fallback");
+        g_nm.bus = NULL; /* dc_net_wifi() gates on g_nm.have_wifi_device, but be explicit */
+        return;
+    }
+    g_nm.have_wifi_device = true;
+
+    sd_bus_match_signal(g_nm.bus, &g_nm.device_slot, DC_NM_DEST, g_nm.device_path,
+                        "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                        on_device_properties_changed, NULL);
+    nm_resolve_ap_from_device();
+
+    dc_info("net: NetworkManager wifi device %s -- event-driven, no nmcli poll",
+            g_nm.device_path);
+}
 
 /* SSID/signal via `nmcli` (a fork+popen, same shell-out style already used by
  * services/audio.c for wpctl and controlcenter.c for rfkill/wpctl/
  * brightnessctl) -- cached briefly since `nmcli dev wifi list` is a slower
  * call than a sysfs read and dc_net_wifi() can be polled every render frame
- * during a popout's entrance animation. */
+ * during a popout's entrance animation.
+ *
+ * Fallback only: used when dc_net_init() couldn't subscribe to
+ * NetworkManager over D-Bus (no system bus, or NM has no Wi-Fi device). */
 #define DC_NET_WIFI_CACHE_SECONDS 3
 
-static void refresh_wifi_details(char *ssid, size_t ssid_sz, int *signal_percent)
+static void refresh_wifi_details_fallback(char *ssid, size_t ssid_sz, int *signal_percent)
 {
     static char cached_ssid[64];
     static int cached_signal = -1;
@@ -59,6 +263,26 @@ static void refresh_wifi_details(char *ssid, size_t ssid_sz, int *signal_percent
 
     snprintf(ssid, ssid_sz, "%s", cached_ssid);
     *signal_percent = cached_signal;
+}
+
+/* Preferred path: serve straight from the NetworkManager D-Bus cache
+ * (updated by PropertiesChanged signals, see above) -- zero forks. Falls
+ * back to the nmcli popen() path only if dc_net_init() never got a working
+ * NetworkManager Wi-Fi device. */
+static void refresh_wifi_details(char *ssid, size_t ssid_sz, int *signal_percent)
+{
+    if (g_nm.have_wifi_device) {
+        if (g_nm.connected && g_nm.ssid[0]) {
+            snprintf(ssid, ssid_sz, "%s", g_nm.ssid);
+            *signal_percent = g_nm.signal_percent;
+        } else {
+            ssid[0] = '\0';
+            *signal_percent = -1;
+        }
+        return;
+    }
+
+    refresh_wifi_details_fallback(ssid, ssid_sz, signal_percent);
 }
 
 /* No fork here (just a handful of sysfs opendir/fopen calls), but

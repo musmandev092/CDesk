@@ -1,6 +1,13 @@
-/* net.h — Wi-Fi link state from sysfs (no NetworkManager dependency yet).
+/* net.h — Wi-Fi link state: NetworkManager D-Bus (preferred) or sysfs/nmcli
+ * (fallback when NM isn't on the bus).
  *
- * A light stand-in until the NetworkManager sd-bus service lands (M3).
+ * docs/15-PERF-PLAN.md T2.2: the bar's SSID+signal readout used to fork
+ * `nmcli dev wifi list` on a timer (~20 forks/min at idle). dc_net_init()
+ * subscribes to org.freedesktop.NetworkManager PropertiesChanged on the
+ * system bus (services/dbus.c) instead, so the cache updates event-driven,
+ * off a signal, with zero forks. If the system bus or NetworkManager itself
+ * is unavailable, dc_net_wifi() transparently falls back to the original
+ * nmcli-popen path (still forks, but only then).
  */
 #ifndef DC_SERVICES_NET_H
 #define DC_SERVICES_NET_H
@@ -8,17 +15,27 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+struct dc_dbus;
+
 typedef struct dc_net_info {
     bool has_wifi;   /* a wl* interface exists */
     bool connected;  /* it is operationally up */
 
-    /* Only meaningful when `connected`; from `nmcli` (already present on any
-     * NetworkManager-managed system -- no new IPC mechanism introduced).
-     * `ssid` is empty and `signal_percent` is -1 if nmcli has nothing to
-     * report (not installed, or a non-NM Wi-Fi setup). */
+    /* Only meaningful when `connected`. Sourced from NetworkManager's D-Bus
+     * cache (dc_net_init()) when available; falls back to a briefly-cached
+     * `nmcli` popen() otherwise. `ssid` is empty and `signal_percent` is -1
+     * if neither source has anything to report. */
     char ssid[64];
     int signal_percent; /* 0-100, or -1 if unknown */
 } dc_net_info;
+
+/* Bind the system bus and subscribe to NetworkManager's Wi-Fi device +
+ * active-access-point PropertiesChanged signals (event-driven SSID/signal
+ * cache -- no forks). Call once at startup, same convention as
+ * dc_bluez_init()/dc_power_init(). Safe no-op (dc_net_wifi() falls back to
+ * nmcli) if `dbus` is NULL, the system bus is unavailable, or no
+ * NetworkManager Wi-Fi device is found. */
+void dc_net_init(struct dc_dbus *dbus);
 
 /* Fill `out` from /sys/class/net. Returns true if a Wi-Fi interface exists. */
 bool dc_net_wifi(dc_net_info *out);
