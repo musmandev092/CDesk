@@ -9,6 +9,7 @@
 #include "services/notifications.h"
 #include "theme/theme.h"
 #include "ui/hover.h"
+#include "ui/material_bg.h"
 #include "ui/notif_image.h"
 #include "ui/popout.h"
 #include "wayland/egl.h"
@@ -568,10 +569,9 @@ static void nc_render(dc_notif_center *nc)
     nvgFillPaint(vg, shadow);
     nvgFill(vg);
 
-    nvgBeginPath(vg);
-    nvgRoundedRect(vg, pad, pad, w - 2 * pad, h - 2 * pad, DC_NC_RADIUS);
-    nvgFillColor(vg, tc(t->surface_container));
-    nvgFill(vg);
+    /* Card: blurred+dimmed wallpaper ("material" bg) when enabled, else the
+     * flat surfaceContainer fill (docs/POLISH.md P2, ui/material_bg.c). */
+    dc_material_bg_fill_card(vg, nc->render, pad, pad, w - 2 * pad, h - 2 * pad, DC_NC_RADIUS);
     nvgStrokeColor(vg, tc_alpha(t->outline, 40));
     nvgStrokeWidth(vg, 1.0f);
     nvgStroke(vg);

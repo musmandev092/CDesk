@@ -11,6 +11,7 @@
 #include "services/weather.h"
 #include "theme/theme.h"
 #include "ui/bar/bar_tokens.h"
+#include "ui/material_bg.h"
 #include "ui/popout.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
@@ -1411,6 +1412,7 @@ static void wall_set_active(dc_dashboard *d, const dc_wall_entry *e)
         return;
     snprintf(cfg->wallpaper, sizeof(cfg->wallpaper), "%s", e->path);
     dc_config_reapply(); /* stock theme + dynamic-color overlay when enabled */
+    dc_material_bg_invalidate(); /* new wallpaper -> panels' blurred bg regenerates lazily */
     if (!getenv("DANKC_WALL_DRY")) {
         dc_config_save();
         wall_apply_compositor(e->path);
@@ -1625,12 +1627,9 @@ static void dash_render(dc_dashboard *d)
     nvgFillPaint(vg, shadow);
     nvgFill(vg);
 
-    /* Opaque surfaceContainer card. */
-    nvgBeginPath(vg);
-    nvgRoundedRect(vg, pad, pad, w - 2 * pad, h - 2 * pad, 12.0f);
-    nvgFillColor(vg, nvgRGBA(t->surface_container.r, t->surface_container.g, t->surface_container.b,
-                             255));
-    nvgFill(vg);
+    /* Card: blurred+dimmed wallpaper ("material" bg) when enabled, else the
+     * flat surfaceContainer fill (docs/POLISH.md P2, ui/material_bg.c). */
+    dc_material_bg_fill_card(vg, d->render, pad, pad, w - 2 * pad, h - 2 * pad, 12.0f);
     nvgStrokeColor(vg, tc_alpha(t->outline, 40));
     nvgStrokeWidth(vg, 1.0f);
     nvgStroke(vg);

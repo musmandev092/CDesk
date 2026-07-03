@@ -69,6 +69,20 @@ typedef struct dc_config {
     /* launcher (docs/08-SETTINGS-UI.md DOCK & LAUNCHER): default view mode
      * used when the launcher (re)opens -- list (false) or grid (true). */
     bool launcher_grid_view;
+
+    /* Frame: rounded screen corners overlay (docs/POLISH.md P2, ui/frame.c).
+     * DMS's frameEnabled defaults to false (SettingsData.qml); frame_radius
+     * defaults to the base cornerRadius design token (docs/10-DESIGN-SYSTEM.md
+     * sec.1 = 12), not DMS's separate frameRounding=23 (that belongs to the
+     * full connected-chrome Frame system, which dankc doesn't implement). */
+    bool frame_enabled;
+    float frame_radius;
+
+    /* Material background: blurred+dimmed wallpaper behind panel cards
+     * instead of a flat surfaceContainer fill (docs/POLISH.md P2,
+     * ui/material_bg.c). Falls back to the flat fill when disabled or when
+     * no wallpaper is configured/readable. */
+    bool material_blur;
 } dc_config;
 
 /* The active config. Read-only for the rest of the app. */

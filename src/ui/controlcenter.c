@@ -13,6 +13,7 @@
 #include "theme/theme.h"
 #include "ui/bar/bar_tokens.h"
 #include "ui/hover.h"
+#include "ui/material_bg.h"
 #include "ui/popout.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
@@ -1124,14 +1125,12 @@ static void cc_render(dc_control_center *cc)
     nvgFillPaint(vg, shadow);
     nvgFill(vg);
 
-    /* Card. No separate "Control Center" title -- the reference screenshot
-     * goes straight from the card edge into the user header card
+    /* Card: blurred+dimmed wallpaper ("material" bg) when enabled, else the
+     * flat surfaceContainer fill (docs/POLISH.md P2, ui/material_bg.c). No
+     * separate "Control Center" title -- the reference screenshot goes
+     * straight from the card edge into the user header card
      * (docs/13-POPOUTS-SPEC.md sec.1). */
-    nvgBeginPath(vg);
-    nvgRoundedRect(vg, pad, pad, w - 2 * pad, h - 2 * pad, 12.0f);
-    nvgFillColor(vg, nvgRGBA(t->surface_container.r, t->surface_container.g, t->surface_container.b,
-                             255));
-    nvgFill(vg);
+    dc_material_bg_fill_card(vg, cc->render, pad, pad, w - 2 * pad, h - 2 * pad, 12.0f);
     nvgStrokeColor(vg, nvgRGBA(t->outline.r, t->outline.g, t->outline.b, 40));
     nvgStrokeWidth(vg, 1.0f);
     nvgStroke(vg);
