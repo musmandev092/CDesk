@@ -479,8 +479,12 @@ static float cc_expand_row_y(const cc_layout *l, int i)
 /* Reserved on the trailing edge of every slider track for its live "NN%"
  * label (docs/13-POPOUTS-SPEC.md sec.1 item 3) -- shared by draw_slider()
  * and cc_slider_track() so the label never overlaps the fill and drag
- * hit-testing still maps a pointer x to the same fraction the fill shows. */
-#define CC_SLIDER_LABEL_W 32.0f
+ * hit-testing still maps a pointer x to the same fraction the fill shows.
+ * Must fit the widest label ("100%" at 12px Inter, ~30px) plus an 8px
+ * (spacing-XS token) gap after the track's rounded end -- 32px left ~2px,
+ * so "100%" visibly collided with the fill/track end. 44px gives the full
+ * 8px gap at 100% with room to spare. */
+#define CC_SLIDER_LABEL_W 44.0f
 
 /* Track geometry for slider `slot` (0=volume, 1=brightness) — the fill/track
  * inset (32px, past the leading icon) is shared by draw_slider(), the click
