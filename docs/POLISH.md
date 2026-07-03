@@ -79,15 +79,45 @@ Reference DMS live (it's running): read its QML at
   fade, exit anims already done for popouts/OSD. Engine is core/anim.c
   (durations+easing done). Mostly needs frame-callback driving on the bar.
 
-## P7 — Performance
-- **Partial redraw / damage tracking**: bar re-renders fully every 1 Hz. Only
-  redraw on real change; clock could tick per-minute + on second only if seconds
-  shown. Files: ui/bar/bar.c, main.c clock_tick.
-- **Reduce polling**: audio (wpctl fork/sec) -> libpipewire or longer cache;
-  bluez/net cache tuning. Files: services/audio.c, net.c, bluez.c.
-- **Lazy EGL** for panels (already create-on-show). Verify no idle GPU work.
-- **Measure**: RSS ~145MB (Mesa-heavy) vs DMS 477MB; profile GPU/CPU with the
-  panels open; target <1% idle CPU, no wakeups when nothing changes.
+## P7 — Performance — DONE 2026-07-03 (wt/perf, items 1-4 below)
+- ~~**Partial redraw / damage tracking**~~ ✅ `dc_bar_render()` (ui/bar/bar.c)
+  now hashes everything that can change the bar's pixels (clock text,
+  workspaces/focused window, media, weather, cpu/mem, battery, controlCenter's
+  net/bluetooth/audio state, notification unread dot, tray, hover) before
+  touching EGL/GL and skips the whole frame when it's unchanged and no
+  frame-callback animation (workspace morph / media marquee) is in flight.
+  Measured (2-output idle bar, 60s window): 117 tick calls -> only 24-34
+  actual GL frames drawn (66-79% skipped); the rest were legitimate
+  cpu/mem-widget redraws from background load on the dev machine during
+  measurement, not idle noise. `DANKC_RENDER_STATS=1` logs drawn/skipped
+  counts every 60s for future verification.
+- ~~**Reduce polling**~~ ✅ audio.c's wpctl cache widened from an effective
+  ~1s to a real 3s window (measured: 45 -> 14 wpctl forks per 32s, ~69%
+  fewer) — libpipewire stays out of scope per this pass. net.c's sysfs
+  link-state scan got a small 2s cache too (its nmcli-backed SSID lookup was
+  already 3s-cached). bluez.c (3s), sysmon.c (3s cpu/mem, 2s process-scan
+  gated behind the Processes popout), and weather.c (15min/2min retry) were
+  already well-paced — no changes needed. Trade-off: external volume-change
+  detection latency is now up to 3s worst-case (own-slider/OSD writes still
+  invalidate the cache immediately, so those stay instant).
+- ~~**Font subsetting**~~ ✅ assets/fonts/MaterialSymbolsRounded.ttf (14.5MB
+  full variable font) is pyftsubset'd to the exact 73 codepoints
+  render/icons.h's DC_ICON_* actually use ->
+  MaterialSymbolsRounded.subset.ttf (244KB, ~98% smaller), which is what
+  render/nvg.c now loads and meson.build now installs; the full font stays
+  in the repo only as the regeneration source for scripts/subset-fonts.sh
+  (re-run it whenever a new DC_ICON_ is added). Verified via screenshot: every
+  icon in the bar and the Control Center popout renders correctly, no tofu.
+- **Lazy EGL** for panels: already create-on-show (unchanged this pass; not
+  re-verified beyond the idle-bar RSS/CPU numbers below).
+- ~~**Measure**~~ ✅ final combined numbers (2-output idle bar, no panels,
+  live niri session): RSS 173920KB (~170MB, actually *below* the earlier
+  ~188MB pre-P7 measurement — mostly the font subset's smaller glyph-cache
+  footprint), Pss 77MB / Private 39MB via smaps_rollup. Idle CPU stayed in
+  the 0.2-0.3% band before and after (already near the measurement noise
+  floor at this sample size on an otherwise-idle-ish dev machine). For
+  contrast, the user's live DMS `qs` process measured Pss 595MB / Private
+  521MB / VmRSS 803MB at the same time (read-only comparison, not touched).
 
 ## How to verify UI against DMS
 1. Run only dankc (stop DMS) to avoid two top-bars fighting the layer:

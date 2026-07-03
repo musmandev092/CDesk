@@ -104,7 +104,12 @@ executable('dankc',
   install: true,
 )
 
+# docs/POLISH.md P7 item 3: install the pyftsubset'd icon font (~248KB,
+# covers exactly render/icons.h's DC_ICON_* codepoints), not the 14.5MB full
+# variable font it's generated from — that one stays repo-only as the
+# regeneration source for scripts/subset-fonts.sh, see render/nvg.c's
+# ICON_FONT_CANDIDATES comment.
 install_data('assets/fonts/InterVariable.ttf',
-             'assets/fonts/MaterialSymbolsRounded.ttf',
+             'assets/fonts/MaterialSymbolsRounded.subset.ttf',
              'assets/fonts/NotoEmoji-Regular.ttf',
              install_dir: get_option('datadir') / 'dankc/fonts')

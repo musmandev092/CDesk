@@ -1,20 +1,34 @@
 #include "services/audio.h"
 
+#include "core/log.h"
+
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 
-/* wpctl forks a process, so cache within the same second (the bar redraws every
- * second, sometimes for multiple outputs). */
+/* wpctl forks a process, so cache it (docs/POLISH.md P7 item 2). The bar's
+ * damage-tracking hash (ui/bar/bar.c bar_compute_signature()) now reads this
+ * every ~1Hz tick per bar just to check for a volume change, on top of the
+ * 1Hz clock_tick's own OSD-change read and the control-center-pill's draw
+ * read — so without a real cache window this would fork on nearly every tick
+ * across 2+ bars. 3s (not libpipewire — out of scope for this pass) matches
+ * bluez.c's/net.c's cache window; dc_audio_set_volume() below still
+ * invalidates the cache immediately so a user's own slider drag/OSD reflects
+ * instantly, and worst-case external-volume-change detection latency (e.g.
+ * media keys, another app) becomes up to 3s instead of up to 1s — acceptable
+ * per docs/POLISH.md P7 ("2-3s worst-case is fine"). */
+#define DC_AUDIO_CACHE_SECONDS 3
+
 static dc_audio_info g_cache;
 static bool g_cache_ok = false;
 static time_t g_cache_time = 0;
+static bool g_cache_valid = false;
 
 bool dc_audio_read(dc_audio_info *out)
 {
     time_t now = time(NULL);
-    if (g_cache_time == now) {
+    if (g_cache_valid && now - g_cache_time < DC_AUDIO_CACHE_SECONDS) {
         *out = g_cache;
         return g_cache_ok;
     }
@@ -23,6 +37,7 @@ bool dc_audio_read(dc_audio_info *out)
     out->volume = 0;
     out->muted = false;
 
+    dc_debug("audio: forking wpctl get-volume (cache miss)");
     FILE *pipe = popen("wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null", "r");
     if (!pipe)
         return false;
@@ -44,6 +59,7 @@ bool dc_audio_read(dc_audio_info *out)
     g_cache = *out;
     g_cache_ok = ok;
     g_cache_time = now;
+    g_cache_valid = true;
     return ok;
 }
 
@@ -65,6 +81,6 @@ void dc_audio_set_volume(int percent)
     }
     /* Invalidate the read cache so a drag's own writes are reflected on the
      * very next dc_audio_read() (the slider's fill needs to track the
-     * pointer immediately, not up to a second later). */
-    g_cache_time = 0;
+     * pointer immediately, not up to DC_AUDIO_CACHE_SECONDS later). */
+    g_cache_valid = false;
 }

@@ -229,6 +229,20 @@ struct dc_bar {
     int phys_width; /* buffer size = logical * scale120 / 120 */
     int phys_height;
 
+    /* Damage tracking (docs/POLISH.md P7): a cheap hash of everything that
+     * could change this bar's on-screen pixels (clock text, workspace/
+     * focused-window/media/weather/sysmon/battery/net/bluetooth/audio/
+     * notification/tray state, hover). dc_bar_render() recomputes it every
+     * call and skips the whole GL frame (no EGL make-current, no glClear, no
+     * nvgBeginFrame/EndFrame, no swap) when it matches the last real render
+     * AND no frame-callback-driven animation (workspace morph / media
+     * marquee) is in flight. Geometry-affecting callers (layer-surface
+     * configure, fractional-scale change, config/theme reconfigure) set
+     * last_sig_valid=false first to force a real render, since geometry
+     * itself isn't part of the hash. */
+    uint64_t last_sig;
+    bool last_sig_valid;
+
     /* The floating bar rect within the (larger, mostly transparent)
      * layer-surface buffer — see bar_compute_geometry() and
      * recompute_content_rect(). Widgets draw relative to this rect, not the
@@ -1971,10 +1985,204 @@ static void draw_hover_overlay(dc_bar *bar)
     nvgFill(vg);
 }
 
+/* --- damage tracking: cheap content-state hash (docs/POLISH.md P7) -------- */
+
+/* FNV-1a, folded byte-at-a-time — plenty for a same-process "did anything
+ * visible change" comparison, not a cryptographic hash. */
+static uint64_t sig_mix(uint64_t h, const void *data, size_t len)
+{
+    const unsigned char *p = data;
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 1099511628211ULL; /* FNV prime */
+    }
+    return h;
+}
+
+static inline uint64_t sig_u64(uint64_t h, uint64_t v)
+{
+    return sig_mix(h, &v, sizeof(v));
+}
+
+static inline uint64_t sig_str(uint64_t h, const char *s)
+{
+    return s ? sig_mix(h, s, strlen(s)) : sig_mix(h, "", 1);
+}
+
+/* Whether DANKC_RENDER_STATS=1 is set, cached after the first check. */
+static bool render_stats_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+        cached = getenv("DANKC_RENDER_STATS") ? 1 : 0;
+    return cached == 1;
+}
+
+/* Env-gated render-count logging (docs/POLISH.md P7 verification): every 60s,
+ * log how many dc_bar_render() calls actually did GL work vs. were skipped
+ * by the damage check. Process-wide (all bars share one window), not
+ * per-bar — simplest thing that answers "did the idle-minute redraw count
+ * actually drop". */
+static void render_stats_tick(bool rendered)
+{
+    if (!render_stats_enabled())
+        return;
+
+    static uint64_t total = 0, drawn = 0;
+    static time_t window_start = 0;
+
+    time_t now = time(NULL);
+    if (window_start == 0)
+        window_start = now;
+
+    total++;
+    if (rendered)
+        drawn++;
+
+    if (now - window_start >= 60) {
+        dc_info("render-stats: %llu calls, %llu drawn, %llu skipped in %llds",
+                (unsigned long long)total, (unsigned long long)drawn,
+                (unsigned long long)(total - drawn), (long long)(now - window_start));
+        total = 0;
+        drawn = 0;
+        window_start = now;
+    }
+}
+
+/* Hash of every piece of state that can change this bar's pixels this frame
+ * (docs/POLISH.md P7 item 1): clock text, this output's workspaces +
+ * focused window, media title/artist/playing, weather, cpu/mem, battery,
+ * the controlCenterButton's net/bluetooth/audio sub-icons, notification
+ * unread dot, tray items, and hover. Deliberately excludes anything
+ * continuously time-driven (marquee scroll offset, workspace-morph
+ * progress) — those are handled by the anim_in_flight bypass in
+ * dc_bar_render() instead, so this hash can stay stable across an
+ * animating frame without starving it. Calls the same cached/self-limiting
+ * service reads the draw pass itself uses (wpctl/nmcli/bluez already cache
+ * for 1-3s; sysmon self-limits to 3s), so this costs no new forks — just
+ * cheap struct reads/string compares, once per bar per tick. */
+static uint64_t bar_compute_signature(dc_bar *bar)
+{
+    const dc_config *cfg = dc_config_current;
+    uint64_t h = 1469598103934665603ULL; /* FNV-1a offset basis */
+
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    char time_str[16];
+    const char *time_fmt = cfg->clock_24h ? (cfg->show_seconds ? "%H:%M:%S" : "%H:%M")
+                                           : (cfg->show_seconds ? "%-I:%M:%S %p" : "%-I:%M %p");
+    strftime(time_str, sizeof(time_str), time_fmt, &tm);
+    h = sig_str(h, time_str);
+    if (cfg->show_date) {
+        char date_str[32];
+        strftime(date_str, sizeof(date_str), "%a %-d", &tm);
+        h = sig_str(h, date_str);
+    }
+
+    int wcount = 0;
+    const dc_niri_workspace *workspaces = bar->niri ? dc_niri_workspaces(bar->niri, &wcount) : NULL;
+    for (int i = 0; i < wcount; i++) {
+        const dc_niri_workspace *ws = &workspaces[i];
+        if (bar->output->name && ws->output[0] && strcmp(ws->output, bar->output->name) != 0)
+            continue;
+        h = sig_u64(h, ws->id);
+        h = sig_u64(h, ws->idx);
+        h = sig_u64(h, ws->is_active);
+        h = sig_u64(h, ws->is_urgent);
+    }
+
+    const dc_niri_window *win = bar->niri ? dc_niri_focused_window(bar->niri) : NULL;
+    if (win && focused_window_on_output(bar, win)) {
+        h = sig_str(h, win->title);
+        h = sig_str(h, win->app_id);
+    } else {
+        h = sig_u64(h, 0);
+    }
+
+    dc_mpris_info mpris;
+    if (dc_mpris_read(&mpris) && mpris.active) {
+        h = sig_u64(h, 1);
+        h = sig_u64(h, mpris.playing);
+        h = sig_str(h, mpris.title);
+        h = sig_str(h, mpris.artist);
+    } else {
+        h = sig_u64(h, 0);
+    }
+
+    dc_weather_state w;
+    if (dc_weather_get(&w) && w.valid) {
+        h = sig_u64(h, 1);
+        h = sig_u64(h, (uint64_t)w.temp_c);
+        h = sig_u64(h, (uint64_t)w.weather_code);
+        h = sig_u64(h, w.is_day);
+    } else {
+        h = sig_u64(h, 0);
+    }
+
+    h = sig_u64(h, (uint64_t)dc_sysmon_cpu_percent());
+    h = sig_u64(h, (uint64_t)dc_sysmon_mem_percent());
+
+    dc_battery_info bat;
+    if (dc_battery_read(&bat) && bat.present) {
+        h = sig_u64(h, 1);
+        h = sig_u64(h, (uint64_t)bat.percent);
+        h = sig_u64(h, bat.charging);
+        h = sig_u64(h, bar_ac_online());
+    } else {
+        h = sig_u64(h, 0);
+    }
+
+    dc_net_info net;
+    dc_net_wifi(&net);
+    h = sig_u64(h, net.connected);
+    h = sig_str(h, net.ssid);
+
+    dc_bluez_info bt;
+    dc_bluez_read(&bt);
+    h = sig_u64(h, bt.connected);
+
+    dc_audio_info audio;
+    bool have_audio = dc_audio_read(&audio);
+    h = sig_u64(h, have_audio);
+    h = sig_u64(h, (uint64_t)audio.volume);
+    h = sig_u64(h, audio.muted);
+
+    h = sig_u64(h, dc_notifications_has_unread(bar->notifications));
+
+    if (bar->tray) {
+        const dc_tray_item *items[DC_TRAY_MAX];
+        int n = dc_tray_items(bar->tray, items, DC_TRAY_MAX);
+        h = sig_u64(h, (uint64_t)n);
+        for (int i = 0; i < n; i++) {
+            h = sig_str(h, items[i]->service);
+            h = sig_str(h, items[i]->icon_name);
+            h = sig_str(h, items[i]->title);
+        }
+    }
+
+    h = sig_u64(h, (uint64_t)bar->hover_region);
+    h = sig_u64(h, (uint64_t)bar->hover_payload);
+
+    return h;
+}
+
 void dc_bar_render(dc_bar *bar)
 {
     if (!bar->configured || bar->phys_width <= 0)
         return;
+
+    /* Damage check (docs/POLISH.md P7 item 1): skip the entire GL frame when
+     * nothing visible changed since the last real render and no frame-
+     * callback animation needs the next frame drawn regardless. */
+    uint64_t sig = bar_compute_signature(bar);
+    bool anim_in_flight = dc_anim_active(&bar->ws_anim) || bar->media_marquee_active;
+    bool skip = bar->last_sig_valid && !anim_in_flight && sig == bar->last_sig;
+    render_stats_tick(!skip);
+    if (skip)
+        return;
+    bar->last_sig = sig;
+    bar->last_sig_valid = true;
 
     if (!bar->egl_ready) {
         if (!dc_egl_window_init(&bar->egl_window, bar->egl, bar->surface, bar->phys_width,
@@ -2060,6 +2268,9 @@ static void fractional_scale_handle_preferred(void *data, struct wp_fractional_s
     dc_debug("bar scale on %s: %.3gx", bar->output->name ? bar->output->name : "?",
              (double)scale / DC_SCALE_BASE);
     recompute_physical(bar);
+    /* Geometry isn't part of the damage-tracking hash (docs/POLISH.md P7) —
+     * force a real render so the buffer actually gets resized/repainted. */
+    bar->last_sig_valid = false;
     dc_bar_render(bar);
 }
 
@@ -2086,6 +2297,9 @@ static void layer_surface_handle_configure(void *data, struct zwlr_layer_surface
              bar->logical_width, bar->logical_height, bar->phys_width, bar->phys_height,
              bar->rect_w, bar->rect_h, bar->rect_x, bar->rect_y,
              bar->output->model ? bar->output->model : "?");
+    /* Geometry isn't part of the damage-tracking hash (docs/POLISH.md P7) —
+     * force a real render so the buffer actually gets resized/repainted. */
+    bar->last_sig_valid = false;
     dc_bar_render(bar);
 }
 
@@ -2188,6 +2402,9 @@ void dc_bar_reconfigure(dc_bar *bar)
      * configure ack will do it again harmlessly. */
     recompute_physical(bar);
     recompute_content_rect(bar);
+    /* Geometry/theme reconfigure isn't part of the damage-tracking hash
+     * (docs/POLISH.md P7) — force a real render. */
+    bar->last_sig_valid = false;
     dc_bar_render(bar);
 }
 

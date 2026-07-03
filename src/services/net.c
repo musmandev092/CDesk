@@ -61,8 +61,26 @@ static void refresh_wifi_details(char *ssid, size_t ssid_sz, int *signal_percent
     *signal_percent = cached_signal;
 }
 
+/* No fork here (just a handful of sysfs opendir/fopen calls), but
+ * docs/POLISH.md P7 item 2 still caches it briefly: the bar's damage-
+ * tracking hash (ui/bar/bar.c bar_compute_signature()) now calls this once
+ * per bar per ~1Hz tick on top of the control-center-pill's own draw-time
+ * call, and link-up/down state doesn't need sub-2s freshness. */
+#define DC_NET_LINK_CACHE_SECONDS 2
+
 bool dc_net_wifi(dc_net_info *out)
 {
+    static dc_net_info cached;
+    static bool cached_has_wifi;
+    static time_t cache_time;
+    static bool cache_valid = false;
+
+    time_t now = time(NULL);
+    if (cache_valid && now - cache_time < DC_NET_LINK_CACHE_SECONDS) {
+        *out = cached;
+        return cached_has_wifi;
+    }
+
     out->has_wifi = false;
     out->connected = false;
     out->ssid[0] = '\0';
@@ -97,6 +115,10 @@ bool dc_net_wifi(dc_net_info *out)
     if (out->connected)
         refresh_wifi_details(out->ssid, sizeof(out->ssid), &out->signal_percent);
 
+    cached = *out;
+    cached_has_wifi = out->has_wifi;
+    cache_time = now;
+    cache_valid = true;
     return out->has_wifi;
 }
 
