@@ -148,13 +148,6 @@ typedef struct dc_config {
      * the dashboard calendar grid (0=Sunday .. 6=Saturday, matching struct
      * tm's tm_wday numbering used by ui/dashboard.c's draw_calendar_card()). */
     int first_day_of_week;
-
-    /* Theme & Colors (docs/14-COMPLETION-PLAN.md W2 "Theme & Colors deep
-     * tab"): light/dark mode preference. UI-only for now -- dankc's theme
-     * engine (under src/theme) is dark-only; a separate agent owns adding
-     * real light-theme variants and will consume this key. Defaults "dark"
-     * so nothing changes visually until that lands. */
-    char theme_mode[8];
 } dc_config;
 
 /* The active config. Read-only for the rest of the app. */

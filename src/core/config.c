@@ -81,8 +81,6 @@ static dc_config config = {
     .font_scale = 1.0f,
 
     .first_day_of_week = 0, /* Sunday, matches dashboard.c's prior hardcoded dow[] order */
-
-    .theme_mode = "dark",
 };
 
 const dc_config *dc_config_current = &config;
@@ -346,7 +344,6 @@ void dc_config_load(void)
     get_int(root, "osdTimeoutMs", &config.osd_timeout_ms, 500, 10000);
     get_float(root, "fontScale", &config.font_scale, 0.8f, 1.5f);
     get_int(root, "firstDayOfWeek", &config.first_day_of_week, 0, 6);
-    get_string(root, "themeMode", config.theme_mode, sizeof(config.theme_mode));
     cJSON_Delete(root);
 
     apply_theme();
@@ -464,7 +461,6 @@ void dc_config_save(void)
     cJSON_AddNumberToObject(root, "osdTimeoutMs", config.osd_timeout_ms);
     cJSON_AddNumberToObject(root, "fontScale", (double)config.font_scale);
     cJSON_AddNumberToObject(root, "firstDayOfWeek", config.first_day_of_week);
-    cJSON_AddStringToObject(root, "themeMode", config.theme_mode);
 
     char *text = cJSON_Print(root);
     cJSON_Delete(root);
