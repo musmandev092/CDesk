@@ -899,6 +899,18 @@ int main(int argc, char **argv)
         dc_notifications_seed_demo(notifications);
         dc_notif_center_toggle(notif_center, first);
     }
+    if (getenv("DANKC_TRAY_MENU_DEMO")) {
+        dc_output *first = NULL;
+        wl_list_for_each(first, &wl->outputs, link) {
+            break;
+        }
+        /* Exercises the real AboutToShow+GetLayout fetch + popup against
+         * whatever tray item(s) the live StatusNotifierWatcher currently has
+         * (docs/POLISH.md P4 verification) without needing pointer-input
+         * synthesis to right-click a specific bar pixel. Index 0 -- the
+         * demo assumes at least one item is registered. */
+        dc_tray_menu_open(tray_menu, first, 0, 0, 0);
+    }
 
     dc_info("entering event loop (%d bar%s)", set.count, set.count == 1 ? "" : "s");
     dc_loop_run(g_loop);

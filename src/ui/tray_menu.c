@@ -232,7 +232,7 @@ static int tm_fetch_layout(dc_tray_menu *m, const char *service, const char *pat
         DC_UNUSED(root_id);
         if (sd_bus_message_enter_container(reply, 'a', "{sv}") > 0) {
             while (sd_bus_message_enter_container(reply, 'e', "sv") > 0) {
-                sd_bus_message_skip(reply, "v");
+                sd_bus_message_skip(reply, "sv"); /* key (s) + value (v) -- not just the value */
                 sd_bus_message_exit_container(reply);
             }
             sd_bus_message_exit_container(reply);
