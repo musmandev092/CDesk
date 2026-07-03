@@ -128,7 +128,7 @@ src = files(
   'src/services/dbus.c', 'src/services/bluez.c', 'src/services/mpris.c',
   'src/services/icons.c', 'src/services/apps.c', 'src/services/notifications.c',
   'src/services/clipboard.c', 'src/services/tray.c', 'src/services/auth.c', 'src/services/logind.c',
-  'src/services/weather.c', 'src/services/sysmon.c', 'src/services/power.c',
+  'src/services/weather.c', 'src/services/sysmon.c', 'src/services/power.c', 'src/services/printers.c',
   'src/services/display.c',
   'src/services/autostart.c',
   'src/services/sound.c', 'src/services/polkit.c',
