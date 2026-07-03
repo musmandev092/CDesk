@@ -81,11 +81,20 @@ static void scan_objects(dc_bluez_info *info)
          * folded into info->devices[] once the object is fully read (a
          * device's Name/Alias/Paired/Connected properties are all on the
          * single org.bluez.Device1 interface, but reading them incrementally
-         * as they stream by is simplest). */
+         * as they stream by is simplest). org.bluez.Battery1 is a *separate*
+         * interface BlueZ auto-adds to the same object path once it can
+         * decode battery level from the connected profile (HID/HFP/some LE),
+         * so its Percentage is folded in here too rather than requiring a
+         * second GetManagedObjects pass. */
         bool is_device_obj = false;
-        bool dev_paired = false, dev_connected = false;
+        bool dev_paired = false, dev_connected = false, dev_trusted = false;
+        bool dev_has_battery = false;
+        int dev_battery = -1;
         char dev_name[64] = {0};
         char dev_alias[64] = {0};
+        char dev_icon[32] = {0};
+        uint32_t dev_class = 0;
+        uint16_t dev_appearance = 0;
 
         if (sd_bus_message_enter_container(reply, 'a', "{sa{sv}}") < 0) {
             sd_bus_message_exit_container(reply);
@@ -97,12 +106,13 @@ static void scan_objects(dc_bluez_info *info)
 
             bool is_device = iface && strcmp(iface, "org.bluez.Device1") == 0;
             bool is_adapter = iface && strcmp(iface, "org.bluez.Adapter1") == 0;
+            bool is_battery = iface && strcmp(iface, "org.bluez.Battery1") == 0;
             if (is_device)
                 is_device_obj = true;
             if (is_adapter && path)
                 snprintf(g_adapter_path, sizeof(g_adapter_path), "%s", path);
 
-            if (is_device || is_adapter) {
+            if (is_device || is_adapter || is_battery) {
                 sd_bus_message_enter_container(reply, 'a', "{sv}");
                 while (sd_bus_message_enter_container(reply, 'e', "sv") > 0) {
                     const char *prop = NULL;
@@ -122,6 +132,12 @@ static void scan_objects(dc_bluez_info *info)
                         sd_bus_message_read_basic(reply, 'b', &paired);
                         sd_bus_message_exit_container(reply);
                         dev_paired = paired != 0;
+                    } else if (is_device && prop && strcmp(prop, "Trusted") == 0) {
+                        int trusted = 0;
+                        sd_bus_message_enter_container(reply, 'v', "b");
+                        sd_bus_message_read_basic(reply, 'b', &trusted);
+                        sd_bus_message_exit_container(reply);
+                        dev_trusted = trusted != 0;
                     } else if (is_device && prop && strcmp(prop, "Name") == 0) {
                         const char *val = NULL;
                         sd_bus_message_enter_container(reply, 'v', "s");
@@ -136,6 +152,32 @@ static void scan_objects(dc_bluez_info *info)
                         sd_bus_message_exit_container(reply);
                         if (val)
                             snprintf(dev_alias, sizeof(dev_alias), "%s", val);
+                    } else if (is_device && prop && strcmp(prop, "Icon") == 0) {
+                        const char *val = NULL;
+                        sd_bus_message_enter_container(reply, 'v', "s");
+                        sd_bus_message_read_basic(reply, 's', &val);
+                        sd_bus_message_exit_container(reply);
+                        if (val)
+                            snprintf(dev_icon, sizeof(dev_icon), "%s", val);
+                    } else if (is_device && prop && strcmp(prop, "Class") == 0) {
+                        uint32_t val = 0;
+                        sd_bus_message_enter_container(reply, 'v', "u");
+                        sd_bus_message_read_basic(reply, 'u', &val);
+                        sd_bus_message_exit_container(reply);
+                        dev_class = val;
+                    } else if (is_device && prop && strcmp(prop, "Appearance") == 0) {
+                        uint16_t val = 0;
+                        sd_bus_message_enter_container(reply, 'v', "q");
+                        sd_bus_message_read_basic(reply, 'q', &val);
+                        sd_bus_message_exit_container(reply);
+                        dev_appearance = val;
+                    } else if (is_battery && prop && strcmp(prop, "Percentage") == 0) {
+                        uint8_t val = 0;
+                        sd_bus_message_enter_container(reply, 'v', "y");
+                        sd_bus_message_read_basic(reply, 'y', &val);
+                        sd_bus_message_exit_container(reply);
+                        dev_has_battery = true;
+                        dev_battery = val;
                     } else if (is_adapter && prop && strcmp(prop, "Powered") == 0) {
                         int powered = 0;
                         sd_bus_message_enter_container(reply, 'v', "b");
@@ -143,6 +185,20 @@ static void scan_objects(dc_bluez_info *info)
                         sd_bus_message_exit_container(reply);
                         if (powered)
                             info->powered = true;
+                    } else if (is_adapter && prop && strcmp(prop, "Discoverable") == 0) {
+                        int discoverable = 0;
+                        sd_bus_message_enter_container(reply, 'v', "b");
+                        sd_bus_message_read_basic(reply, 'b', &discoverable);
+                        sd_bus_message_exit_container(reply);
+                        if (discoverable)
+                            info->discoverable = true;
+                    } else if (is_adapter && prop && strcmp(prop, "Pairable") == 0) {
+                        int pairable = 0;
+                        sd_bus_message_enter_container(reply, 'v', "b");
+                        sd_bus_message_read_basic(reply, 'b', &pairable);
+                        sd_bus_message_exit_container(reply);
+                        if (pairable)
+                            info->pairable = true;
                     } else {
                         sd_bus_message_skip(reply, "v");
                     }
@@ -170,12 +226,63 @@ static void scan_objects(dc_bluez_info *info)
             snprintf(d->name, sizeof(d->name), "%s", name);
             d->paired = dev_paired;
             d->connected = dev_connected;
+            d->trusted = dev_trusted;
+            d->battery_percent = dev_has_battery ? dev_battery : -1;
+            snprintf(d->icon, sizeof(d->icon), "%s", dev_icon);
+            d->device_class = dev_class;
+            d->appearance = dev_appearance;
             info->device_count++;
         }
     }
 
 done:
     sd_bus_message_unref(reply);
+}
+
+/* --- DANKC_BTSVC_TEST verification hook (Wave 1 service-layer testing) -----
+ *
+ * Env-gated (any value): logs the full device list (name/mac/connected/
+ * paired/trusted/battery/icon/class/appearance) plus adapter state once at
+ * startup and again every time dc_bluez_read()'s result changes, so this can
+ * be checked against `bluetoothctl devices`/`busctl introspect` reality
+ * without any UI. No effect on behaviour when unset. */
+static dc_bluez_info g_test_last_logged;
+static bool g_test_logged_once = false;
+
+static void bluez_test_log(const dc_bluez_info *info)
+{
+    dc_info("bluez: [DANKC_BTSVC_TEST] adapter available=%d powered=%d discoverable=%d "
+            "pairable=%d connected=%d devices=%d",
+            info->available, info->powered, info->discoverable, info->pairable, info->connected,
+            info->device_count);
+    for (int i = 0; i < info->device_count; i++) {
+        const dc_bluez_device *d = &info->devices[i];
+        char battery_buf[16];
+        if (d->battery_percent >= 0)
+            snprintf(battery_buf, sizeof(battery_buf), "%d%%", d->battery_percent);
+        else
+            snprintf(battery_buf, sizeof(battery_buf), "n/a");
+        dc_info("bluez: [DANKC_BTSVC_TEST]   %-17s %-24s connected=%d paired=%d trusted=%d "
+                "battery=%-4s icon=%-16s class=0x%06x appearance=0x%04x",
+                d->mac, d->name, d->connected, d->paired, d->trusted, battery_buf,
+                d->icon[0] ? d->icon : "-", (unsigned)d->device_class, (unsigned)d->appearance);
+    }
+}
+
+static void bluez_test_log_if_changed(const dc_bluez_info *info)
+{
+    if (!getenv("DANKC_BTSVC_TEST"))
+        return;
+    /* Byte-for-byte compare against the last-logged snapshot -- both sides
+     * are always fully zero-initialised before being filled (scan_objects()
+     * memsets g_cache, memsets each device slot), so padding is deterministic
+     * and this is a reliable (if slightly conservative) change check for a
+     * debug-only hook. */
+    if (g_test_logged_once && memcmp(info, &g_test_last_logged, sizeof(*info)) == 0)
+        return;
+    bluez_test_log(info);
+    g_test_last_logged = *info;
+    g_test_logged_once = true;
 }
 
 bool dc_bluez_read(dc_bluez_info *out)
@@ -205,11 +312,23 @@ bool dc_bluez_read(dc_bluez_info *out)
         snprintf(d->name, sizeof(d->name), "%s", fake);
         d->paired = false;
         d->connected = false;
+        d->battery_percent = -1; /* no Battery1 interface on the synthetic device */
         out->device_count++;
         out->available = true;
     }
 
+    bluez_test_log_if_changed(out);
     return out->available;
+}
+
+int dc_bluez_devices(dc_bluez_device *out, int max)
+{
+    dc_bluez_info info;
+    dc_bluez_read(&info);
+    int n = info.device_count < max ? info.device_count : max;
+    for (int i = 0; i < n; i++)
+        out[i] = info.devices[i];
+    return n;
 }
 
 /* Fire-and-forget `bluetoothctl <verb> <mac>`, detached (same run-detached
