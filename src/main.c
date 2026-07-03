@@ -1086,6 +1086,13 @@ int main(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGCHLD, SIG_IGN); /* auto-reap detached action processes */
 
+    /* docs/16-PERF2-PLAN.md T1.2: bind audio.c to the loop so its wpctl
+     * cache refresh runs as a non-blocking fork+pipe child instead of a
+     * synchronous popen(). Placed after SIGCHLD=SIG_IGN above so any child it
+     * forks is reaped the same way every other fire-and-forget action
+     * process in this file already is. */
+    dc_audio_init(g_loop);
+
     /* TEMP(verify): auto-open a popup to screenshot it. */
     if (getenv("DANKC_CC_DEMO") || getenv("DANKC_OSD_DEMO")) {
         dc_output *first = NULL;
