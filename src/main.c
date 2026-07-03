@@ -29,6 +29,7 @@
 #include "ui/controlcenter.h"
 #include "ui/dashboard.h"
 #include "ui/dock.h"
+#include "ui/frame.h"
 #include "ui/launcher.h"
 #include "ui/lock.h"
 #include "ui/notifcenter.h"
@@ -52,11 +53,17 @@
 #include <unistd.h>
 
 #define DC_MAX_BARS 16
+#define DC_MAX_FRAMES 16
 
 static dc_loop *g_loop = NULL;
 
 struct bar_set {
     dc_bar *bars[DC_MAX_BARS];
+    int count;
+};
+
+struct frame_set {
+    dc_frame *frames[DC_MAX_FRAMES];
     int count;
 };
 
@@ -75,12 +82,21 @@ static void render_all(struct bar_set *set)
 
 /* dc_config change hook (registered below): the settings UI mutates bar
  * geometry / widget lists, so re-apply each bar's layer-surface geometry and
- * repaint. */
-static void bars_config_changed(void *ud)
+ * repaint. Also drives the frame overlay (docs/POLISH.md P2): it reads
+ * frame_enabled/frame_radius from the same dc_config, so it needs the same
+ * "config changed" signal as the bars, not a separate hook. */
+struct config_change_ctx {
+    struct bar_set *bars;
+    struct frame_set *frames;
+};
+
+static void config_changed(void *ud)
 {
-    struct bar_set *set = ud;
-    for (int i = 0; i < set->count; i++)
-        dc_bar_reconfigure(set->bars[i]);
+    struct config_change_ctx *ctx = ud;
+    for (int i = 0; i < ctx->bars->count; i++)
+        dc_bar_reconfigure(ctx->bars->bars[i]);
+    for (int i = 0; i < ctx->frames->count; i++)
+        dc_frame_reconfigure(ctx->frames->frames[i]);
 }
 
 struct tick_ctx {
@@ -827,6 +843,7 @@ int main(int argc, char **argv)
 
     dc_render render = {0};
     struct bar_set set = {0};
+    struct frame_set frames = {0};
     dc_output *output;
     wl_list_for_each(output, &wl->outputs, link) {
         if (set.count >= DC_MAX_BARS) {
@@ -834,6 +851,8 @@ int main(int argc, char **argv)
             break;
         }
         set.bars[set.count++] = dc_bar_create(wl, output, &egl, &render, niri);
+        if (frames.count < DC_MAX_FRAMES)
+            frames.frames[frames.count++] = dc_frame_create(wl, output, &egl, &render);
     }
     if (set.count == 0)
         dc_warn("no outputs found; nothing to display");
@@ -900,7 +919,8 @@ int main(int argc, char **argv)
         .settings = settings,
         .powermenu = powermenu};
     dc_wayland_set_key_cb(wl, handle_key, &kbd);
-    dc_config_set_change_cb(bars_config_changed, &set);
+    struct config_change_ctx cfg_ctx = {.bars = &set, .frames = &frames};
+    dc_config_set_change_cb(config_changed, &cfg_ctx);
 
     struct click_ctx cctx = {.set = &set,
                              .control_center = control_center,
@@ -1070,6 +1090,8 @@ int main(int argc, char **argv)
     dc_dock_destroy(dock);
     for (int i = 0; i < set.count; i++)
         dc_bar_destroy(set.bars[i]);
+    for (int i = 0; i < frames.count; i++)
+        dc_frame_destroy(frames.frames[i]);
     /* GL teardown is skipped: the process is exiting and nvgDelete needs a live
      * context; the driver reclaims resources on exit. */
     dc_loop_destroy(g_loop);

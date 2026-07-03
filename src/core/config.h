@@ -88,6 +88,19 @@ typedef struct dc_config {
      * Default empty, matching DMS's own SessionData.pinnedApps: []. */
     char dock_pinned[DC_CONFIG_DOCK_PINNED_MAX][DC_CONFIG_WIDGET_ID_MAX];
     int dock_pinned_n;
+    /* Frame: rounded screen corners overlay (docs/POLISH.md P2, ui/frame.c).
+     * DMS's frameEnabled defaults to false (SettingsData.qml); frame_radius
+     * defaults to the base cornerRadius design token (docs/10-DESIGN-SYSTEM.md
+     * sec.1 = 12), not DMS's separate frameRounding=23 (that belongs to the
+     * full connected-chrome Frame system, which dankc doesn't implement). */
+    bool frame_enabled;
+    float frame_radius;
+
+    /* Material background: blurred+dimmed wallpaper behind panel cards
+     * instead of a flat surfaceContainer fill (docs/POLISH.md P2,
+     * ui/material_bg.c). Falls back to the flat fill when disabled or when
+     * no wallpaper is configured/readable. */
+    bool material_blur;
 } dc_config;
 
 /* The active config. Read-only for the rest of the app. */

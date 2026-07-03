@@ -7,6 +7,7 @@
 #include "render/nvg.h"
 #include "services/weather.h"
 #include "theme/theme.h"
+#include "ui/material_bg.h"
 #include "ui/popout.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
@@ -1010,10 +1011,9 @@ static void s_render(dc_settings *s)
     nvgPathWinding(vg, NVG_HOLE);
     nvgFillPaint(vg, shadow);
     nvgFill(vg);
-    nvgBeginPath(vg);
-    nvgRoundedRect(vg, pad, pad, w - 2 * pad, h - 2 * pad, 16.0f);
-    nvgFillColor(vg, tc(t->surface_container));
-    nvgFill(vg);
+    /* Card: blurred+dimmed wallpaper ("material" bg) when enabled, else the
+     * flat surfaceContainer fill (docs/POLISH.md P2, ui/material_bg.c). */
+    dc_material_bg_fill_card(vg, s->render, pad, pad, w - 2 * pad, h - 2 * pad, 16.0f);
 
     draw_sidebar(s, vg, t);
 

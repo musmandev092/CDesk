@@ -58,6 +58,12 @@ static dc_config config = {
     .dock_auto_hide = false,
     .dock_icon_size = 40,
     .dock_pinned_n = 0,
+    /* docs/POLISH.md P2: DMS's frameEnabled defaults off; frame_radius
+     * defaults to the base cornerRadius token (docs/10-DESIGN-SYSTEM.md
+     * sec.1). materialBlur defaults on per docs/POLISH.md P2. */
+    .frame_enabled = false,
+    .frame_radius = 12.0f,
+    .material_blur = true,
 };
 
 const dc_config *dc_config_current = &config;
@@ -283,6 +289,9 @@ void dc_config_load(void)
     get_int(root, "dockIconSize", &config.dock_icon_size, 16, 96);
     get_string_array(root, "dockPinned", config.dock_pinned, DC_CONFIG_DOCK_PINNED_MAX,
                      &config.dock_pinned_n);
+    get_bool(root, "frameEnabled", &config.frame_enabled);
+    get_float(root, "frameRadius", &config.frame_radius, 0.0f, 200.0f);
+    get_bool(root, "materialBlur", &config.material_blur);
     cJSON_Delete(root);
 
     apply_theme();
@@ -386,6 +395,9 @@ void dc_config_save(void)
     cJSON_AddBoolToObject(root, "dockAutoHide", config.dock_auto_hide);
     cJSON_AddNumberToObject(root, "dockIconSize", config.dock_icon_size);
     add_string_array(root, "dockPinned", config.dock_pinned, config.dock_pinned_n);
+    cJSON_AddBoolToObject(root, "frameEnabled", config.frame_enabled);
+    cJSON_AddNumberToObject(root, "frameRadius", (double)config.frame_radius);
+    cJSON_AddBoolToObject(root, "materialBlur", config.material_blur);
 
     char *text = cJSON_Print(root);
     cJSON_Delete(root);
