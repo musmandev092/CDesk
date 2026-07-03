@@ -215,5 +215,54 @@ bool dc_net_saved_set_autoconnect(const char *path, bool enable);
  * a second D-Bus round trip. */
 const dc_net_saved_net *dc_net_saved_find_by_ssid(const char *ssid);
 
+/* --- Hotspot (Wi-Fi access-point mode) -------------------------------------
+ * docs/18-WIFI-BT-PLAN.md sec.2.2 -- NetworkManager.AddAndActivateConnection()
+ * on the Wi-Fi device (the same one dc_net_init() resolves for scan/connect)
+ * with an ephemeral 802-11-wireless/mode=ap connection; ipv4.method=shared
+ * tells NM to run its own DHCP server + NAT, no hostapd/dnsmasq wrangling
+ * needed here.
+ *
+ * IMPORTANT: if the Wi-Fi device is currently connected as a client (see
+ * dc_net_wifi()/dc_net_wifi_scan()'s `in_use` AP), starting the hotspot
+ * activates the AP-mode connection *on that same radio* and NetworkManager
+ * will tear down the client connection to do it -- a single Wi-Fi adapter
+ * cannot be a client and an AP at once. This is NOT silently hidden: the
+ * caller gets a distinct dc_net_hotspot_start() return value
+ * (DC_NET_HOTSPOT_START_WAS_CONNECTED) in that case so the (future) UI can
+ * warn the user before/while it happens, and it's logged via dc_warn(). */
+typedef enum {
+    DC_NET_HOTSPOT_START_OK = 0,          /* started; Wi-Fi device was idle/disconnected */
+    DC_NET_HOTSPOT_START_WAS_CONNECTED,   /* started, but a client connection was dropped to do it */
+    DC_NET_HOTSPOT_START_NO_DEVICE = -1,  /* no Wi-Fi device found */
+    DC_NET_HOTSPOT_START_DBUS_FAILED = -2, /* AddAndActivateConnection itself failed/rejected */
+} dc_net_hotspot_start_result;
+
+/* Start an AP-mode connection named after `ssid` on the Wi-Fi device.
+ * `password` may be NULL/empty for an open hotspot (omits the
+ * 802-11-wireless-security group entirely); otherwise WPA-PSK is used.
+ * `band` may be NULL ("bg" or "a" otherwise) to let NM pick. See the dry-run
+ * note above dc_net_hotspot_stop(). */
+dc_net_hotspot_start_result dc_net_hotspot_start(const char *ssid, const char *password,
+                                                 const char *band);
+
+/* Deactivate and delete the ephemeral hotspot connection (whichever one is
+ * currently active in AP mode on the Wi-Fi device -- not just one dankc
+ * itself started this run, so this also cleans up a hotspot left running
+ * from a previous session). No-op if none is active.
+ *
+ * If the environment variable DANKC_NET_DRYRUN is set (any value), no D-Bus
+ * write call is made for dc_net_hotspot_start()/dc_net_hotspot_stop() (nor
+ * for the saved-network writes below, nor dc_net_eth_connect()/
+ * dc_net_eth_disconnect()): the exact destination/path/interface/method and
+ * full argument set (including the AddAndActivateConnection settings dict)
+ * are logged via dc_info() instead, mirroring DANKC_WIFI_DRYRUN's existing
+ * convention for dc_net_wifi_connect_psk(). Both env vars can be set at once
+ * without conflict. */
+void dc_net_hotspot_stop(void);
+
+/* True if the Wi-Fi device currently has an AP-mode connection active
+ * (Device.Wireless.Mode == NM_802_11_MODE_AP); on true, `ssid_out` (if
+ * non-NULL) is filled with the active connection's SSID. */
+bool dc_net_hotspot_active(char *ssid_out, size_t len);
 
 #endif /* DC_SERVICES_NET_H */

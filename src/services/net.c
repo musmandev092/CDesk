@@ -1616,3 +1616,305 @@ const dc_net_saved_net *dc_net_saved_find_by_ssid(const char *ssid)
     return NULL;
 }
 
+/* --- Hotspot (Wi-Fi AP mode) — NetworkManager D-Bus (docs/18-WIFI-BT-PLAN.md
+ * sec.2.2) ---------------------------------------------------------------- */
+
+/* Look up the Wi-Fi device's currently-active connection object path
+ * (Device.ActiveConnection, "/" or unset if none). Shared by
+ * dc_net_hotspot_stop()/dc_net_hotspot_active(); the ethernet equivalent of
+ * this same read lives inline in dc_net_eth_disconnect() above (small enough
+ * not to be worth sharing across the two very different device kinds). */
+static bool nm_active_connection_path(const char *device_path, char *out, size_t out_sz)
+{
+    out[0] = '\0';
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = NULL;
+    if (sd_bus_get_property(g_net_bus, DC_NM_DEST, device_path, DC_NM_DEVICE_IFACE,
+                            "ActiveConnection", &err, &reply, "o") >= 0) {
+        const char *ac = NULL;
+        sd_bus_message_read_basic(reply, 'o', &ac);
+        if (ac && ac[0] && strcmp(ac, "/") != 0)
+            snprintf(out, out_sz, "%s", ac);
+    }
+    sd_bus_error_free(&err);
+    sd_bus_message_unref(reply);
+    return out[0] != '\0';
+}
+
+/* Read Connection.Active's "Connection" property (the Settings/Connection
+ * object path backing this active connection) -- needed to Delete() the
+ * ephemeral hotspot connection once it's deactivated. */
+static bool nm_active_connection_settings_path(const char *active_path, char *out, size_t out_sz)
+{
+    out[0] = '\0';
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = NULL;
+    if (sd_bus_get_property(g_net_bus, DC_NM_DEST, active_path, DC_NM_ACTIVE_CONN_IFACE,
+                            "Connection", &err, &reply, "o") >= 0) {
+        const char *conn = NULL;
+        sd_bus_message_read_basic(reply, 'o', &conn);
+        if (conn)
+            snprintf(out, out_sz, "%s", conn);
+    }
+    sd_bus_error_free(&err);
+    sd_bus_message_unref(reply);
+    return out[0] != '\0';
+}
+
+bool dc_net_hotspot_active(char *ssid_out, size_t len)
+{
+    if (ssid_out && len)
+        ssid_out[0] = '\0';
+    if (!g_net_bus || !g_nm.have_wifi_device)
+        return false;
+
+    uint32_t mode = 0;
+    sd_bus_error merr = SD_BUS_ERROR_NULL;
+    int r = sd_bus_get_property_trivial(g_net_bus, DC_NM_DEST, g_nm.device_path,
+                                        DC_NM_WIRELESS_IFACE, "Mode", &merr, 'u', &mode);
+    sd_bus_error_free(&merr);
+    if (r < 0 || mode != NM_802_11_MODE_AP)
+        return false;
+
+    if (!ssid_out || !len)
+        return true;
+
+    /* No "current AP" object exists in AP mode the way there is for a
+     * client connection -- decode the SSID off the active connection's own
+     * saved 802-11-wireless.ssid via Settings.Connection.GetSettings()
+     * instead (net_conn_read_settings(), defined in the saved-networks
+     * section below). */
+    char active_path[128];
+    if (!nm_active_connection_path(g_nm.device_path, active_path, sizeof(active_path)))
+        return true; /* AP mode confirmed, just no active-connection object to read */
+
+    char settings_path[128];
+    if (!nm_active_connection_settings_path(active_path, settings_path, sizeof(settings_path)))
+        return true;
+
+    net_conn_read_settings(settings_path, NULL, 0, NULL, 0, NULL, ssid_out, len);
+    return true;
+}
+
+dc_net_hotspot_start_result dc_net_hotspot_start(const char *ssid, const char *password,
+                                                 const char *band)
+{
+    if (!ssid || !ssid[0])
+        return DC_NET_HOTSPOT_START_DBUS_FAILED;
+    if (!g_net_bus || !g_nm.have_wifi_device)
+        return DC_NET_HOTSPOT_START_NO_DEVICE;
+
+    /* g_nm.connected reflects whether the Wi-Fi device is currently a
+     * connected client (tracked by the PropertiesChanged subscription at the
+     * top of this file) -- see the "IMPORTANT" note in net.h. */
+    bool was_connected = g_nm.connected;
+
+    if (net_dryrun()) {
+        dc_info("net: [DANKC_NET_DRYRUN] would call %s %s %s.AddAndActivateConnection(...) on "
+                "device %s:",
+                DC_NM_DEST, DC_NM_PATH, DC_NM_DEST, g_nm.device_path);
+        dc_info("net: [DANKC_NET_DRYRUN]   connection: {id=\"%s\", type=802-11-wireless, "
+                "autoconnect=false}",
+                ssid);
+        if (band && band[0])
+            dc_info("net: [DANKC_NET_DRYRUN]   802-11-wireless: {mode=ap, ssid=\"%s\", band=%s%s}",
+                    ssid, band, password && password[0] ? ", security=802-11-wireless-security" : "");
+        else
+            dc_info("net: [DANKC_NET_DRYRUN]   802-11-wireless: {mode=ap, ssid=\"%s\"%s}", ssid,
+                    password && password[0] ? ", security=802-11-wireless-security" : "");
+        if (password && password[0])
+            dc_info("net: [DANKC_NET_DRYRUN]   802-11-wireless-security: {key-mgmt=wpa-psk, "
+                    "psk=\"%s\"}",
+                    password);
+        else
+            dc_info("net: [DANKC_NET_DRYRUN]   (open hotspot -- no 802-11-wireless-security group)");
+        dc_info("net: [DANKC_NET_DRYRUN]   ipv4: {method=shared}");
+        if (was_connected)
+            dc_warn("net: [DANKC_NET_DRYRUN] wifi device %s is currently a connected client "
+                    "(ssid \"%s\") -- starting the hotspot would drop that connection",
+                    g_nm.device_path, g_nm.ssid);
+        return was_connected ? DC_NET_HOTSPOT_START_WAS_CONNECTED : DC_NET_HOTSPOT_START_OK;
+    }
+
+    if (was_connected)
+        dc_warn("net: starting hotspot on %s will drop its active client connection (ssid \"%s\")",
+                g_nm.device_path, g_nm.ssid);
+
+    sd_bus_message *m = NULL;
+    int r = sd_bus_message_new_method_call(g_net_bus, &m, DC_NM_DEST, DC_NM_PATH, DC_NM_DEST,
+                                           "AddAndActivateConnection");
+    if (r < 0)
+        return DC_NET_HOTSPOT_START_DBUS_FAILED;
+
+    /* a{sa{sv}} settings dict, built by hand -- same nested-container shape
+     * as services/polkit.c's register_agent() (see its header comment). */
+    sd_bus_message_open_container(m, 'a', "{sa{sv}}");
+
+    /* "connection": {id, type, autoconnect} */
+    sd_bus_message_open_container(m, 'e', "sa{sv}");
+    sd_bus_message_append(m, "s", "connection");
+    sd_bus_message_open_container(m, 'a', "{sv}");
+    sd_bus_message_open_container(m, 'e', "sv");
+    sd_bus_message_append(m, "s", "id");
+    sd_bus_message_open_container(m, 'v', "s");
+    sd_bus_message_append(m, "s", ssid);
+    sd_bus_message_close_container(m);
+    sd_bus_message_close_container(m);
+    sd_bus_message_open_container(m, 'e', "sv");
+    sd_bus_message_append(m, "s", "type");
+    sd_bus_message_open_container(m, 'v', "s");
+    sd_bus_message_append(m, "s", "802-11-wireless");
+    sd_bus_message_close_container(m);
+    sd_bus_message_close_container(m);
+    sd_bus_message_open_container(m, 'e', "sv");
+    sd_bus_message_append(m, "s", "autoconnect");
+    sd_bus_message_open_container(m, 'v', "b");
+    sd_bus_message_append(m, "b", 0);
+    sd_bus_message_close_container(m);
+    sd_bus_message_close_container(m);
+    sd_bus_message_close_container(m); /* a{sv} */
+    sd_bus_message_close_container(m); /* e */
+
+    /* "802-11-wireless": {mode=ap, ssid, band?, security?} */
+    sd_bus_message_open_container(m, 'e', "sa{sv}");
+    sd_bus_message_append(m, "s", "802-11-wireless");
+    sd_bus_message_open_container(m, 'a', "{sv}");
+    sd_bus_message_open_container(m, 'e', "sv");
+    sd_bus_message_append(m, "s", "mode");
+    sd_bus_message_open_container(m, 'v', "s");
+    sd_bus_message_append(m, "s", "ap");
+    sd_bus_message_close_container(m);
+    sd_bus_message_close_container(m);
+    sd_bus_message_open_container(m, 'e', "sv");
+    sd_bus_message_append(m, "s", "ssid");
+    sd_bus_message_open_container(m, 'v', "ay");
+    sd_bus_message_append_array(m, 'y', ssid, strlen(ssid));
+    sd_bus_message_close_container(m);
+    sd_bus_message_close_container(m);
+    if (band && band[0]) {
+        sd_bus_message_open_container(m, 'e', "sv");
+        sd_bus_message_append(m, "s", "band");
+        sd_bus_message_open_container(m, 'v', "s");
+        sd_bus_message_append(m, "s", band);
+        sd_bus_message_close_container(m);
+        sd_bus_message_close_container(m);
+    }
+    if (password && password[0]) {
+        sd_bus_message_open_container(m, 'e', "sv");
+        sd_bus_message_append(m, "s", "security");
+        sd_bus_message_open_container(m, 'v', "s");
+        sd_bus_message_append(m, "s", "802-11-wireless-security");
+        sd_bus_message_close_container(m);
+        sd_bus_message_close_container(m);
+    }
+    sd_bus_message_close_container(m); /* a{sv} */
+    sd_bus_message_close_container(m); /* e */
+
+    /* "802-11-wireless-security": {key-mgmt=wpa-psk, psk} -- omitted entirely
+     * for an open hotspot. */
+    if (password && password[0]) {
+        sd_bus_message_open_container(m, 'e', "sa{sv}");
+        sd_bus_message_append(m, "s", "802-11-wireless-security");
+        sd_bus_message_open_container(m, 'a', "{sv}");
+        sd_bus_message_open_container(m, 'e', "sv");
+        sd_bus_message_append(m, "s", "key-mgmt");
+        sd_bus_message_open_container(m, 'v', "s");
+        sd_bus_message_append(m, "s", "wpa-psk");
+        sd_bus_message_close_container(m);
+        sd_bus_message_close_container(m);
+        sd_bus_message_open_container(m, 'e', "sv");
+        sd_bus_message_append(m, "s", "psk");
+        sd_bus_message_open_container(m, 'v', "s");
+        sd_bus_message_append(m, "s", password);
+        sd_bus_message_close_container(m);
+        sd_bus_message_close_container(m);
+        sd_bus_message_close_container(m); /* a{sv} */
+        sd_bus_message_close_container(m); /* e */
+    }
+
+    /* "ipv4": {method=shared} -- NM runs its own DHCP server + NAT for the
+     * lifetime of the AP-mode connection. */
+    sd_bus_message_open_container(m, 'e', "sa{sv}");
+    sd_bus_message_append(m, "s", "ipv4");
+    sd_bus_message_open_container(m, 'a', "{sv}");
+    sd_bus_message_open_container(m, 'e', "sv");
+    sd_bus_message_append(m, "s", "method");
+    sd_bus_message_open_container(m, 'v', "s");
+    sd_bus_message_append(m, "s", "shared");
+    sd_bus_message_close_container(m);
+    sd_bus_message_close_container(m);
+    sd_bus_message_close_container(m); /* a{sv} */
+    sd_bus_message_close_container(m); /* e */
+
+    sd_bus_message_close_container(m); /* a{sa{sv}} */
+
+    sd_bus_message_append(m, "oo", g_nm.device_path, "/");
+
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = NULL;
+    r = sd_bus_call(g_net_bus, m, 0, &err, &reply);
+    sd_bus_message_unref(m);
+    sd_bus_message_unref(reply);
+
+    if (r < 0) {
+        dc_warn("net: AddAndActivateConnection (hotspot) failed: %s",
+                err.message ? err.message : strerror(-r));
+        sd_bus_error_free(&err);
+        return DC_NET_HOTSPOT_START_DBUS_FAILED;
+    }
+    sd_bus_error_free(&err);
+
+    return was_connected ? DC_NET_HOTSPOT_START_WAS_CONNECTED : DC_NET_HOTSPOT_START_OK;
+}
+
+void dc_net_hotspot_stop(void)
+{
+    if (!g_net_bus || !g_nm.have_wifi_device)
+        return;
+
+    char ssid[64] = {0};
+    if (!dc_net_hotspot_active(ssid, sizeof(ssid))) {
+        dc_info("net: dc_net_hotspot_stop() called but no hotspot is active");
+        return;
+    }
+
+    char active_path[128];
+    if (!nm_active_connection_path(g_nm.device_path, active_path, sizeof(active_path)))
+        return;
+
+    char settings_path[128];
+    bool have_settings = nm_active_connection_settings_path(active_path, settings_path,
+                                                            sizeof(settings_path));
+
+    if (net_dryrun()) {
+        dc_info("net: [DANKC_NET_DRYRUN] would call %s %s %s.DeactivateConnection(\"%s\")",
+                DC_NM_DEST, DC_NM_PATH, DC_NM_DEST, active_path);
+        if (have_settings)
+            dc_info("net: [DANKC_NET_DRYRUN] would call %s %s %s.Delete() (hotspot \"%s\")",
+                    DC_NM_DEST, settings_path, DC_NM_SETTINGS_CONN_IFACE, ssid);
+        return;
+    }
+
+    sd_bus_error derr = SD_BUS_ERROR_NULL;
+    sd_bus_message *dreply = NULL;
+    int r = sd_bus_call_method(g_net_bus, DC_NM_DEST, DC_NM_PATH, DC_NM_DEST,
+                               "DeactivateConnection", &derr, &dreply, "o", active_path);
+    if (r < 0)
+        dc_warn("net: DeactivateConnection (hotspot) failed: %s",
+                derr.message ? derr.message : strerror(-r));
+    sd_bus_error_free(&derr);
+    sd_bus_message_unref(dreply);
+
+    if (have_settings) {
+        sd_bus_error delerr = SD_BUS_ERROR_NULL;
+        sd_bus_message *delreply = NULL;
+        int dr = sd_bus_call_method(g_net_bus, DC_NM_DEST, settings_path, DC_NM_SETTINGS_CONN_IFACE,
+                                    "Delete", &delerr, &delreply, "");
+        if (dr < 0)
+            dc_warn("net: Settings.Connection.Delete (hotspot) failed: %s",
+                    delerr.message ? delerr.message : strerror(-dr));
+        sd_bus_error_free(&delerr);
+        sd_bus_message_unref(delreply);
+    }
+}
+
