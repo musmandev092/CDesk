@@ -731,6 +731,57 @@ void dc_notifications_mark_read(dc_notifications *n)
     n->has_unread = false;
 }
 
+/* Post a notification that originates from internal dankc code (e.g. battery
+ * automation) rather than a D-Bus Notify() call. Bypasses D-Bus entirely --
+ * same idea as dc_notifications_seed_demo() -- but posts one real, live entry
+ * off the same id counter/store a D-Bus arrival uses, and drives the same
+ * effects method_notify() does: acquire_slot(), fill the slot with a
+ * now-timestamp, respect the DND gate (notifications.c:408's
+ * `!dc_config_current->dnd_enabled`) so a local post can't bypass Do Not
+ * Disturb either, then dc_sound_notify() + notify_changed() so a toast pops
+ * and the notification center picks it up on its own next redraw. Unlike
+ * method_notify() there's no D-Bus caller waiting on this id, so nothing here
+ * emits NotificationClosed for it on arrival (there was nothing to open, in
+ * the spec's sense) -- but resolving it later via dc_notifications_dismiss()/
+ * CloseNotification still emits the signal as usual, since that's just a
+ * session-bus broadcast rather than a reply to a specific sender; a locally-
+ * originated id is indistinguishable from a D-Bus one at that point. Returns
+ * the assigned id. */
+uint32_t dc_notifications_post_local(dc_notifications *n, const char *app, const char *summary,
+                                     const char *body, dc_urgency urgency)
+{
+    if (!n)
+        return 0;
+
+    uint32_t id = ++n->next_id;
+    dc_notification *slot = acquire_slot(n, 0);
+    if (slot->active && slot->id != id)
+        emit_closed(n, slot->id, DC_NOTIF_REASON_CLOSED); /* evicted a different notification */
+    free_slot_image(slot); /* release a reused slot's old pixels before memset drops the pointer */
+
+    memset(slot, 0, sizeof(*slot));
+    slot->id = id;
+    slot->urgency = urgency;
+    slot->expire_timeout_ms = -1; /* server default, same as a Notify() call with no explicit timeout */
+    slot->created_ms = now_ms();
+    slot->created_wall_ms = now_wall_ms();
+    /* Do Not Disturb gate -- mirrors method_notify()'s slot->popup assignment
+     * so a local post respects DND exactly like a real D-Bus arrival. */
+    slot->popup = !dc_config_current->dnd_enabled;
+    slot->active = true;
+    slot->status = DC_NOTIF_CURRENT;
+    snprintf(slot->app_name, sizeof(slot->app_name), "%s", app ? app : "");
+    snprintf(slot->summary, sizeof(slot->summary), "%s", summary ? summary : "");
+    snprintf(slot->body, sizeof(slot->body), "%s", body ? body : "");
+
+    dc_info("notify #%u [%s] %s (local)", id, slot->app_name, slot->summary);
+    n->has_unread = true;
+    dc_sound_notify(slot->urgency);
+    notify_changed(n);
+
+    return id;
+}
+
 /* Fabricated entries covering: a plain body, a long/wrapping body, an action
  * button, and both same-day and older (different calendar day) timestamps --
  * see docs/13-POPOUTS-SPEC.md sec.3. Bypasses D-Bus entirely (writes directly
