@@ -22,6 +22,7 @@
 #include "services/printers.h"
 #include "services/systheme.h"
 #include "services/timedate.h"
+#include "services/updates.h"
 #include "services/weather.h"
 #include "theme/theme.h"
 #include "ui/material_bg.h"
@@ -4433,79 +4434,86 @@ static void tab_mux(uictx *c)
     ui_hint(c, "Read-only list; click a session to attach in a new terminal.");
 }
 
-/* docs/14-COMPLETION-PLAN.md W5.2: Arch's `checkupdates` (pacman-contrib) --
- * a read-only sync-db-then-compare check that never touches the real pacman
- * DB or installs anything. Explicitly NOT run automatically or on every
- * render (it syncs a temp package DB over the network, which would be both
- * slow -- blocking dankc's single-threaded event loop -- and rude to do
- * unprompted): only a detached background run kicked off by the "Check for
- * updates" button, polled via a small cache file so the render loop never
- * blocks on it. */
-#define DC_UPDATES_CACHE "/tmp/dankc-checkupdates.out"
-
-static bool updates_backend_available(void)
+/* docs/29-SMALL-FEATURES-PLAN.md sec.4 (updater T1): generalized multi-
+ * backend view on top of services/updates.h (dc_updates_check_async/_read/
+ * _total/_run_upgrade), replacing this tab's old Arch-only inline
+ * checkupdates cache-file logic (moved into services/updates.c). Backend
+ * checks are still detached/fire-and-forget and polled from a cache file --
+ * updates.c owns that now, this tab just reads the summarized result. */
+static const char *update_backend_label(const char *name)
 {
-    return system("command -v checkupdates >/dev/null 2>&1") == 0;
-}
-
-static void updates_check_now(void)
-{
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
-             "{ checkupdates 2>/dev/null || true; } >" DC_UPDATES_CACHE ".tmp 2>/dev/null && "
-             "mv " DC_UPDATES_CACHE ".tmp " DC_UPDATES_CACHE);
-    run_detached(cmd);
-}
-
-/* Reads the last completed check's line count + the cache file's mtime (as
- * "last checked"). Returns false if no check has completed yet. */
-static bool updates_read_cache(int *count, time_t *mtime)
-{
-    struct stat st;
-    if (stat(DC_UPDATES_CACHE, &st) != 0)
-        return false;
-    *mtime = st.st_mtime;
-    FILE *f = fopen(DC_UPDATES_CACHE, "r");
-    if (!f)
-        return false;
-    int n = 0;
-    char line[256];
-    while (fgets(line, sizeof(line), f))
-        if (line[0] != '\n')
-            n++;
-    fclose(f);
-    *count = n;
-    return true;
+    if (!strcmp(name, "pacman"))
+        return "Pacman (official repos)";
+    if (!strcmp(name, "aur"))
+        return "AUR";
+    if (!strcmp(name, "flatpak"))
+        return "Flatpak";
+    return name;
 }
 
 static void tab_system_updater(uictx *c)
 {
-    ui_section(c, "PACKAGE UPDATES (ARCH)");
-    if (!updates_backend_available()) {
-        ui_hint(c, "checkupdates not found (pacman-contrib package) -- Arch-only");
-        return;
-    }
+    dc_config *cfg = c->cfg;
+    dc_settings *s = c->s;
 
-    int count = 0;
-    time_t mtime = 0;
-    if (updates_read_cache(&count, &mtime)) {
-        char cv[16];
-        snprintf(cv, sizeof(cv), "%d", count);
-        ui_value(c, "Updates available", cv);
-        char when[64];
-        struct tm tm;
-        localtime_r(&mtime, &tm);
-        strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &tm);
-        ui_value(c, "Last checked", when);
-    } else {
-        ui_hint(c, "Not checked yet this session");
-    }
+    ui_section(c, "PACKAGE UPDATES");
+
+    int total = dc_updates_total();
+    char totalbuf[16];
+    snprintf(totalbuf, sizeof(totalbuf), "%d", total);
+    ui_value(c, "Total pending", totalbuf);
 
     if (ui_list_row(c, "Check for updates", NULL, IC_SYSTEM_UPDATER, false) == 1)
-        updates_check_now();
+        dc_updates_check_async();
 
-    ui_hint(c, "Runs `checkupdates` (syncs a temp package DB, read-only) --");
-    ui_hint(c, "never installs or upgrades anything automatically.");
+    dc_update_backend backends[DC_UPDATES_BACKENDS_N];
+    int n = dc_updates_read(backends, DC_UPDATES_BACKENDS_N);
+    for (int i = 0; i < n; i++) {
+        const dc_update_backend *b = &backends[i];
+        char status[64];
+        if (!b->available) {
+            snprintf(status, sizeof(status), "not installed");
+        } else if (b->count < 0) {
+            snprintf(status, sizeof(status), "not checked");
+        } else if (b->mtime > 0) {
+            char when[16];
+            time_t mt = (time_t)b->mtime;
+            struct tm tm;
+            localtime_r(&mt, &tm);
+            strftime(when, sizeof(when), "%H:%M", &tm);
+            snprintf(status, sizeof(status), "%d pending @ %s", b->count, when);
+        } else {
+            snprintf(status, sizeof(status), "%d pending", b->count);
+        }
+        bool actionable = b->available && b->count > 0;
+        int r = ui_list_row(c, update_backend_label(b->name), status,
+                            actionable ? IC_MUX : 0, false);
+        if (r == 2)
+            dc_updates_run_upgrade(b->name);
+    }
+    ui_hint(c, "\"Update in terminal\" opens an interactive terminal to run the real");
+    ui_hint(c, "upgrade -- there's no embedded live-log popout here (yet).");
+    ui_hint(c, "AUR checking needs paru or yay installed; Flatpak needs the flatpak CLI.");
+
+    ui_section(c, "UPGRADE TERMINAL");
+    bool tf_focus = s->focus_field == 17;
+    char tfbuf[256];
+    if (tf_focus)
+        snprintf(tfbuf, sizeof(tfbuf), "%s", s->edit_buf);
+    else
+        copy_trunc(tfbuf, sizeof(tfbuf), cfg->update_terminal_cmd);
+    if (ui_textfield(c, "Custom terminal command", tfbuf, tf_focus)) {
+        s->focus_field = 17;
+        copy_trunc(s->edit_buf, sizeof(s->edit_buf), cfg->update_terminal_cmd);
+    }
+    ui_hint(c, "Template with one literal %s = the upgrade command, e.g.");
+    ui_hint(c, "foot -e sh -c '%s; read -p \"[enter to close]\" x' -- empty auto-probes a");
+    ui_hint(c, "terminal (foot/kitty/alacritty/wezterm/ghostty/xterm).");
+
+    ui_section(c, "AUTO-CHECK");
+    if (ui_stepper(c, "Check interval (minutes, 0 = manual)", &cfg->updates_check_interval_min, 0,
+                   1440, 5))
+        c->changed = true;
 }
 
 /* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.6: CUPS printers, now backed by
@@ -5013,6 +5021,11 @@ static void commit_edit(dc_settings *s)
             copy_trunc(r->match, sizeof(r->match), s->edit_buf);
             cfg->notif_rules_n++;
         }
+        break;
+    case 17: /* System Updater tab's "Custom terminal command" field
+              * (update_terminal_cmd) -- empty clears the override back to
+              * dc_updates_run_upgrade()'s auto-probe. */
+        copy_trunc(cfg->update_terminal_cmd, sizeof(cfg->update_terminal_cmd), s->edit_buf);
         break;
     default:
         break;
