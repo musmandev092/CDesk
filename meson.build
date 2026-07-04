@@ -122,7 +122,7 @@ src = files(
   'src/ui/dashboard.c',
   'src/ui/lock.c', 'src/ui/processes.c', 'src/ui/powermenu.c', 'src/ui/dock.c',
   'src/ui/frame.c', 'src/ui/material_bg.c', 'src/ui/tray_menu.c', 'src/ui/notif_image.c',
-  'src/ui/keybinds_modal.c', 'src/ui/polkit_modal.c',
+  'src/ui/keybinds_modal.c', 'src/ui/polkit_modal.c', 'src/ui/text_edit.c',
   'src/services/calc.c', 'src/services/history.c', 'src/services/notepad_storage.c',
   'src/services/battery.c', 'src/services/audio.c', 'src/services/net.c',
   'src/services/dbus.c', 'src/services/bluez.c', 'src/services/mpris.c',
