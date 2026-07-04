@@ -18,6 +18,7 @@
 #include "wayland/wl.h"
 
 #include <GLES2/gl2.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,6 +64,14 @@
  * answer, not just another entry. */
 #define DC_LAUNCHER_CALC_ROW_H 64.0f
 #define DC_LAUNCHER_CALC_RESULT_MAX 48
+
+/* Builtin-entry table (docs/22-NOTEPAD-PLAN.md NT5): generic non-app results
+ * (Notepad today; Settings/Clipboard could be added the same way later)
+ * matched against the query and rendered as pinned rows above the app
+ * results, calc-row style. DC_LAUNCHER_BUILTIN_MAX bounds the launcher's
+ * per-query match-index array; the actual table can be smaller. */
+#define DC_LAUNCHER_BUILTIN_MAX 8
+#define DC_LAUNCHER_BUILTIN_ROW_H 56.0f
 
 /* Run-actions sub-list (docs/POLISH.md P4 item 3): Tab on a selected app
  * with Actions= swaps the results area for that app's action list. Rows
@@ -113,16 +122,27 @@ struct dc_launcher {
     const dc_app *results[64];
     int result_count;
 
-    /* Calculator row state (docs/POLISH.md P4 item 1). When calc_active,
-     * `selected == -1` means the calc row itself is highlighted (Enter/click
-     * copies calc_result_str to the clipboard); selected >= 0 still indexes
-     * `results` as usual. DMS's current DankLauncherV2 QML doesn't actually
-     * ship a calculator (checked: no Scorer/Controller trigger evaluates
-     * expressions) -- this mirrors the common spotlight-calculator pattern
-     * instead of a specific DMS source, per the task's "if DMS supports it"
-     * scope note. */
+    /* Calculator row state (docs/POLISH.md P4 item 1). When calc_active, the
+     * calc row is one of the launcher's "pinned rows" (see
+     * launcher_top_row_count()'s comment for how `selected < 0` is mapped to
+     * a specific pinned row -- calc, or a matched builtin, NT5); selected >=
+     * 0 still indexes `results` as usual. DMS's current DankLauncherV2 QML
+     * doesn't actually ship a calculator (checked: no Scorer/Controller
+     * trigger evaluates expressions) -- this mirrors the common
+     * spotlight-calculator pattern instead of a specific DMS source, per the
+     * task's "if DMS supports it" scope note. */
     bool calc_active;
     char calc_result_str[DC_LAUNCHER_CALC_RESULT_MAX];
+
+    /* Builtin-entry matches for the current query (docs/22-NOTEPAD-PLAN.md
+     * NT5): indices into launcher_builtins[], rendered as pinned rows above
+     * the app results alongside the calc row (see launcher_top_row_*
+     * helpers, which treat "calc row, then matched builtins" as one ordered
+     * list of pinned rows). */
+    int builtin_matches[DC_LAUNCHER_BUILTIN_MAX];
+    int builtin_match_count;
+    void (*builtin_cb)(const char *action, void *ud);
+    void *builtin_cb_ud;
 
     /* Run-actions sub-list (docs/POLISH.md P4 item 3): Tab on a selected app
      * that has Actions= swaps the results area for its action list; query
@@ -240,6 +260,89 @@ static void recompute_physical(dc_launcher *l)
     l->phys_height = (l->logical_height * l->scale120 + DC_SCALE_BASE / 2) / DC_SCALE_BASE;
 }
 
+/* Builtin-entry table (see DC_LAUNCHER_BUILTIN_MAX above): name+icon shown in
+ * the row, `action` handed to the registered builtin_cb on activation,
+ * `keywords` widens what the query can match against (space-separated,
+ * matched as a whole blob below -- not tokenized). */
+typedef struct {
+    const char *name;
+    uint32_t icon;
+    const char *action;
+    const char *keywords;
+} dc_launcher_builtin;
+
+static const dc_launcher_builtin launcher_builtins[] = {
+    {"Notepad", DC_ICON_EDIT, "notepad", "note notes notepad"},
+};
+#define DC_LAUNCHER_BUILTIN_COUNT \
+    (int)(sizeof(launcher_builtins) / sizeof(launcher_builtins[0]))
+
+/* Case-insensitive substring match of `query` against "name keywords" --
+ * same free-text convention dc_apps_search uses for desktop entries, just
+ * inlined here since the builtin table is launcher-local. Empty query never
+ * matches (mirrors the calc row: no query, no builtin banner). */
+static bool builtin_matches_query(const dc_launcher_builtin *b, const char *query)
+{
+    if (!query[0])
+        return false;
+    char hay[160];
+    snprintf(hay, sizeof(hay), "%s %s", b->name, b->keywords);
+    for (char *p = hay; *p; p++)
+        *p = (char)tolower((unsigned char)*p);
+    char needle[DC_LAUNCHER_QUERY_MAX];
+    snprintf(needle, sizeof(needle), "%s", query);
+    for (char *p = needle; *p; p++)
+        *p = (char)tolower((unsigned char)*p);
+    return strstr(hay, needle) != NULL;
+}
+
+/* Pinned rows above the scrollable app results, in on-screen top-to-bottom
+ * order: the calc row (if active) first, then each matched builtin. Treating
+ * these as one ordered list keeps selection/navigation uniform -- `selected`
+ * for the pinned row at list-order index `i` (0 = topmost) is `i - n` where
+ * n = launcher_top_row_count(), so selected == -1 is always the row nearest
+ * the (scrollable) app list and selected == -n is the topmost row. That
+ * generalizes the calc row's original `selected == -1` convention (n was
+ * always 1 there) to any number of pinned rows. */
+static int launcher_top_row_count(const dc_launcher *l)
+{
+    return (l->calc_active ? 1 : 0) + l->builtin_match_count;
+}
+
+static float launcher_top_row_h(const dc_launcher *l, int i)
+{
+    return (l->calc_active && i == 0) ? DC_LAUNCHER_CALC_ROW_H : DC_LAUNCHER_BUILTIN_ROW_H;
+}
+
+static float launcher_top_rows_height(const dc_launcher *l)
+{
+    int n = launcher_top_row_count(l);
+    float h = 0.0f;
+    for (int i = 0; i < n; i++)
+        h += launcher_top_row_h(l, i);
+    return h;
+}
+
+/* selected-value (always < 0, see launcher_top_row_count()'s comment) of the
+ * pinned row under logical (x, y), or 0 if none -- shared by click and
+ * hover. Needs `lay` (not just the launcher) since it's called before
+ * launcher_get_layout() results are otherwise in scope at the two call
+ * sites. */
+static int launcher_top_row_at(const dc_launcher *l, const launcher_layout *lay, double x, double y)
+{
+    int top_n = launcher_top_row_count(l);
+    if (top_n == 0 || x < (double)lay->ix || x > (double)(lay->ix + lay->iw))
+        return 0;
+    float ty = lay->list_y0;
+    for (int i = 0; i < top_n; i++) {
+        float th = launcher_top_row_h(l, i);
+        if (y >= (double)ty && y <= (double)(ty + th))
+            return i - top_n;
+        ty += th;
+    }
+    return 0;
+}
+
 /* Total pixel/row extent of the current result set in the active view mode —
  * shared by scroll clamping and the wheel handler. */
 static float launcher_content_height(const dc_launcher *l)
@@ -254,14 +357,15 @@ static float launcher_content_height(const dc_launcher *l)
     return (float)l->result_count * DC_LAUNCHER_ROW_H;
 }
 
-/* The results area shrinks by the calc banner's height whenever it's shown
- * (docs/POLISH.md P4 item 1) -- every consumer of lay->list_y0/list_h for
+/* The results area shrinks by the pinned rows' height whenever any are shown
+ * (calc row and/or matched builtins, docs/POLISH.md P4 item 1 and
+ * docs/22-NOTEPAD-PLAN.md NT5) -- every consumer of lay->list_y0/list_h for
  * the actual app list/grid (hit-testing, scroll clamping, rendering) goes
  * through this so they can't drift out of sync. */
 static void launcher_results_region(const dc_launcher *l, const launcher_layout *lay, float *y0,
                                     float *h)
 {
-    float off = (l->calc_active && !l->action_mode) ? DC_LAUNCHER_CALC_ROW_H : 0.0f;
+    float off = l->action_mode ? 0.0f : launcher_top_rows_height(l);
     *y0 = lay->list_y0 + off;
     *h = lay->list_h - off;
     if (*h < 0.0f)
@@ -362,22 +466,32 @@ static void run_search(dc_launcher *l)
         }
     }
 
-    l->selected = l->calc_active ? -1 : 0;
+    /* Builtin-entry matches (docs/22-NOTEPAD-PLAN.md NT5), alongside apps. */
+    l->builtin_match_count = 0;
+    for (int i = 0; i < DC_LAUNCHER_BUILTIN_COUNT; i++) {
+        if (builtin_matches_query(&launcher_builtins[i], l->query) &&
+            l->builtin_match_count < DC_LAUNCHER_BUILTIN_MAX)
+            l->builtin_matches[l->builtin_match_count++] = i;
+    }
+
+    int top_n = launcher_top_row_count(l);
+    l->selected = top_n > 0 ? -top_n : 0;
     l->scroll = 0.0f;
 }
 
 /* Keep the selected row/cell scrolled into view (mode-aware). */
 static void clamp_scroll(dc_launcher *l)
 {
-    int floor_idx = l->calc_active ? -1 : 0;
+    int top_n = launcher_top_row_count(l);
+    int floor_idx = top_n > 0 ? -top_n : 0;
     if (l->selected < floor_idx)
         l->selected = floor_idx;
     if (l->selected >= l->result_count)
         l->selected = l->result_count - 1;
     if (l->selected < 0) {
-        /* Either the calc row is selected (-1, calc_active) or there are
-         * truly no results at all. */
-        if (!l->calc_active)
+        /* Either a pinned row (calc and/or a matched builtin) is selected, or
+         * there are truly no results at all. */
+        if (top_n == 0)
             l->selected = 0;
         l->scroll = 0.0f;
         return;
@@ -590,6 +704,34 @@ static void draw_calc_row(dc_launcher *l, const launcher_layout *lay, bool selec
     nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
     nvgFillColor(vg, tc_alpha(t->surface_text, 130));
     nvgText(vg, lay->ix + lay->iw - 14.0f, cy, "\xe2\x8f\x8e copy", NULL); /* enter-glyph "copy" */
+}
+
+/* Builtin-entry row (docs/22-NOTEPAD-PLAN.md NT5): a pinned row above the app
+ * results for a matched builtin (e.g. "Notepad"), same visual family as the
+ * calc row but simpler (icon + name only, no result string) since it's a
+ * plain jump-to-panel action rather than a computed value. `y`/`h` are
+ * passed in (not derived from lay->list_y0 like draw_calc_row) because a
+ * builtin row can be stacked below the calc row and/or other builtin rows. */
+static void draw_builtin_row(dc_launcher *l, const launcher_layout *lay, float y, float h,
+                             const dc_launcher_builtin *b, bool selected)
+{
+    NVGcontext *vg = l->render->vg;
+    const dc_theme *t = dc_theme_current;
+
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, lay->ix, y + 2.0f, lay->iw, h - 4.0f, 10.0f);
+    nvgFillColor(vg, selected ? tc_alpha(t->primary, 46) : tc(t->surface_container_high));
+    nvgFill(vg);
+
+    float cy = y + h / 2.0f;
+    dc_render_icon(l->render, b->icon, lay->ix + 26.0f, cy, 22.0f, t->primary,
+                   NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+
+    nvgFontFaceId(vg, l->render->font_ui);
+    nvgFontSize(vg, 15.0f);
+    nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+    nvgFillColor(vg, tc(t->surface_text));
+    nvgText(vg, lay->ix + 52.0f, cy, b->name, NULL);
 }
 
 /* Breadcrumb above the action sub-list (docs/POLISH.md P4 item 3): back
@@ -880,14 +1022,26 @@ static void launcher_render(dc_launcher *l)
     }
 
     /* Run-actions sub-list (docs/POLISH.md P4 item 3) replaces the normal
-     * header + results entirely while browsing; calc row + list/grid results
-     * (with the calc banner, item 1) render otherwise. */
+     * header + results entirely while browsing; calc row + builtin rows +
+     * list/grid results (docs/POLISH.md P4 item 1, docs/22-NOTEPAD-PLAN.md
+     * NT5) render otherwise, calc first then each matched builtin. */
     if (l->action_mode) {
         draw_action_breadcrumb(l, &lay);
     } else {
         draw_header(l, &lay);
-        if (l->calc_active)
-            draw_calc_row(l, &lay, l->selected == -1);
+        int top_n = launcher_top_row_count(l);
+        float ty = lay.list_y0;
+        for (int i = 0; i < top_n; i++) {
+            float trh = launcher_top_row_h(l, i);
+            bool sel = l->selected == i - top_n;
+            if (l->calc_active && i == 0) {
+                draw_calc_row(l, &lay, sel);
+            } else {
+                int bidx = i - (l->calc_active ? 1 : 0);
+                draw_builtin_row(l, &lay, ty, trh, &launcher_builtins[l->builtin_matches[bidx]], sel);
+            }
+            ty += trh;
+        }
     }
 
     float ry0, list_h;
@@ -1150,6 +1304,12 @@ struct wl_surface *dc_launcher_surface(dc_launcher *l)
     return l->surface;
 }
 
+void dc_launcher_set_builtin_cb(dc_launcher *l, void (*cb)(const char *action, void *ud), void *ud)
+{
+    l->builtin_cb = cb;
+    l->builtin_cb_ud = ud;
+}
+
 /* Copy the calculator row's result to the clipboard via wl-copy, detached
  * the same way clipboard.c's dc_clipboard_copy() does for text entries
  * (docs/POLISH.md P4 item 1: "Enter copies result to clipboard, like DMS"). */
@@ -1178,9 +1338,23 @@ static void launcher_activate_selection(dc_launcher *l)
         }
         return;
     }
-    if (l->calc_active && l->selected == -1) {
-        launcher_copy_calc_result(l);
-        launcher_begin_close(l);
+    if (l->selected < 0) {
+        /* Pinned row (calc and/or a matched builtin) -- see the
+         * launcher_top_row_count() comment for the selected-value mapping. */
+        int top_n = launcher_top_row_count(l);
+        int top_idx = top_n + l->selected;
+        if (l->calc_active && top_idx == 0) {
+            launcher_copy_calc_result(l);
+            launcher_begin_close(l);
+            return;
+        }
+        int bidx = top_idx - (l->calc_active ? 1 : 0);
+        if (bidx >= 0 && bidx < l->builtin_match_count) {
+            const dc_launcher_builtin *b = &launcher_builtins[l->builtin_matches[bidx]];
+            if (l->builtin_cb)
+                l->builtin_cb(b->action, l->builtin_cb_ud);
+            launcher_begin_close(l);
+        }
         return;
     }
     if (l->selected >= 0 && l->selected < l->result_count) {
@@ -1285,7 +1459,8 @@ void dc_launcher_handle_key(dc_launcher *l, uint32_t keysym, const char *utf8)
         if (l->action_mode) {
             l->action_selected = 0;
         } else {
-            l->selected = l->calc_active ? -1 : 0;
+            int top_n = launcher_top_row_count(l);
+            l->selected = top_n > 0 ? -top_n : 0;
             clamp_scroll(l);
         }
         break;
@@ -1356,10 +1531,11 @@ void dc_launcher_handle_click(dc_launcher *l, double x, double y)
         return;
     }
 
-    /* Calculator banner (docs/POLISH.md P4 item 1): click == Enter, copies. */
-    if (l->calc_active && in_rect(x, y, lay.ix, lay.list_y0, lay.ix + lay.iw,
-                                  lay.list_y0 + DC_LAUNCHER_CALC_ROW_H)) {
-        l->selected = -1;
+    /* Pinned rows (calc banner and/or matched builtins, docs/POLISH.md P4
+     * item 1 + docs/22-NOTEPAD-PLAN.md NT5): click == Enter, activates. */
+    int top_sel = launcher_top_row_at(l, &lay, x, y);
+    if (top_sel != 0) {
+        l->selected = top_sel;
         launcher_activate_selection(l);
         return;
     }
@@ -1392,11 +1568,12 @@ void dc_launcher_handle_motion(dc_launcher *l, double x, double y)
         return;
     }
 
-    /* Hovering the calc banner selects it (selected = -1), same as rows. */
-    if (l->calc_active && in_rect(x, y, lay.ix, lay.list_y0, lay.ix + lay.iw,
-                                  lay.list_y0 + DC_LAUNCHER_CALC_ROW_H)) {
-        if (l->selected != -1) {
-            l->selected = -1;
+    /* Hovering a pinned row (calc banner and/or a matched builtin) selects
+     * it, same as rows -- docs/22-NOTEPAD-PLAN.md NT5. */
+    int top_sel = launcher_top_row_at(l, &lay, x, y);
+    if (top_sel != 0) {
+        if (l->selected != top_sel) {
+            l->selected = top_sel;
             launcher_render(l);
         }
         return;
