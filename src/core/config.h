@@ -41,10 +41,37 @@ typedef struct dc_notif_rule {
 /* App dock pinned-apps list (see dock_pinned below). */
 #define DC_CONFIG_DOCK_PINNED_MAX 16
 
+/* Audio per-device config (docs/25-AUDIO-PERDEVICE-PLAN.md sec.3 "Config
+ * surface", T2): keyed by pipewire node.name, which runs longer (~45 chars
+ * for a typical USB/HDMI sink) than DC_CONFIG_WIDGET_ID_MAX (32) so these get
+ * their own wider name buffer. Capped at 16 devices each; a full table
+ * evicts the oldest entry to make room for a new one (stale entries from a
+ * USB device that moved ports are harmless, just wasted slots). */
+#define DC_CONFIG_AUDIO_DEVICES_MAX 16
+#define DC_CONFIG_AUDIO_NAME_MAX 96
+#define DC_CONFIG_AUDIO_ALIAS_MAX 48
+
 typedef enum {
     DC_BAR_POSITION_TOP = 0,
     DC_BAR_POSITION_BOTTOM,
 } dc_bar_position;
+
+/* Per-device max-volume clamp entry ("audioDeviceMaxVolumes" JSON object,
+ * node.name -> percent). max_percent is stored clamped to 100-200; a device
+ * with no entry uses the plain 100 default (dc_config_audio_max()). */
+typedef struct dc_audio_max_entry {
+    char name[DC_CONFIG_AUDIO_NAME_MAX];
+    int max_percent;
+} dc_audio_max_entry;
+
+/* Per-device display-name override ("audioDeviceAliases" JSON object,
+ * node.name -> alias string). dankc-config-only (D3 in the plan doc): no
+ * wireplumber file is written, so applying an alias never audibly
+ * interrupts audio. */
+typedef struct dc_audio_alias_entry {
+    char name[DC_CONFIG_AUDIO_NAME_MAX];
+    char alias[DC_CONFIG_AUDIO_ALIAS_MAX];
+} dc_audio_alias_entry;
 
 typedef struct dc_config {
     char theme_id[DC_CONFIG_THEME_MAX];   /* built-in palette id, e.g. "green" */
@@ -340,6 +367,17 @@ typedef struct dc_config {
     int idle_suspend_batt_min;
     int idle_hibernate_ac_min;
     int idle_hibernate_batt_min;
+
+    /* Audio per-device config (docs/25-AUDIO-PERDEVICE-PLAN.md sec.3, T2):
+     * flat parallel tables keyed by pipewire node.name (config.c has no map
+     * type). Unused until T3 (audio.c enforces the max clamp + resolves
+     * aliases) and T4/T5 (settings.c/controlcenter.c UI) land. */
+    dc_audio_max_entry audio_max_volumes[DC_CONFIG_AUDIO_DEVICES_MAX];
+    int audio_max_volumes_n;
+    dc_audio_alias_entry audio_aliases[DC_CONFIG_AUDIO_DEVICES_MAX];
+    int audio_aliases_n;
+    char audio_hidden[DC_CONFIG_AUDIO_DEVICES_MAX][DC_CONFIG_AUDIO_NAME_MAX];
+    int audio_hidden_n;
 } dc_config;
 
 /* The active config. Read-only for the rest of the app. */
@@ -365,5 +403,20 @@ void dc_config_save(void);
  * reconfigures + redraws the bars. */
 void dc_config_set_change_cb(void (*cb)(void *ud), void *ud);
 void dc_config_notify_changed(void);
+
+/* Audio per-device config accessors (docs/25-AUDIO-PERDEVICE-PLAN.md sec.3,
+ * T2). All keyed by pipewire node.name; `name` may be NULL/empty, in which
+ * case the accessors return the "no entry" default and the setters are a
+ * no-op. Setters remove the table entry when reset to the default value
+ * (max_percent<=100 / alias empty-or-NULL / hidden=false) so config.json
+ * doesn't accumulate no-op entries; a full table evicts its oldest entry to
+ * make room for a new one. */
+int dc_config_audio_max(const char *name);          /* default 100 */
+const char *dc_config_audio_alias(const char *name); /* NULL if none set */
+bool dc_config_audio_hidden(const char *name);
+
+void dc_config_audio_set_max(const char *name, int max_percent);
+void dc_config_audio_set_alias(const char *name, const char *alias);
+void dc_config_audio_set_hidden(const char *name, bool hidden);
 
 #endif /* DC_CORE_CONFIG_H */
