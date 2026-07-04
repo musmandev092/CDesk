@@ -1013,6 +1013,15 @@ static void autostart_timer_cb(int fd, uint32_t revents, void *user_data)
     close(fd);
 }
 
+/* docs/22-NOTEPAD-PLAN.md sec.2.6: dc_wayland owns the key-repeat timerfd;
+ * this just drives it from the event loop like any other fd. */
+static void wl_repeat_readable(int fd, uint32_t revents, void *user_data)
+{
+    DC_UNUSED(fd);
+    DC_UNUSED(revents);
+    dc_wayland_repeat_fire((dc_wayland *)user_data);
+}
+
 int main(int argc, char **argv)
 {
     /* Client modes exit immediately without starting the shell. */
@@ -1245,6 +1254,8 @@ int main(int argc, char **argv)
 
     g_loop = dc_loop_create();
     dc_wayland_integrate(wl, g_loop);
+    if (dc_wayland_repeat_fd(wl) >= 0)
+        dc_loop_add_fd(g_loop, dc_wayland_repeat_fd(wl), POLLIN, wl_repeat_readable, wl);
     dc_niri_integrate(niri, g_loop);
     struct niri_dock_ctx niri_dock_ctx = {.set = &set, .dock = dock};
     dc_niri_set_changed_cb(niri, niri_and_dock_changed, &niri_dock_ctx);

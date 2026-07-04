@@ -9,8 +9,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 #include <xkbcommon/xkbcommon.h>
+#include <xkbcommon/xkbcommon-names.h>
 
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #include "wlr-data-control-unstable-v1-client-protocol.h"
@@ -26,6 +28,12 @@
  * turning accumulated continuous motion into discrete steps
  * (docs/12-BAR-SPEC.md sec.5). */
 #define DC_AXIS_STEP_THRESHOLD 10.0
+
+/* Fallback key-repeat rate/delay (docs/22-NOTEPAD-PLAN.md sec.2.6) for the
+ * rare compositor that sends a zero rate/delay in wl_keyboard.repeat_info
+ * instead of just omitting the event. */
+#define DC_KEY_REPEAT_RATE_HZ 25
+#define DC_KEY_REPEAT_DELAY_MS 600
 
 /* --- wl_output ---------------------------------------------------------- */
 
@@ -301,6 +309,42 @@ static const struct wl_pointer_listener pointer_listener = {
 
 /* --- keyboard (xkb) ----------------------------------------------------- */
 
+/* Stop any in-flight key repeat: disarm the timerfd and clear the candidate
+ * (docs/22-NOTEPAD-PLAN.md sec.2.6). Safe to call when nothing is repeating. */
+static void repeat_disarm(dc_wayland *wl)
+{
+    if (wl->repeat_timerfd >= 0) {
+        struct itimerspec none = {0};
+        timerfd_settime(wl->repeat_timerfd, 0, &none, NULL);
+    }
+    wl->repeat_keycode = 0;
+}
+
+/* Arm the repeat timerfd for the just-pressed, repeatable `keycode`: fires
+ * once after repeat_delay, then automatically every 1000/repeat_rate ms
+ * (the kernel handles the periodic re-arm via it_interval) until disarmed. */
+static void repeat_arm(dc_wayland *wl, xkb_keycode_t keycode, xkb_keysym_t sym, const char *utf8)
+{
+    if (wl->repeat_timerfd < 0)
+        return;
+
+    wl->repeat_keycode = keycode;
+    wl->repeat_keysym = (uint32_t)sym;
+    strncpy(wl->repeat_utf8, utf8, sizeof(wl->repeat_utf8) - 1);
+    wl->repeat_utf8[sizeof(wl->repeat_utf8) - 1] = '\0';
+
+    int32_t delay = wl->repeat_delay > 0 ? wl->repeat_delay : DC_KEY_REPEAT_DELAY_MS;
+    int32_t rate = wl->repeat_rate > 0 ? wl->repeat_rate : DC_KEY_REPEAT_RATE_HZ;
+    long interval_ns = 1000000000L / rate;
+
+    struct itimerspec spec = {0};
+    spec.it_value.tv_sec = delay / 1000;
+    spec.it_value.tv_nsec = (long)(delay % 1000) * 1000000L;
+    spec.it_interval.tv_sec = interval_ns / 1000000000L;
+    spec.it_interval.tv_nsec = interval_ns % 1000000000L;
+    timerfd_settime(wl->repeat_timerfd, 0, &spec, NULL);
+}
+
 static void keyboard_handle_keymap(void *data, struct wl_keyboard *kbd, uint32_t format, int fd,
                                    uint32_t size)
 {
@@ -343,10 +387,14 @@ static void keyboard_handle_enter(void *data, struct wl_keyboard *kbd, uint32_t 
 static void keyboard_handle_leave(void *data, struct wl_keyboard *kbd, uint32_t serial,
                                   struct wl_surface *surface)
 {
-    DC_UNUSED(data);
+    dc_wayland *wl = data;
     DC_UNUSED(kbd);
     DC_UNUSED(serial);
     DC_UNUSED(surface);
+    /* Losing keyboard focus ends any in-flight repeat -- there is no longer
+     * a panel that should keep receiving the held key (docs/22-NOTEPAD-PLAN.md
+     * sec.2.6). */
+    repeat_disarm(wl);
 }
 
 static void keyboard_handle_key(void *data, struct wl_keyboard *kbd, uint32_t serial, uint32_t time,
@@ -356,14 +404,30 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *kbd, uint32_t se
     DC_UNUSED(kbd);
     DC_UNUSED(serial);
     DC_UNUSED(time);
-    if (state != WL_KEYBOARD_KEY_STATE_PRESSED || !wl->xkb_state || !wl->key_cb)
-        return;
 
     xkb_keycode_t keycode = key + 8; /* evdev -> xkb offset */
+
+    /* Releases carry no text/panel-facing behavior (unchanged from before) --
+     * they're only honored here to end a matching in-flight repeat
+     * (docs/22-NOTEPAD-PLAN.md sec.2.6). */
+    if (state != WL_KEYBOARD_KEY_STATE_PRESSED) {
+        if (wl->repeat_keycode == keycode)
+            repeat_disarm(wl);
+        return;
+    }
+
+    if (!wl->xkb_state || !wl->key_cb)
+        return;
+
     xkb_keysym_t sym = xkb_state_key_get_one_sym(wl->xkb_state, keycode);
     char utf8[64];
     xkb_state_key_get_utf8(wl->xkb_state, keycode, utf8, sizeof(utf8));
     wl->key_cb((uint32_t)sym, utf8, wl->key_data);
+
+    if (wl->xkb_keymap && xkb_keymap_key_repeats(wl->xkb_keymap, keycode))
+        repeat_arm(wl, keycode, sym, utf8);
+    else if (wl->repeat_keycode == keycode)
+        repeat_disarm(wl); /* keymap changed under us; don't keep repeating */
 }
 
 static void keyboard_handle_modifiers(void *data, struct wl_keyboard *kbd, uint32_t serial,
@@ -380,10 +444,15 @@ static void keyboard_handle_modifiers(void *data, struct wl_keyboard *kbd, uint3
 static void keyboard_handle_repeat_info(void *data, struct wl_keyboard *kbd, int32_t rate,
                                         int32_t delay)
 {
-    DC_UNUSED(data);
+    dc_wayland *wl = data;
     DC_UNUSED(kbd);
-    DC_UNUSED(rate);
-    DC_UNUSED(delay);
+    /* A rate of 0 means "no repeat" per the protocol, but DankC has no
+     * per-key opt-out path yet, so treat a nonsensical 0 the same as an
+     * unset value and fall back rather than silently never repeating
+     * (docs/22-NOTEPAD-PLAN.md sec.2.6); repeat_arm() re-clamps the same way
+     * on every arm in case this event never arrives at all. */
+    wl->repeat_rate = rate > 0 ? rate : DC_KEY_REPEAT_RATE_HZ;
+    wl->repeat_delay = delay > 0 ? delay : DC_KEY_REPEAT_DELAY_MS;
 }
 
 static const struct wl_keyboard_listener keyboard_listener = {
@@ -514,10 +583,15 @@ dc_wayland *dc_wayland_connect(void)
 {
     dc_wayland *wl = calloc(1, sizeof(*wl));
     wl_list_init(&wl->outputs);
+    wl->repeat_rate = DC_KEY_REPEAT_RATE_HZ;
+    wl->repeat_delay = DC_KEY_REPEAT_DELAY_MS;
+    wl->repeat_timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
 
     wl->display = wl_display_connect(NULL);
     if (!wl->display) {
         dc_error("wl_display_connect failed (is WAYLAND_DISPLAY set?)");
+        if (wl->repeat_timerfd >= 0)
+            close(wl->repeat_timerfd);
         free(wl);
         return NULL;
     }
@@ -563,6 +637,8 @@ void dc_wayland_destroy(dc_wayland *wl)
         xkb_keymap_unref(wl->xkb_keymap);
     if (wl->xkb_context)
         xkb_context_unref(wl->xkb_context);
+    if (wl->repeat_timerfd >= 0)
+        close(wl->repeat_timerfd);
 
     if (wl->registry)
         wl_registry_destroy(wl->registry);
@@ -664,4 +740,35 @@ void dc_wayland_integrate(dc_wayland *wl, struct dc_loop *loop)
     int fd = wl_display_get_fd(wl->display);
     dc_loop_add_fd(loop, fd, POLLIN, wayland_readable, wl);
     dc_loop_set_prepare(loop, wayland_prepare, wl);
+}
+
+int dc_wayland_repeat_fd(dc_wayland *wl)
+{
+    return wl->repeat_timerfd;
+}
+
+void dc_wayland_repeat_fire(dc_wayland *wl)
+{
+    uint64_t expirations;
+    if (read(wl->repeat_timerfd, &expirations, sizeof(expirations)) < 0)
+        return;
+    if (wl->repeat_keycode == 0 || !wl->key_cb)
+        return;
+    wl->key_cb(wl->repeat_keysym, wl->repeat_utf8, wl->key_data);
+}
+
+bool dc_wayland_ctrl_down(dc_wayland *wl)
+{
+    if (!wl->xkb_state)
+        return false;
+    return xkb_state_mod_name_is_active(wl->xkb_state, XKB_MOD_NAME_CTRL,
+                                        XKB_STATE_MODS_EFFECTIVE) > 0;
+}
+
+bool dc_wayland_shift_down(dc_wayland *wl)
+{
+    if (!wl->xkb_state)
+        return false;
+    return xkb_state_mod_name_is_active(wl->xkb_state, XKB_MOD_NAME_SHIFT,
+                                        XKB_STATE_MODS_EFFECTIVE) > 0;
 }
