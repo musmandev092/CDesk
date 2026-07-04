@@ -122,7 +122,7 @@ $(TP_OBJ): %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -rf bin protocol/generated $(OBJ) $(CXX_OBJ) $(TP_OBJ) $(PROTO_O) $(DEPS) bin/test_calc
+	rm -rf bin protocol/generated $(OBJ) $(CXX_OBJ) $(TP_OBJ) $(PROTO_O) $(DEPS) bin/test_calc bin/test_text_edit
 
 DEPS := $(OBJ:.o=.d) $(CXX_OBJ:.o=.d)
 -include $(DEPS)
@@ -139,6 +139,24 @@ bin/test_calc: tests/test_calc.c src/services/calc.c src/services/calc.h
 test-calc: bin/test_calc
 	./bin/test_calc
 
+# Standalone unit test for the multi-line text-editor widget's PURE ops
+# (src/ui/text_edit.c) -- see tests/test_text_edit_stubs.c for why this still
+# needs a handful of trivial nanovg/theme/anim link stubs even though it
+# never creates a GL context: text_edit.c is one translation unit that also
+# contains the EGL-dependent layout/draw code, and linking a .o directly (not
+# pulled a symbol at a time out of an archive) requires every symbol it
+# references to resolve, even ones this test never actually calls.
+bin/test_text_edit: tests/test_text_edit.c tests/test_text_edit_stubs.c src/ui/text_edit.c \
+	src/ui/text_edit.h src/core/log.c
+	@mkdir -p bin
+	$(CC) -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Isrc -Ithird_party/nanovg \
+		$(WARNINGS) -O2 -g \
+		-o $@ tests/test_text_edit.c tests/test_text_edit_stubs.c src/ui/text_edit.c \
+		src/core/log.c -lm
+
+test-text-edit: bin/test_text_edit
+	./bin/test_text_edit
+
 # Shipped/packaged build: -O2 -flto -DNDEBUG, no -g (see OPT_FLAGS above).
 # Object files from a dev build aren't LTO/flag-compatible, so always start
 # from clean.
@@ -146,4 +164,4 @@ release:
 	$(MAKE) clean
 	$(MAKE) RELEASE=1 all
 
-.PHONY: all clean test-calc release
+.PHONY: all clean test-calc test-text-edit release
