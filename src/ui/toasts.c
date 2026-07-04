@@ -1,6 +1,7 @@
 #include "ui/toasts.h"
 
 #include "core/anim.h"
+#include "core/config.h"
 #include "core/log.h"
 #include "dc.h"
 #include "render/icons.h"
@@ -193,10 +194,17 @@ static void draw_card(dc_toasts *t, const dc_notification *n, float x, float y, 
     nvgFontSize(vg, 14.0f);
     nvgFillColor(vg, nvgRGBA(th->surface_text.r, th->surface_text.g, th->surface_text.b, 255));
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_TOP);
+    /* Privacy mode (docs/26-DND-SCHEDULING-PLAN.md privacy section): render-
+     * time only redaction -- the stored dc_notification (n->summary/body) is
+     * untouched, so the notification center's full-detail view (which reads
+     * the same struct) is unaffected. Just the toast popup summary is
+     * replaced and the body is skipped entirely. */
+    bool privacy = dc_config_current && dc_config_current->notif_privacy_mode;
+    const char *disp_summary = privacy ? "New notification" : n->summary;
     /* Single-line summary, ellipsised by clipping. */
     nvgSave(vg);
     nvgScissor(vg, tx, y + 30.0f, tw, 18.0f);
-    dc_shape_draw_text(t->render, tx, y + 31.0f, n->summary, NULL);
+    dc_shape_draw_text(t->render, tx, y + 31.0f, disp_summary, NULL);
     nvgRestore(vg);
 
     /* Body text yields its bottom rows to a pill-button row when the
@@ -204,7 +212,7 @@ static void draw_card(dc_toasts *t, const dc_notification *n, float x, float y, 
      * reserves basePopupHeight for actionButtonHeight the same way). */
     bool has_actions = n->action_count > 0;
     float body_h = has_actions ? 16.0f : 30.0f;
-    if (n->body[0]) {
+    if (n->body[0] && !privacy) {
         nvgFontSize(vg, 13.0f);
         nvgFillColor(vg, nvgRGBA(th->surface_text.r, th->surface_text.g, th->surface_text.b, 170));
         nvgSave(vg);
