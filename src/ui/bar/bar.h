@@ -79,6 +79,12 @@ typedef enum {
     /* screenRecorder widget (docs/29-SMALL-FEATURES-PLAN.md sec.5 T3):
      * toggles dc_screenrec_start()/_stop() from main.c's click dispatch. */
     DC_BAR_REGION_SCREENREC,
+    /* systemUpdate widget: opens Settings on the System Updater tab
+     * (dc_settings_toggle_tab(), DC_SETTINGS_TAB_UPDATER). */
+    DC_BAR_REGION_SYSTEM_UPDATE,
+    /* vpn widget: opens Settings on the Network tab
+     * (dc_settings_toggle_tab(), DC_SETTINGS_TAB_NETWORK). */
+    DC_BAR_REGION_VPN,
 } dc_bar_region;
 
 /* Which region a surface-local logical coordinate falls in, from the last
