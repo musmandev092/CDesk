@@ -122,7 +122,7 @@ $(TP_OBJ): %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -rf bin protocol/generated $(OBJ) $(CXX_OBJ) $(TP_OBJ) $(PROTO_O) $(DEPS) bin/test_calc bin/test_text_edit
+	rm -rf bin protocol/generated $(OBJ) $(CXX_OBJ) $(TP_OBJ) $(PROTO_O) $(DEPS) bin/test_calc bin/test_text_edit bin/test_systheme
 
 DEPS := $(OBJ:.o=.d) $(CXX_OBJ:.o=.d)
 -include $(DEPS)
@@ -157,6 +157,32 @@ bin/test_text_edit: tests/test_text_edit.c tests/test_text_edit_stubs.c src/ui/t
 test-text-edit: bin/test_text_edit
 	./bin/test_text_edit
 
+# Standalone unit test for the system-theming engine's PURE/file-IO helpers
+# (src/services/systheme.c: hex formatting, contrast pick, the
+# ensure_line()/ensure_line_top() marker-injector idempotency+backup
+# contract, and write_owned() atomicity) -- see tests/test_systheme_stubs.c
+# for why this still needs link-only no-op stand-ins for the ~30 per-app
+# emitters (systheme_apps.c et al, never built here)/dc_config_light_mode()/
+# dc_theme_current that systheme.c's dc_systheme_apply()/apply_gtk() also
+# reference: linking systheme.o directly requires every symbol it mentions
+# to resolve, even ones this test never calls. -flto=auto matches the real
+# OPT_FLAGS profile above and (unlike a plain -O2 build of systheme.c in
+# isolation) avoids a spurious -Wformat-truncation on gtk_dir()'s snprintf
+# that only appears without the fuller inlining context LTO provides --
+# same false-positive shape gcc gives depending on inlining depth, not a
+# real bug (the real `make`/meson builds of dankc, which also use
+# -flto=auto, never emit it either).
+bin/test_systheme: tests/test_systheme.c tests/test_systheme_stubs.c src/services/systheme.c \
+	src/services/systheme.h src/services/systheme_internal.h src/core/log.c
+	@mkdir -p bin
+	$(CC) -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Isrc \
+		$(WARNINGS) -O2 -g -flto=auto \
+		-o $@ tests/test_systheme.c tests/test_systheme_stubs.c src/services/systheme.c \
+		src/core/log.c -lm
+
+test-systheme: bin/test_systheme
+	./bin/test_systheme
+
 # Shipped/packaged build: -O2 -flto -DNDEBUG, no -g (see OPT_FLAGS above).
 # Object files from a dev build aren't LTO/flag-compatible, so always start
 # from clean.
@@ -164,4 +190,4 @@ release:
 	$(MAKE) clean
 	$(MAKE) RELEASE=1 all
 
-.PHONY: all clean test-calc test-text-edit release
+.PHONY: all clean test-calc test-text-edit test-systheme release
