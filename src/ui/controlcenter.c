@@ -29,7 +29,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <time.h>
 #include <unistd.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
 
@@ -722,11 +721,52 @@ static void run_self_ctl(const char *subcmd)
     }
 }
 
+/* Find the current default Audio/Sink or Audio/Source device in the audio
+ * service's device cache (docs/25-AUDIO-PERDEVICE-PLAN.md T5). Returns NULL
+ * if the cache hasn't populated yet (async pw-dump warm-up) or there's no
+ * default. `out` must hold at least `max` entries and stay alive as long as
+ * the returned pointer is used (it points into `out`). */
+static const dc_audio_device *cc_find_default_device(dc_audio_device *out, int max, bool source)
+{
+    int n = source ? dc_audio_sources(out, max) : dc_audio_sinks(out, max);
+    for (int i = 0; i < n; i++) {
+        if (out[i].is_default)
+            return &out[i];
+    }
+    return NULL;
+}
+
+/* Toggle the current default sink's (source=false) or source's (source=true)
+ * mute state via the audio service's per-device setter (docs/25-AUDIO-
+ * PERDEVICE-PLAN.md T5) -- self-invalidates the device cache, replacing the
+ * old `wpctl set-mute @DEFAULT_...@ toggle` run_detached() + g_audio_dirty
+ * semantics. No-op if no default device is currently known. */
+static void cc_toggle_default_mute(bool source)
+{
+    dc_audio_device devs[16];
+    const dc_audio_device *dev = cc_find_default_device(devs, 16, source);
+    if (dev)
+        dc_audio_device_toggle_mute(dev->id);
+}
+
 /* Apply a 0..1 volume fraction via the audio service's setter (docs/13-
- * POPOUTS-SPEC.md sec.1 slider drag) -- shared by click-to-set and every
- * motion event of a live drag. */
+ * POPOUTS-SPEC.md sec.1 slider drag; docs/25-AUDIO-PERDEVICE-PLAN.md T5) --
+ * shared by click-to-set and every motion event of a live drag. The fraction
+ * maps onto the default sink's *configured* max (dc_config_audio_max(),
+ * 100-200) rather than a flat 100, so a device configured for e.g. 150% can
+ * be driven all the way up by the slider; dc_audio_device_set_volume() clamps
+ * defensively to that same max regardless. Falls back to the legacy
+ * default-sink setter (100% scale) if the device cache hasn't populated yet
+ * (async pw-dump warm-up window). */
 static void cc_apply_volume_frac(float frac)
 {
+    dc_audio_device devs[16];
+    const dc_audio_device *dev = cc_find_default_device(devs, 16, false);
+    if (dev) {
+        int max = dc_config_audio_max(dev->name);
+        dc_audio_device_set_volume(dev->id, (int)(frac * (float)max + 0.5f));
+        return;
+    }
     dc_audio_set_volume((int)(frac * 100.0f + 0.5f));
 }
 
@@ -839,121 +879,6 @@ static void cc_ellipsize(dc_render *render, char *buf, size_t bufsize, float max
         bufsize = sizeof(tmp);
     dc_shape_ellipsize(render, buf, max_w, tmp, bufsize);
     memcpy(buf, tmp, bufsize);
-}
-
-/* Mirrors services/audio.c's dc_audio_read() for the default *source* (mic):
- * same wpctl tool, same "Volume: %f [MUTED]" parsing, same per-second cache.
- * Kept local (rather than extending audio.h, out of this task's touch-scope)
- * since audio.h's dc_audio_read() only ever targets @DEFAULT_AUDIO_SINK@. */
-static bool audio_source_read(dc_audio_info *out)
-{
-    static dc_audio_info cache;
-    static bool cache_ok;
-    static time_t cache_time;
-
-    time_t now = time(NULL);
-    if (cache_time == now) {
-        *out = cache;
-        return cache_ok;
-    }
-
-    out->available = false;
-    out->volume = 0;
-    out->muted = false;
-
-    FILE *pipe = popen("wpctl get-volume @DEFAULT_AUDIO_SOURCE@ 2>/dev/null", "r");
-    if (!pipe)
-        return false;
-
-    char line[128];
-    bool ok = false;
-    if (fgets(line, sizeof(line), pipe)) {
-        float volume = 0.0f;
-        if (sscanf(line, "Volume: %f", &volume) == 1) {
-            out->volume = (int)(volume * 100.0f + 0.5f);
-            out->available = true;
-            ok = true;
-        }
-        if (strstr(line, "MUTED"))
-            out->muted = true;
-    }
-    pclose(pipe);
-
-    cache = *out;
-    cache_ok = ok;
-    cache_time = now;
-    return ok;
-}
-
-/* The default sink/source's human-readable device name (e.g. "Built-in Audio
- * Analog Stereo"), parsed from `wpctl status`'s starred Sinks:/Sources: line
- * -- audio.h has no device-name field (out of touch-scope to add one), and
- * this reuses the same wpctl binary/popen pattern as dc_audio_read() rather
- * than introducing a new IPC mechanism. Cached per-second like the reads
- * above (this can be called once per render frame during the entrance
- * animation). */
-static void read_audio_device_names(char *sink_name, size_t sink_sz, char *source_name,
-                                     size_t source_sz)
-{
-    static char cached_sink[64];
-    static char cached_source[64];
-    static time_t cache_time;
-
-    time_t now = time(NULL);
-    if (cache_time != now) {
-        cache_time = now;
-        cached_sink[0] = '\0';
-        cached_source[0] = '\0';
-
-        FILE *pipe = popen("wpctl status 2>/dev/null", "r");
-        if (pipe) {
-            char line[256];
-            int section = 0; /* 0=other, 1=sinks, 2=sources */
-            while (fgets(line, sizeof(line), pipe)) {
-                if (strstr(line, "Video")) /* the Audio block always comes first */
-                    break;
-                if (strstr(line, "Sinks:")) {
-                    section = 1;
-                    continue;
-                }
-                if (strstr(line, "Sources:")) {
-                    section = 2;
-                    continue;
-                }
-                if (strstr(line, "Filters:") || strstr(line, "Streams:") ||
-                    strstr(line, "Devices:")) {
-                    section = 0;
-                    continue;
-                }
-                if (section == 0)
-                    continue;
-                char *star = strchr(line, '*');
-                if (!star)
-                    continue;
-                char *dot = strchr(star, '.');
-                if (!dot)
-                    continue;
-                char *name = dot + 1;
-                while (*name == ' ')
-                    name++;
-                char *bracket = strchr(name, '[');
-                size_t len = bracket ? (size_t)(bracket - name) : strlen(name);
-                while (len > 0 &&
-                       (name[len - 1] == ' ' || name[len - 1] == '\n' || name[len - 1] == '\r'))
-                    len--;
-                char *dst = section == 1 ? cached_sink : cached_source;
-                size_t dst_sz = section == 1 ? sizeof(cached_sink) : sizeof(cached_source);
-                if (len >= dst_sz)
-                    len = dst_sz - 1;
-                memcpy(dst, name, len);
-                dst[len] = '\0';
-            }
-            pclose(pipe);
-        }
-    }
-
-    snprintf(sink_name, sink_sz, "%s", cached_sink);
-    snprintf(source_name, source_sz, "%s", cached_source);
 }
 
 /* Media-active + expand-panel state, gathered once per render/click/motion
@@ -1906,23 +1831,38 @@ static void cc_render(dc_control_center *cc)
     dc_audio_info audio_out;
     bool have_out = dc_audio_read(&audio_out);
     dc_audio_info audio_in;
-    bool have_in = audio_source_read(&audio_in);
+    bool have_in = dc_audio_read_source(&audio_in);
     dc_net_info net;
     dc_net_wifi(&net);
     dc_bluez_info bt;
     bool have_bt = dc_bluez_read(&bt);
-    char sink_name[64], source_name[64];
-    read_audio_device_names(sink_name, sizeof(sink_name), source_name, sizeof(source_name));
+
+    /* Default sink/source lookups (docs/25-AUDIO-PERDEVICE-PLAN.md T5) --
+     * replaces the private wpctl-status parser that used to live in this
+     * file. dc_audio_display_name() is alias-aware (dc_config_audio_alias()
+     * if the user set one, else the raw pw-dump description); the output
+     * slider's max comes from the default sink's configured max-volume
+     * (dc_config_audio_max(), 100-200, docs/25-AUDIO-PERDEVICE-PLAN.md D4). */
+    dc_audio_device out_devs[16], in_devs[16];
+    const dc_audio_device *def_out = cc_find_default_device(out_devs, 16, false);
+    const dc_audio_device *def_in = cc_find_default_device(in_devs, 16, true);
+    const char *sink_name = dc_audio_display_name(def_out);
+    const char *source_name = dc_audio_display_name(def_in);
+    int out_max = def_out ? dc_config_audio_max(def_out->name) : 100;
     float brightness = read_brightness();
 
     /* --- Sliders: volume + brightness, side by side --------------------
      * While a slider is being dragged (docs/13-POPOUTS-SPEC.md sec.1), show
      * the dragged fraction directly rather than re-reading system state —
      * wpctl/brightnessctl round-trip async, so reading back mid-drag would
-     * either show a stale value or race the write. */
+     * either show a stale value or race the write. The output slider's 0..1
+     * range maps onto the default sink's configured max (docs/25-AUDIO-
+     * PERDEVICE-PLAN.md D4/T5) rather than a flat 100%, so a device allowed
+     * up to e.g. 150% fills the slider at its own ceiling rather than
+     * appearing stuck around the halfway mark. */
     float vol_frac = (cc->slider_dragging && cc->slider_drag_slot == 0)
                          ? cc->slider_drag_value
-                         : (have_out ? audio_out.volume / 100.0f : 0.5f);
+                         : (have_out ? audio_out.volume / (float)out_max : 0.5f);
     float bright_frac = (cc->slider_dragging && cc->slider_drag_slot == 1)
                             ? cc->slider_drag_value
                             : (brightness >= 0.0f ? brightness : 0.7f);
@@ -2473,11 +2413,12 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
     }
 
     /* Tile grid: wifi/bluetooth toggle rfkill (unchanged from before);
-     * audioOutput/audioInput toggle mute via the same wpctl already used by
-     * the sliders above (new, but reuses the exact tool/pattern -- these
-     * tiles didn't exist as clickable elements before this task); darkMode
-     * toggles dynamic color (see cc_render()'s comment); nightMode stays a
-     * no-op (no backing service yet). */
+     * audioOutput/audioInput toggle mute via the audio service's per-device
+     * setter (docs/25-AUDIO-PERDEVICE-PLAN.md T5 -- dc_audio_device_toggle_
+     * mute() self-invalidates the device cache, replacing the old
+     * `wpctl set-mute @DEFAULT_...@ toggle` run_detached() + g_audio_dirty
+     * semantics); darkMode toggles dynamic color (see cc_render()'s comment);
+     * nightMode stays a no-op (no backing service yet). */
     for (int row = 0; row < 3; row++) {
         float ry = cc_tile_y(&l, row);
         if (y < (double)ry || y > (double)(ry + l.tile_h))
@@ -2491,9 +2432,9 @@ void dc_control_center_handle_click(dc_control_center *cc, double x, double y)
             else if (row == 0 && col == 1)
                 run_detached("rfkill toggle bluetooth");
             else if (row == 1 && col == 0)
-                run_detached("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
+                cc_toggle_default_mute(false);
             else if (row == 1 && col == 1)
-                run_detached("wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle");
+                cc_toggle_default_mute(true);
             else if (row == 2 && col == 1) {
                 dc_config *cfg = dc_config_mut();
                 cfg->dynamic_color = !cfg->dynamic_color;
