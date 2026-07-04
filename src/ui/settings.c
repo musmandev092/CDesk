@@ -11,6 +11,7 @@
 #include "services/bluez.h"
 #include "services/display.h"
 #include "services/firewall.h"
+#include "services/logind.h"
 #include "services/net.h"
 #include "services/nightlight.h"
 #include "services/niri_input.h"
@@ -2618,18 +2619,62 @@ static void tab_power(uictx *c)
     dc_power_info pw;
     if (!dc_power_read(&pw)) {
         ui_hint(c, "No power-profile backend (power-profiles-daemon or tuned) detected");
-        return;
+    } else {
+        static const char *const opts[3] = {"Power Saver", "Balanced", "Performance"};
+        int cur = (int)pw.active_mode; /* -1 (unknown) selects nothing */
+        int clicked = ui_segmented(c, "Profile", opts, 3, cur);
+        if (clicked >= 0 && clicked != cur)
+            dc_power_set_mode((dc_power_mode)clicked);
+        /* Raw backend profile as a caption when it isn't literally one of the
+         * 3 mode slugs (same rule as the battery popout's caption). */
+        if (pw.active_profile[0])
+            ui_value(c, "Active profile", pw.active_profile);
+        ui_hint(c, "Lock, suspend and power-off live in the power menu (bar \xc2\xb7 power button)");
     }
-    static const char *const opts[3] = {"Power Saver", "Balanced", "Performance"};
-    int cur = (int)pw.active_mode; /* -1 (unknown) selects nothing */
-    int clicked = ui_segmented(c, "Profile", opts, 3, cur);
-    if (clicked >= 0 && clicked != cur)
-        dc_power_set_mode((dc_power_mode)clicked);
-    /* Raw backend profile as a caption when it isn't literally one of the 3
-     * mode slugs (same rule as the battery popout's caption). */
-    if (pw.active_profile[0])
-        ui_value(c, "Active profile", pw.active_profile);
-    ui_hint(c, "Lock, suspend and power-off live in the power menu (bar \xc2\xb7 power button)");
+
+    /* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.9: Idle & Lid, a thin view
+     * over services/logind.c's /etc/systemd/logind.conf (+ drop-ins) reader/
+     * writer. Editing writes a dankc-owned drop-in via pkexec (never the
+     * main logind.conf); dankc never restarts systemd-logind itself, so the
+     * hint below tells the user a re-login is needed. */
+    ui_section(c, "IDLE & LID");
+    dc_logind_conf_info lc;
+    dc_logind_conf_read(&lc, NULL);
+    if (lc.from_dropin)
+        ui_hint(c, "Some of these are overridden by an existing logind.conf.d drop-in.");
+
+    static const char *const idle_opts[4] = {"Ignore", "Lock", "Suspend", "Poweroff"};
+    static const char *const idle_vals[4] = {"ignore", "lock", "suspend", "poweroff"};
+    int idle_cur = -1;
+    for (int i = 0; i < 4; i++)
+        if (strcmp(lc.idle_action, idle_vals[i]) == 0)
+            idle_cur = i;
+    int idle_clicked = ui_segmented(c, "When idle", idle_opts, 4, idle_cur);
+    if (idle_clicked >= 0 && idle_clicked != idle_cur) {
+        snprintf(lc.idle_action, sizeof(lc.idle_action), "%s", idle_vals[idle_clicked]);
+        dc_logind_conf_write_dropin(&lc);
+    }
+
+    int idle_min = (lc.idle_action_sec + 59) / 60;
+    if (ui_stepper(c, "Idle timeout (minutes)", &idle_min, 1, 180, 1)) {
+        lc.idle_action_sec = idle_min * 60;
+        dc_logind_conf_write_dropin(&lc);
+    }
+
+    static const char *const lid_opts[4] = {"Ignore", "Lock", "Suspend", "Poweroff"};
+    static const char *const lid_vals[4] = {"ignore", "lock", "suspend", "poweroff"};
+    int lid_cur = -1;
+    for (int i = 0; i < 4; i++)
+        if (strcmp(lc.handle_lid_switch, lid_vals[i]) == 0)
+            lid_cur = i;
+    int lid_clicked = ui_segmented(c, "Lid close action", lid_opts, 4, lid_cur);
+    if (lid_clicked >= 0 && lid_clicked != lid_cur) {
+        snprintf(lc.handle_lid_switch, sizeof(lc.handle_lid_switch), "%s", lid_vals[lid_clicked]);
+        dc_logind_conf_write_dropin(&lc);
+    }
+
+    ui_hint(c, "Writes /etc/systemd/logind.conf.d/50-dankc.conf via pkexec;");
+    ui_hint(c, "a re-login (or reboot) is needed for changes to take effect.");
 }
 
 /* ====================== niri Window Rules editor (W3.4) ======================
