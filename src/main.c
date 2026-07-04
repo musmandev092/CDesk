@@ -41,6 +41,7 @@
 #include "ui/frame.h"
 #include "ui/keybinds_modal.h"
 #include "ui/launcher.h"
+#include "ui/greeter_main.h"
 #include "ui/lock.h"
 #include "ui/material_bg.h"
 #include "ui/notepad.h"
@@ -1216,6 +1217,8 @@ int main(int argc, char **argv)
         print_keybinds();
         return 0;
     }
+    if (argc >= 2 && strcmp(argv[1], "greeter") == 0)
+        return dc_greeter_main(argc, argv);
 
     dc_log_init(DC_LOG_DEBUG);
     dc_info("DankC %s starting", DC_VERSION);
