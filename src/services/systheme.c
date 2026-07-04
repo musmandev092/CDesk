@@ -41,6 +41,7 @@
 #include "services/systheme.h"
 
 #include "services/systheme_apps.h"
+#include "services/systheme_editors.h"
 #include "services/systheme_internal.h"
 #include "services/systheme_launchers.h"
 #include "services/systheme_term.h"
@@ -483,12 +484,41 @@ bool dc_systheme_app_detected(const char *app)
         return generic_detect(have_base, base, "helix", "hx");
     if (strcmp(app, "neovim") == 0)
         return generic_detect(have_base, base, "nvim", "nvim");
-    if (strcmp(app, "vim") == 0)
-        return generic_detect(have_base, base, "vim", "vim");
+    if (strcmp(app, "vim") == 0) {
+        /* Not generic_detect(): Vim's traditional config dir is ~/.vim,
+         * directly under $HOME -- NOT $XDG_CONFIG_HOME/vim (unlike every
+         * other app in this list, Vim doesn't follow the XDG base dir spec
+         * by default). Matches systheme_editors.c's dc_systheme_apply_vim(),
+         * which writes into that same ~/.vim/colors/. */
+        const char *home = getenv("HOME");
+        if (home && home[0]) {
+            snprintf(dir, sizeof(dir), "%s/.vim", home);
+            if (dc_systheme_dir_exists(dir))
+                return true;
+        }
+        return dc_systheme_on_path("vim");
+    }
     if (strcmp(app, "sublime") == 0)
         return generic_detect(have_base, base, "sublime-text", "subl");
-    if (strcmp(app, "emacs") == 0)
-        return generic_detect(have_base, base, "emacs", "emacs");
+    if (strcmp(app, "emacs") == 0) {
+        /* Not generic_detect(): Emacs' traditional config dir is
+         * ~/.emacs.d, directly under $HOME, with $XDG_CONFIG_HOME/emacs as
+         * a newer opt-in alternative -- check both, matching
+         * systheme_editors.c's dc_systheme_apply_emacs(), which writes into
+         * whichever of the two already exists. */
+        const char *home = getenv("HOME");
+        if (home && home[0]) {
+            snprintf(dir, sizeof(dir), "%s/.emacs.d", home);
+            if (dc_systheme_dir_exists(dir))
+                return true;
+        }
+        if (have_base) {
+            snprintf(dir, sizeof(dir), "%s/emacs", base);
+            if (dc_systheme_dir_exists(dir))
+                return true;
+        }
+        return dc_systheme_on_path("emacs");
+    }
     if (strcmp(app, "rofi") == 0)
         return generic_detect(have_base, base, "rofi", "rofi");
     if (strcmp(app, "wofi") == 0)
@@ -832,4 +862,17 @@ void dc_systheme_apply(const struct dc_config *cfg)
         dc_systheme_apply_konsole(light);
     if (cfg->systheme_xresources && dc_systheme_app_detected("xresources"))
         dc_systheme_apply_xresources(light);
+
+    if (cfg->systheme_zed && dc_systheme_app_detected("zed"))
+        dc_systheme_apply_zed(light);
+    if (cfg->systheme_helix && dc_systheme_app_detected("helix"))
+        dc_systheme_apply_helix(light);
+    if (cfg->systheme_neovim && dc_systheme_app_detected("neovim"))
+        dc_systheme_apply_neovim(light);
+    if (cfg->systheme_vim && dc_systheme_app_detected("vim"))
+        dc_systheme_apply_vim(light);
+    if (cfg->systheme_sublime && dc_systheme_app_detected("sublime"))
+        dc_systheme_apply_sublime(light);
+    if (cfg->systheme_emacs && dc_systheme_app_detected("emacs"))
+        dc_systheme_apply_emacs(light);
 }
