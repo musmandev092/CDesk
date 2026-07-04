@@ -59,4 +59,35 @@ typedef struct dc_battery_info {
  * if a battery was found. */
 bool dc_battery_read(dc_battery_info *out);
 
+/* Write `pct` (50-100; 100 disables the limit) to `batt_dir`'s
+ * charge_control_end_threshold sysfs attribute, via
+ * `pkexec tee /sys/class/power_supply/<batt_dir>/charge_control_end_threshold`
+ * (tee, not `install`, since sysfs attributes are magic files, not regular
+ * ones -- an argv-exec straight into tee avoids any shell-quoting concerns
+ * too). `batt_dir` should come from dc_battery_info.batt_dir.
+ *
+ * Fire-and-forget (fork+pipe, reaped by main's SIGCHLD=SIG_IGN, same shape
+ * as every other pkexec call in this codebase): returns true once the
+ * pkexec request has been launched, NOT once the write has actually
+ * succeeded -- there is no success signal. pkexec will prompt for
+ * authentication via dankc's own polkit agent (see polkit.c). Callers that
+ * need to know the outcome should re-read sysfs afterwards (dc_battery_read)
+ * and compare charge_limit against what was requested.
+ *
+ * DANKC_BATTERY_DRYRUN=1 logs the would-be write instead of forking --
+ * verification harness for this task uses it to confirm call shape without
+ * touching a live session (mirrors DANKC_LOGIND_DRYRUN in logind.c).
+ *
+ * The kernel resets charge_control_end_threshold on every reboot, so this
+ * function is never called automatically at startup to "reapply" a saved
+ * limit -- that would mean an unsolicited pkexec prompt at login. Re-applying
+ * a remembered limit (if desired) is a settings/UI concern, driven by an
+ * explicit user action, not something battery.c does on its own.
+ *
+ * Returns false without forking anything if `pct` is out of range or
+ * `batt_dir` is empty/contains a '/' (defensive -- batt_dir nominally comes
+ * from a readdir() basename, but this is the boundary where a bad value
+ * would otherwise be concatenated straight into a filesystem path). */
+bool dc_battery_set_charge_limit(const char *batt_dir, int pct);
+
 #endif /* DC_SERVICES_BATTERY_H */
