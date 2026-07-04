@@ -123,6 +123,36 @@ static dc_config config = {
     .systheme_vscode = true,
     .systheme_kitty = true,
     .systheme_foot = true,
+
+    /* Wave 2 (config.h's field comments): default true except the Tier-3
+     * hard-caveat apps, which default false. */
+    .systheme_kvantum = true,
+    .systheme_kde = true,
+    .systheme_ghostty = true,
+    .systheme_wezterm = true,
+    .systheme_konsole = false,
+    .systheme_xresources = false,
+    .systheme_zed = true,
+    .systheme_helix = true,
+    .systheme_neovim = true,
+    .systheme_vim = true,
+    .systheme_sublime = true,
+    .systheme_emacs = true,
+    .systheme_rofi = true,
+    .systheme_wofi = true,
+    .systheme_fuzzel = true,
+    .systheme_tofi = true,
+    .systheme_mako = true,
+    .systheme_dunst = true,
+    .systheme_swaync = true,
+    .systheme_btop = true,
+    .systheme_cava = true,
+    .systheme_zathura = true,
+    .systheme_qutebrowser = true,
+    .systheme_firefox = false,
+    .systheme_discord = false,
+    .systheme_spicetify = false,
+    .systheme_gtk2 = true,
 };
 
 const dc_config *dc_config_current = &config;
@@ -420,6 +450,34 @@ void dc_config_load(void)
     get_bool(root, "systemThemeVscode", &config.systheme_vscode);
     get_bool(root, "systemThemeKitty", &config.systheme_kitty);
     get_bool(root, "systemThemeFoot", &config.systheme_foot);
+
+    get_bool(root, "systemThemeKvantum", &config.systheme_kvantum);
+    get_bool(root, "systemThemeKde", &config.systheme_kde);
+    get_bool(root, "systemThemeGhostty", &config.systheme_ghostty);
+    get_bool(root, "systemThemeWezterm", &config.systheme_wezterm);
+    get_bool(root, "systemThemeKonsole", &config.systheme_konsole);
+    get_bool(root, "systemThemeXresources", &config.systheme_xresources);
+    get_bool(root, "systemThemeZed", &config.systheme_zed);
+    get_bool(root, "systemThemeHelix", &config.systheme_helix);
+    get_bool(root, "systemThemeNeovim", &config.systheme_neovim);
+    get_bool(root, "systemThemeVim", &config.systheme_vim);
+    get_bool(root, "systemThemeSublime", &config.systheme_sublime);
+    get_bool(root, "systemThemeEmacs", &config.systheme_emacs);
+    get_bool(root, "systemThemeRofi", &config.systheme_rofi);
+    get_bool(root, "systemThemeWofi", &config.systheme_wofi);
+    get_bool(root, "systemThemeFuzzel", &config.systheme_fuzzel);
+    get_bool(root, "systemThemeTofi", &config.systheme_tofi);
+    get_bool(root, "systemThemeMako", &config.systheme_mako);
+    get_bool(root, "systemThemeDunst", &config.systheme_dunst);
+    get_bool(root, "systemThemeSwaync", &config.systheme_swaync);
+    get_bool(root, "systemThemeBtop", &config.systheme_btop);
+    get_bool(root, "systemThemeCava", &config.systheme_cava);
+    get_bool(root, "systemThemeZathura", &config.systheme_zathura);
+    get_bool(root, "systemThemeQutebrowser", &config.systheme_qutebrowser);
+    get_bool(root, "systemThemeFirefox", &config.systheme_firefox);
+    get_bool(root, "systemThemeDiscord", &config.systheme_discord);
+    get_bool(root, "systemThemeSpicetify", &config.systheme_spicetify);
+    get_bool(root, "systemThemeGtk2", &config.systheme_gtk2);
     cJSON_Delete(root);
 
     apply_theme();
@@ -573,6 +631,34 @@ void dc_config_save(void)
     cJSON_AddBoolToObject(root, "systemThemeVscode", config.systheme_vscode);
     cJSON_AddBoolToObject(root, "systemThemeKitty", config.systheme_kitty);
     cJSON_AddBoolToObject(root, "systemThemeFoot", config.systheme_foot);
+
+    cJSON_AddBoolToObject(root, "systemThemeKvantum", config.systheme_kvantum);
+    cJSON_AddBoolToObject(root, "systemThemeKde", config.systheme_kde);
+    cJSON_AddBoolToObject(root, "systemThemeGhostty", config.systheme_ghostty);
+    cJSON_AddBoolToObject(root, "systemThemeWezterm", config.systheme_wezterm);
+    cJSON_AddBoolToObject(root, "systemThemeKonsole", config.systheme_konsole);
+    cJSON_AddBoolToObject(root, "systemThemeXresources", config.systheme_xresources);
+    cJSON_AddBoolToObject(root, "systemThemeZed", config.systheme_zed);
+    cJSON_AddBoolToObject(root, "systemThemeHelix", config.systheme_helix);
+    cJSON_AddBoolToObject(root, "systemThemeNeovim", config.systheme_neovim);
+    cJSON_AddBoolToObject(root, "systemThemeVim", config.systheme_vim);
+    cJSON_AddBoolToObject(root, "systemThemeSublime", config.systheme_sublime);
+    cJSON_AddBoolToObject(root, "systemThemeEmacs", config.systheme_emacs);
+    cJSON_AddBoolToObject(root, "systemThemeRofi", config.systheme_rofi);
+    cJSON_AddBoolToObject(root, "systemThemeWofi", config.systheme_wofi);
+    cJSON_AddBoolToObject(root, "systemThemeFuzzel", config.systheme_fuzzel);
+    cJSON_AddBoolToObject(root, "systemThemeTofi", config.systheme_tofi);
+    cJSON_AddBoolToObject(root, "systemThemeMako", config.systheme_mako);
+    cJSON_AddBoolToObject(root, "systemThemeDunst", config.systheme_dunst);
+    cJSON_AddBoolToObject(root, "systemThemeSwaync", config.systheme_swaync);
+    cJSON_AddBoolToObject(root, "systemThemeBtop", config.systheme_btop);
+    cJSON_AddBoolToObject(root, "systemThemeCava", config.systheme_cava);
+    cJSON_AddBoolToObject(root, "systemThemeZathura", config.systheme_zathura);
+    cJSON_AddBoolToObject(root, "systemThemeQutebrowser", config.systheme_qutebrowser);
+    cJSON_AddBoolToObject(root, "systemThemeFirefox", config.systheme_firefox);
+    cJSON_AddBoolToObject(root, "systemThemeDiscord", config.systheme_discord);
+    cJSON_AddBoolToObject(root, "systemThemeSpicetify", config.systheme_spicetify);
+    cJSON_AddBoolToObject(root, "systemThemeGtk2", config.systheme_gtk2);
 
     char *text = cJSON_Print(root);
     cJSON_Delete(root);

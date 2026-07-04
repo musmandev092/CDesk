@@ -224,6 +224,59 @@ bool dc_systheme_ensure_line(const char *path, const char *needle, const char *m
     return ok;
 }
 
+bool dc_systheme_ensure_line_top(const char *user_file, const char *line, const char *marker)
+{
+    char *text = read_whole_file(user_file);
+    if (text && strstr(text, line)) {
+        free(text);
+        return true; /* already present: idempotent no-op */
+    }
+
+    if (dc_systheme_dryrun()) {
+        if (text)
+            dc_info("[DRYRUN] systheme: would back up %s to %s.bak-<epoch>", user_file, user_file);
+        dc_info("[DRYRUN] systheme: would prepend %zu bytes to %s",
+                strlen(marker) + strlen(line) + 2, user_file);
+        free(text);
+        return true;
+    }
+
+    if (text) {
+        char backup_path[DC_SYSTHEME_PATH_MAX + 32];
+        snprintf(backup_path, sizeof(backup_path), "%s.bak-%ld", user_file, (long)time(NULL));
+        FILE *bf = fopen(backup_path, "w");
+        if (!bf) {
+            dc_warn("systheme: could not create backup %s; leaving %s untouched", backup_path,
+                    user_file);
+            free(text);
+            return false;
+        }
+        fputs(text, bf);
+        fclose(bf);
+        dc_info("systheme: backed up %s to %s before first edit", user_file, backup_path);
+    }
+
+    size_t text_len = text ? strlen(text) : 0;
+    size_t head_len = strlen(marker) + strlen(line) + 2;
+    size_t new_len = head_len + text_len;
+    char *new_content = malloc(new_len + 1);
+    if (!new_content) {
+        free(text);
+        return false;
+    }
+    snprintf(new_content, head_len + 1, "%s\n%s\n", marker, line);
+    if (text_len)
+        memcpy(new_content + head_len, text, text_len);
+    new_content[new_len] = '\0';
+    free(text);
+
+    bool ok = dc_systheme_write_owned(user_file, new_content, strlen(new_content));
+    free(new_content);
+    if (ok)
+        dc_info("systheme: prepended include to %s", user_file);
+    return ok;
+}
+
 /* --- reload-nudge spawn (fire-and-forget, SIGCHLD-safe) ---------------------- */
 
 void dc_systheme_spawn(const char *tag, const char *const argv[], int argc)
@@ -278,6 +331,39 @@ static bool config_home(char *out, size_t cap)
         return true;
     }
     return false;
+}
+
+/* Resolve $XDG_DATA_HOME, falling back to "$HOME/.local/share"; false if
+ * neither is set. Some apps (KDE color-schemes, Konsole profiles) live under
+ * the XDG *data* dir rather than the config dir config_home() resolves. */
+static bool data_home(char *out, size_t cap)
+{
+    const char *xdg = getenv("XDG_DATA_HOME");
+    if (xdg && xdg[0]) {
+        snprintf(out, cap, "%s", xdg);
+        return true;
+    }
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        snprintf(out, cap, "%s/.local/share", home);
+        return true;
+    }
+    return false;
+}
+
+/* Shared "does this app look installed" rule for the common case (docs'
+ * Task 0 spec, detection rule D): a config dir under config_home() named
+ * `app_dir_name`, OR `binary` on $PATH. */
+static bool generic_detect(bool have_base, const char *base, const char *app_dir_name,
+                           const char *binary)
+{
+    if (have_base) {
+        char dir[DC_SYSTHEME_PATH_MAX + 32];
+        snprintf(dir, sizeof(dir), "%s/%s", base, app_dir_name);
+        if (dc_systheme_dir_exists(dir))
+            return true;
+    }
+    return dc_systheme_on_path(binary);
 }
 
 bool dc_systheme_app_detected(const char *app)
@@ -354,6 +440,113 @@ bool dc_systheme_app_detected(const char *app)
                 return true;
         }
         return dc_systheme_on_path("foot");
+    }
+
+    /* --- wave 2 (Task 0 detection spec) --- */
+    if (strcmp(app, "kvantum") == 0)
+        return generic_detect(have_base, base, "Kvantum", "kvantummanager");
+    if (strcmp(app, "kde") == 0) {
+        char data[DC_SYSTHEME_PATH_MAX];
+        if (data_home(data, sizeof(data))) {
+            snprintf(dir, sizeof(dir), "%s/color-schemes", data);
+            if (dc_systheme_dir_exists(dir))
+                return true;
+        }
+        if (have_base) {
+            snprintf(dir, sizeof(dir), "%s/kdeglobals", base);
+            if (dc_systheme_dir_exists(dir))
+                return true;
+        }
+        return dc_systheme_on_path("kreadconfig6");
+    }
+    if (strcmp(app, "ghostty") == 0)
+        return generic_detect(have_base, base, "ghostty", "ghostty");
+    if (strcmp(app, "wezterm") == 0)
+        return generic_detect(have_base, base, "wezterm", "wezterm");
+    if (strcmp(app, "konsole") == 0) {
+        char data[DC_SYSTHEME_PATH_MAX];
+        if (data_home(data, sizeof(data))) {
+            snprintf(dir, sizeof(dir), "%s/konsole", data);
+            if (dc_systheme_dir_exists(dir))
+                return true;
+        }
+        return dc_systheme_on_path("konsole");
+    }
+    if (strcmp(app, "xresources") == 0)
+        return (dc_systheme_on_path("urxvt") || dc_systheme_on_path("xterm")) &&
+                dc_systheme_on_path("xrdb");
+    if (strcmp(app, "zed") == 0)
+        return generic_detect(have_base, base, "zed", "zed");
+    if (strcmp(app, "helix") == 0)
+        return generic_detect(have_base, base, "helix", "hx");
+    if (strcmp(app, "neovim") == 0)
+        return generic_detect(have_base, base, "nvim", "nvim");
+    if (strcmp(app, "vim") == 0)
+        return generic_detect(have_base, base, "vim", "vim");
+    if (strcmp(app, "sublime") == 0)
+        return generic_detect(have_base, base, "sublime-text", "subl");
+    if (strcmp(app, "emacs") == 0)
+        return generic_detect(have_base, base, "emacs", "emacs");
+    if (strcmp(app, "rofi") == 0)
+        return generic_detect(have_base, base, "rofi", "rofi");
+    if (strcmp(app, "wofi") == 0)
+        return generic_detect(have_base, base, "wofi", "wofi");
+    if (strcmp(app, "fuzzel") == 0)
+        return generic_detect(have_base, base, "fuzzel", "fuzzel");
+    if (strcmp(app, "tofi") == 0)
+        return generic_detect(have_base, base, "tofi", "tofi");
+    if (strcmp(app, "mako") == 0)
+        return generic_detect(have_base, base, "mako", "mako");
+    if (strcmp(app, "dunst") == 0)
+        return generic_detect(have_base, base, "dunst", "dunst");
+    if (strcmp(app, "swaync") == 0)
+        return generic_detect(have_base, base, "swaync", "swaync");
+    if (strcmp(app, "btop") == 0)
+        return generic_detect(have_base, base, "btop", "btop");
+    if (strcmp(app, "cava") == 0)
+        return generic_detect(have_base, base, "cava", "cava");
+    if (strcmp(app, "zathura") == 0)
+        return generic_detect(have_base, base, "zathura", "zathura");
+    if (strcmp(app, "qutebrowser") == 0)
+        return generic_detect(have_base, base, "qutebrowser", "qutebrowser");
+    if (strcmp(app, "spicetify") == 0)
+        return generic_detect(have_base, base, "spicetify", "spicetify");
+    if (strcmp(app, "gtk2") == 0) {
+        const char *home = getenv("HOME");
+        if (home && home[0]) {
+            char f[DC_SYSTHEME_PATH_MAX];
+            snprintf(f, sizeof(f), "%s/.gtkrc-2.0", home);
+            if (dc_systheme_dir_exists(f))
+                return true;
+        }
+        return dc_systheme_on_path("gimp");
+    }
+    if (strcmp(app, "firefox") == 0) {
+        const char *home = getenv("HOME");
+        if (home && home[0]) {
+            char f[DC_SYSTHEME_PATH_MAX];
+            snprintf(f, sizeof(f), "%s/.mozilla/firefox/profiles.ini", home);
+            if (dc_systheme_dir_exists(f))
+                return true;
+            snprintf(f, sizeof(f), "%s/.zen/profiles.ini", home);
+            if (dc_systheme_dir_exists(f))
+                return true;
+            snprintf(f, sizeof(f), "%s/.librewolf/profiles.ini", home);
+            if (dc_systheme_dir_exists(f))
+                return true;
+        }
+        return false;
+    }
+    if (strcmp(app, "discord") == 0) {
+        if (have_base) {
+            snprintf(dir, sizeof(dir), "%s/vesktop/themes", base);
+            if (dc_systheme_dir_exists(dir))
+                return true;
+            snprintf(dir, sizeof(dir), "%s/Vencord/themes", base);
+            if (dc_systheme_dir_exists(dir))
+                return true;
+        }
+        return false;
     }
     return false;
 }
@@ -528,16 +721,62 @@ static uint64_t fnv1a(const void *data, size_t len, uint64_t hash)
     return hash;
 }
 
+/* Every systheme_* per-app toggle, folded one byte at a time into the FNV
+ * hash below. Widened from the original uint8_t bitmask (which only had
+ * room for ~6 apps) now that the toggle count has grown past 30 -- folding
+ * each bool as its own hashed byte scales to any number of toggles without
+ * another bitmask-width bump later. */
+static uint64_t hash_toggles(const struct dc_config *cfg, uint64_t h)
+{
+    const bool toggles[] = {
+        cfg->systheme_gtk,
+        cfg->systheme_qt,
+        cfg->systheme_alacritty,
+        cfg->systheme_vscode,
+        cfg->systheme_kitty,
+        cfg->systheme_foot,
+        cfg->systheme_kvantum,
+        cfg->systheme_kde,
+        cfg->systheme_ghostty,
+        cfg->systheme_wezterm,
+        cfg->systheme_konsole,
+        cfg->systheme_xresources,
+        cfg->systheme_zed,
+        cfg->systheme_helix,
+        cfg->systheme_neovim,
+        cfg->systheme_vim,
+        cfg->systheme_sublime,
+        cfg->systheme_emacs,
+        cfg->systheme_rofi,
+        cfg->systheme_wofi,
+        cfg->systheme_fuzzel,
+        cfg->systheme_tofi,
+        cfg->systheme_mako,
+        cfg->systheme_dunst,
+        cfg->systheme_swaync,
+        cfg->systheme_btop,
+        cfg->systheme_cava,
+        cfg->systheme_zathura,
+        cfg->systheme_qutebrowser,
+        cfg->systheme_firefox,
+        cfg->systheme_discord,
+        cfg->systheme_spicetify,
+        cfg->systheme_gtk2,
+    };
+    for (size_t i = 0; i < sizeof(toggles) / sizeof(toggles[0]); i++) {
+        uint8_t b = toggles[i] ? 1 : 0;
+        h = fnv1a(&b, 1, h);
+    }
+    return h;
+}
+
 static uint64_t compute_palette_hash(const struct dc_config *cfg, bool light)
 {
     uint64_t h = 1469598103934665603ULL; /* FNV-1a 64-bit offset basis */
     h = fnv1a(dc_theme_current, sizeof(*dc_theme_current), h);
     uint8_t lightb = light ? 1 : 0;
     h = fnv1a(&lightb, 1, h);
-    uint8_t bitmask = (uint8_t)((cfg->systheme_gtk ? 1 : 0) | (cfg->systheme_qt ? 2 : 0) |
-            (cfg->systheme_alacritty ? 4 : 0) | (cfg->systheme_vscode ? 8 : 0) |
-            (cfg->systheme_kitty ? 16 : 0) | (cfg->systheme_foot ? 32 : 0));
-    h = fnv1a(&bitmask, 1, h);
+    h = hash_toggles(cfg, h);
     return h;
 }
 
