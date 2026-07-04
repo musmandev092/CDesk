@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 #define DC_NOTIF_PATH "/org/freedesktop/Notifications"
@@ -269,14 +270,63 @@ static void emit_closed(dc_notifications *n, uint32_t id, uint32_t reason)
 static void resolve_dismiss(dc_notifications *n, dc_notification *slot)
 {
     if (slot->status == DC_NOTIF_CURRENT) {
-        slot->status = DC_NOTIF_HISTORY;
-        slot->popup = false;
         emit_closed(n, slot->id, DC_NOTIF_REASON_DISMISSED);
+        /* popup-only/no-history rule matches (docs/26-DND-SCHEDULING-PLAN.md):
+         * delete instead of archiving to History -- there's nowhere for them
+         * to persist. */
+        if (slot->popup_only || slot->no_history) {
+            slot->active = false;
+            free_slot_image(slot);
+        } else {
+            slot->status = DC_NOTIF_HISTORY;
+            slot->popup = false;
+        }
     } else {
         slot->active = false; /* forget it entirely */
         free_slot_image(slot);
     }
     notify_changed(n);
+}
+
+/* --- per-app rule engine (docs/26-DND-SCHEDULING-PLAN.md) ----------------- */
+
+/* Strip a trailing ".desktop" suffix (case-insensitive), if present, into
+ * `out`. desktop-entry hint senders sometimes include the suffix and
+ * sometimes don't (the spec's own examples omit it) -- rules are meant to
+ * match either way, so match against the stripped form. */
+static void strip_desktop_suffix(const char *in, char *out, size_t out_n)
+{
+    if (!in)
+        in = "";
+    size_t len = strlen(in);
+    if (len > 8 && strcasecmp(in + len - 8, ".desktop") == 0)
+        len -= 8;
+    if (len >= out_n)
+        len = out_n - 1;
+    memcpy(out, in, len);
+    out[len] = '\0';
+}
+
+/* First matching per-app rule for this arrival, or NULL. `match` is compared
+ * case-insensitively against app_name and the (".desktop"-stripped)
+ * desktop_entry hint; first configured rule wins. config.c stores
+ * action/urgency as plain ints (dc_notif_rule) to avoid depending on this
+ * header -- cast back to dc_notif_rule_action at the call site. */
+static const dc_notif_rule *match_notif_rule(const char *app_name, const char *desktop_entry)
+{
+    const dc_config *cfg = dc_config_current;
+    char stripped[DC_NOTIF_APP];
+    strip_desktop_suffix(desktop_entry, stripped, sizeof(stripped));
+    for (int i = 0; i < cfg->notif_rules_n; i++) {
+        const dc_notif_rule *r = &cfg->notif_rules[i];
+        if (!r->match[0])
+            continue;
+        if (app_name && app_name[0] && strcasecmp(r->match, app_name) == 0)
+            return r;
+        if (stripped[0] && strcasecmp(r->match, stripped) == 0)
+            return r;
+    }
+    return NULL;
 }
 
 /* --- D-Bus methods ------------------------------------------------------- */
@@ -325,6 +375,7 @@ static int method_notify(sd_bus_message *msg, void *userdata, sd_bus_error *err)
     /* hints: a{sv} — urgency, resident, image-path, image-data. */
     dc_urgency urgency = DC_URGENCY_NORMAL;
     const char *hint_image_path = NULL;
+    const char *hint_desktop_entry = NULL;
     bool resident = false;
     int32_t img_w = 0, img_h = 0, img_stride = 0, img_bps = 0, img_channels = 0;
     bool img_has_alpha = false;
@@ -352,6 +403,12 @@ static int method_notify(sd_bus_message *msg, void *userdata, sd_bus_error *err)
                                strcmp(key, "image_path") == 0)) {
                 sd_bus_message_enter_container(msg, 'v', "s");
                 sd_bus_message_read_basic(msg, 's', &hint_image_path);
+                sd_bus_message_exit_container(msg);
+            } else if (key && strcmp(key, "desktop-entry") == 0) {
+                /* Per-app rule engine (docs/26-DND-SCHEDULING-PLAN.md): the
+                 * app's .desktop file id, e.g. "firefox" or "org.mozilla.firefox". */
+                sd_bus_message_enter_container(msg, 'v', "s");
+                sd_bus_message_read_basic(msg, 's', &hint_desktop_entry);
                 sd_bus_message_exit_container(msg);
             } else if (key && (strcmp(key, "image-data") == 0 || strcmp(key, "image_data") == 0 ||
                                strcmp(key, "icon_data") == 0)) {
@@ -390,12 +447,32 @@ static int method_notify(sd_bus_message *msg, void *userdata, sd_bus_error *err)
         decode_image_data(img_w, img_h, img_stride, img_has_alpha, img_bps, img_channels, img_data,
                           img_data_len, &decoded_pixels, &decoded_w, &decoded_h);
 
+    /* Per-app rule engine (docs/26-DND-SCHEDULING-PLAN.md): first match wins.
+     * "ignore" drops the arrival entirely -- never touches the store -- but
+     * still advances the id counter and returns a fresh id, matching the
+     * spec's expectation that Notify() always returns a valid (non-zero) id. */
+    const dc_notif_rule *rule = match_notif_rule(app_name, hint_desktop_entry);
+    if (rule && (dc_notif_rule_action)rule->action == DC_NOTIF_RULE_IGNORE) {
+        free(decoded_pixels);
+        uint32_t ignored_id = replaces_id != 0 ? replaces_id : ++n->next_id;
+        dc_debug("notify ignored by rule '%s': [%s] %s", rule->match, app_name ? app_name : "",
+                summary ? summary : "");
+        return sd_bus_reply_method_return(msg, "u", ignored_id);
+    }
+
     uint32_t id = replaces_id != 0 ? replaces_id : ++n->next_id;
     dc_notification *slot = acquire_slot(n, replaces_id);
     if (slot->active && slot->id != id) {
         emit_closed(n, slot->id, DC_NOTIF_REASON_CLOSED); /* evicted a different notification */
     }
     free_slot_image(slot); /* release a reused slot's old pixels before memset drops the pointer */
+
+    /* Rule urgency override (applied before lifetime_ms()/dc_sound_notify()
+     * below, both of which key off slot->urgency) and mute/popup-only/
+     * no-history flags. */
+    bool mute = rule && (dc_notif_rule_action)rule->action == DC_NOTIF_RULE_MUTE;
+    if (rule && rule->urgency >= 0)
+        urgency = (dc_urgency)rule->urgency;
 
     memset(slot, 0, sizeof(*slot));
     slot->id = id;
@@ -404,12 +481,17 @@ static int method_notify(sd_bus_message *msg, void *userdata, sd_bus_error *err)
     slot->created_ms = now_ms();
     slot->created_wall_ms = now_wall_ms();
     /* Do Not Disturb (Notifications tab): still recorded/history-tracked, just
-     * never shown as a transient toast. */
-    slot->popup = !dc_config_current->dnd_enabled;
+     * never shown as a transient toast. A muted rule suppresses the popup the
+     * same way regardless of DND. */
+    slot->popup = !dc_config_current->dnd_enabled && !mute;
     slot->active = true;
     slot->status = DC_NOTIF_CURRENT; /* arrival -> Current, even for a replace */
     slot->resident = resident;
+    slot->popup_only = rule && (dc_notif_rule_action)rule->action == DC_NOTIF_RULE_POPUP_ONLY;
+    slot->no_history = rule && (dc_notif_rule_action)rule->action == DC_NOTIF_RULE_NO_HISTORY;
     snprintf(slot->app_name, sizeof(slot->app_name), "%s", app_name ? app_name : "");
+    snprintf(slot->desktop_entry, sizeof(slot->desktop_entry), "%s",
+            hint_desktop_entry ? hint_desktop_entry : "");
     snprintf(slot->summary, sizeof(slot->summary), "%s", summary ? summary : "");
     snprintf(slot->body, sizeof(slot->body), "%s", body ? body : "");
     snprintf(slot->app_icon, sizeof(slot->app_icon), "%s", app_icon ? app_icon : "");
@@ -428,8 +510,10 @@ static int method_notify(sd_bus_message *msg, void *userdata, sd_bus_error *err)
     /* docs/14-COMPLETION-PLAN.md W1.3: play a sound on arrival, gated by
      * config (sounds_enabled/notif_sound_enabled/dnd_enabled) and
      * self-debounced -- see services/sound.c. Fires for every arrival
-     * including replaces, matching DMS's onNotification. */
-    dc_sound_notify(urgency);
+     * including replaces, matching DMS's onNotification. A muted rule skips
+     * the sound outright (docs/26-DND-SCHEDULING-PLAN.md rule-engine). */
+    if (!mute)
+        dc_sound_notify(urgency);
     notify_changed(n);
 
     return sd_bus_reply_method_return(msg, "u", id);
@@ -561,6 +645,21 @@ bool dc_notifications_tick(dc_notifications *n)
     if (!n)
         return false;
     bool changed = false;
+
+    /* DND schedule auto-resume (docs/26-DND-SCHEDULING-PLAN.md): dnd_enabled
+     * remains the sole runtime gate, but a scheduled "until" deadline that's
+     * passed clears it automatically. CLOCK_REALTIME so this survives
+     * suspend/hibernate correctly (dnd_until_epoch is wall-clock, not
+     * monotonic). */
+    if (dc_config_current->dnd_enabled && dc_config_current->dnd_until_epoch > 0 &&
+        time(NULL) >= dc_config_current->dnd_until_epoch) {
+        dc_config *cfg = dc_config_mut();
+        cfg->dnd_enabled = false;
+        cfg->dnd_until_epoch = 0;
+        dc_config_save();
+        changed = true;
+    }
+
     int64_t t = now_ms();
     for (int i = 0; i < DC_NOTIF_MAX; i++) {
         dc_notification *item = &n->store[i];
@@ -568,11 +667,19 @@ bool dc_notifications_tick(dc_notifications *n)
             continue;
         int life = lifetime_ms(item);
         if (life > 0 && t - item->created_ms >= life) {
-            /* Only hides the toast -- stays on the Current tab until the user
-             * dismisses it (matches DMS: a popup timeout doesn't drop the
-             * notification from NotificationService.notifications). */
-            item->popup = false;
             emit_closed(n, item->id, DC_NOTIF_REASON_EXPIRED);
+            if (item->popup_only) {
+                /* popup-only rule match (docs/26-DND-SCHEDULING-PLAN.md):
+                 * never archived -- delete the moment the toast would
+                 * otherwise just go quiet. */
+                item->active = false;
+                free_slot_image(item);
+            } else {
+                /* Only hides the toast -- stays on the Current tab until the
+                 * user dismisses it (matches DMS: a popup timeout doesn't
+                 * drop the notification from NotificationService.notifications). */
+                item->popup = false;
+            }
             changed = true;
         }
     }
@@ -673,9 +780,16 @@ void dc_notifications_clear_current(dc_notifications *n)
     for (int i = 0; i < DC_NOTIF_MAX; i++) {
         dc_notification *s = &n->store[i];
         if (s->active && s->status == DC_NOTIF_CURRENT) {
-            s->status = DC_NOTIF_HISTORY;
-            s->popup = false;
             emit_closed(n, s->id, DC_NOTIF_REASON_DISMISSED);
+            if (s->popup_only || s->no_history) {
+                /* docs/26-DND-SCHEDULING-PLAN.md rule-engine: delete instead
+                 * of archiving -- same as resolve_dismiss(). */
+                s->active = false;
+                free_slot_image(s);
+            } else {
+                s->status = DC_NOTIF_HISTORY;
+                s->popup = false;
+            }
         }
     }
     notify_changed(n);
@@ -780,6 +894,73 @@ uint32_t dc_notifications_post_local(dc_notifications *n, const char *app, const
     notify_changed(n);
 
     return id;
+}
+
+/* --- DND scheduling (docs/26-DND-SCHEDULING-PLAN.md) ---------------------- */
+
+void dc_notif_dnd_start(dc_notifications *n, int dur_sec)
+{
+    dc_config *cfg = dc_config_mut();
+    cfg->dnd_enabled = true;
+    cfg->dnd_until_epoch = dur_sec > 0 ? (int64_t)time(NULL) + dur_sec : 0;
+    dc_config_save();
+    if (n)
+        notify_changed(n);
+}
+
+void dc_notif_dnd_start_until_hour(dc_notifications *n, int hour)
+{
+    if (hour < 0)
+        hour = 0;
+    if (hour > 23)
+        hour = 23;
+
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    tmv.tm_hour = hour;
+    tmv.tm_min = 0;
+    tmv.tm_sec = 0;
+    tmv.tm_isdst = -1;
+    time_t target = mktime(&tmv);
+    if (target <= now) {
+        /* Already past today -- resume tomorrow instead. Bump tm_mday and
+         * re-run mktime() (rather than adding 86400 seconds) so a DST
+         * transition between now and then doesn't shift the actual
+         * wall-clock resume hour. */
+        tmv.tm_mday += 1;
+        tmv.tm_isdst = -1;
+        target = mktime(&tmv);
+    }
+
+    dc_config *cfg = dc_config_mut();
+    cfg->dnd_enabled = true;
+    cfg->dnd_until_hour = hour;
+    cfg->dnd_until_epoch = (int64_t)target;
+    dc_config_save();
+    if (n)
+        notify_changed(n);
+}
+
+void dc_notif_dnd_stop(dc_notifications *n)
+{
+    dc_config *cfg = dc_config_mut();
+    cfg->dnd_enabled = false;
+    cfg->dnd_until_epoch = 0;
+    dc_config_save();
+    if (n)
+        notify_changed(n);
+}
+
+int64_t dc_notif_dnd_remaining_sec(void)
+{
+    const dc_config *cfg = dc_config_current;
+    if (!cfg->dnd_enabled)
+        return -1;
+    if (cfg->dnd_until_epoch <= 0)
+        return 0;
+    int64_t rem = cfg->dnd_until_epoch - (int64_t)time(NULL);
+    return rem > 0 ? rem : 0;
 }
 
 /* Fabricated entries covering: a plain body, a long/wrapping body, an action
