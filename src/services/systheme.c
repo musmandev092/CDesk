@@ -40,6 +40,7 @@
  */
 #include "services/systheme.h"
 
+#include "services/systheme_apps.h"
 #include "services/systheme_internal.h"
 #include "services/systheme_term.h"
 
@@ -320,7 +321,19 @@ bool dc_systheme_app_detected(const char *app)
     }
     if (strcmp(app, "vscode") == 0) {
         if (have_base) {
+            /* "Code - OSS" (note the space) is the upstream-built-from-source
+             * package name several distros use; "Code" is the official
+             * Microsoft build; "VSCodium" is the de-Microsoft-branded
+             * community build. systheme_apps.c's find_vscode_settings()
+             * checks the same three dirs, same order, for the actual
+             * settings.json write target. */
+            snprintf(dir, sizeof(dir), "%s/Code - OSS/User", base);
+            if (dc_systheme_dir_exists(dir))
+                return true;
             snprintf(dir, sizeof(dir), "%s/Code/User", base);
+            if (dc_systheme_dir_exists(dir))
+                return true;
+            snprintf(dir, sizeof(dir), "%s/VSCodium/User", base);
             if (dc_systheme_dir_exists(dir))
                 return true;
         }
@@ -557,8 +570,8 @@ void dc_systheme_apply(const struct dc_config *cfg)
     if (cfg->systheme_foot && dc_systheme_app_detected("foot"))
         dc_systheme_apply_foot(light);
 
-    /* Qt/VS Code emitters land in later tasks; the config toggles +
-     * detection ids already exist (see config.h) so this function only
-     * needs a new `if (cfg->systheme_X && ...) apply_X(...);` line added
-     * here, no other wiring changes. */
+    if (cfg->systheme_qt && dc_systheme_app_detected("qt"))
+        dc_systheme_apply_qt(light);
+    if (cfg->systheme_vscode && dc_systheme_app_detected("vscode"))
+        dc_systheme_apply_vscode(light);
 }
