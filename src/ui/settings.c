@@ -2775,6 +2775,40 @@ static void tab_network(uictx *c)
         }
         ui_hint(c, "Click a network to toggle auto-connect, or the icon to forget it.");
     }
+
+    ui_section(c, "VPN");
+    dc_net_vpn vpns[DC_NET_VPN_MAX];
+    int vn = dc_net_vpn_list(vpns, DC_NET_VPN_MAX);
+    /* Per-profile optimistic flip (mirrors the HOTSPOT toggle above): NM's
+     * ActivateConnection/DeactivateConnection are async, so the very next
+     * dc_net_vpn_list() call can still report the pre-click state for a
+     * second or two. Keyed by list index rather than path -- NM's
+     * ListConnections order is stable across activation/deactivation (it
+     * enumerates saved Settings.Connections, not ActiveConnections), so
+     * indices don't shuffle between frames the way, say, a sorted-by-active
+     * list would. */
+    static opt_flip vpn_flips[DC_NET_VPN_MAX];
+    if (vn == 0) {
+        ui_hint(c, "No VPN profiles -- import with nmcli or nm-connection-editor");
+    } else {
+        for (int i = 0; i < vn; i++) {
+            const dc_net_vpn *v = &vpns[i];
+            bool active = flip_get(&vpn_flips[i], v->active);
+            char status[32];
+            snprintf(status, sizeof(status), "%s%s", v->type_is_wireguard ? "WireGuard" : "OpenVPN",
+                     active ? " \xc2\xb7 Connected" : "");
+            if (ui_list_row(c, v->id[0] ? v->id : v->path, status, 0, active) == 1) {
+                if (active)
+                    dc_net_vpn_deactivate(v->active_conn_path[0] ? v->active_conn_path : v->path);
+                else
+                    dc_net_vpn_activate(v->path);
+                flip_set(&vpn_flips[i], !active);
+            }
+        }
+    }
+    ui_hint(c, "Click a profile to connect or disconnect. Import new profiles with");
+    ui_hint(c, "`nmcli connection import` or nm-connection-editor -- dankc only");
+    ui_hint(c, "manages saved profiles, not secrets/credentials (v1).");
 }
 
 static void tab_bluetooth(uictx *c)
