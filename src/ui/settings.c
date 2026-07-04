@@ -8,6 +8,7 @@
 #include "render/nvg.h"
 #include "services/apps.h"
 #include "services/audio.h"
+#include "services/battery.h"
 #include "services/bluez.h"
 #include "services/display.h"
 #include "services/firewall.h"
@@ -2812,6 +2813,13 @@ static void tab_bluetooth(uictx *c)
     ui_hint(c, "Click a device to connect or disconnect");
 }
 
+/* Profile-mode labels shared by the POWER PROFILE segmented control and the
+ * AUTOMATION section's per-power-source pickers below -- same 3 slugs
+ * dc_power_mode enumerates (services/power.h) and the same plain ints
+ * config.h's profile_on_ac/profile_on_battery use (see that struct's comment
+ * for why those fields are ints rather than dc_power_mode). */
+static const char *const dc_power_profile_opts[3] = {"Power Saver", "Balanced", "Performance"};
+
 static void tab_power(uictx *c)
 {
     ui_section(c, "POWER PROFILE");
@@ -2819,9 +2827,8 @@ static void tab_power(uictx *c)
     if (!dc_power_read(&pw)) {
         ui_hint(c, "No power-profile backend (power-profiles-daemon or tuned) detected");
     } else {
-        static const char *const opts[3] = {"Power Saver", "Balanced", "Performance"};
         int cur = (int)pw.active_mode; /* -1 (unknown) selects nothing */
-        int clicked = ui_segmented(c, "Profile", opts, 3, cur);
+        int clicked = ui_segmented(c, "Profile", dc_power_profile_opts, 3, cur);
         if (clicked >= 0 && clicked != cur)
             dc_power_set_mode((dc_power_mode)clicked);
         /* Raw backend profile as a caption when it isn't literally one of the
@@ -2829,6 +2836,81 @@ static void tab_power(uictx *c)
         if (pw.active_profile[0])
             ui_value(c, "Active profile", pw.active_profile);
         ui_hint(c, "Lock, suspend and power-off live in the power menu (bar \xc2\xb7 power button)");
+    }
+
+    /* docs/24-BATTERY-POWER-PLAN.md T6: charge-limit protection plus the
+     * notification/threshold/auto-power-saver knobs, all backed by config.h's
+     * battery_* keys (T2) and battery.c's charge-limit read/write (T1/T3).
+     * The whole section is skipped when no battery is present at all (a
+     * desktop) -- matches every other tab's "unavailable" hint convention
+     * (see POWER PROFILE / IDLE & LID above). Within it, the charge-limit
+     * stepper specifically is further gated on charge_limit_supported since
+     * plenty of drivers (ThinkPad/ASUS/LG EC-dependent) don't expose the
+     * sysfs attribute at all -- the notif/threshold/auto-power-saver rows
+     * don't need that support and stay available whenever a battery exists. */
+    ui_section(c, "BATTERY");
+    dc_battery_info bi;
+    if (!dc_battery_read(&bi)) {
+        ui_hint(c, "No battery detected");
+    } else {
+        if (bi.charge_limit_supported) {
+            if (ui_stepper(c, "Charge limit (%)", &c->cfg->charge_limit, 50, 100, 5)) {
+                c->changed = true;
+                /* Fire-and-forget pkexec write (DANKC_BATTERY_DRYRUN-gated
+                 * inside battery.c itself); UI reflects sysfs via poll-back
+                 * below, not the wish, since there's no success signal. */
+                dc_battery_set_charge_limit(bi.batt_dir, c->cfg->charge_limit);
+            }
+            ui_hint(c, "Caps charging to protect long-term battery health (100 = no limit)");
+            if (bi.charge_limit != c->cfg->charge_limit) {
+                char msg[96];
+                snprintf(msg, sizeof(msg), "Sysfs is at %d%% -- use the stepper to reapply %d%%",
+                         bi.charge_limit, c->cfg->charge_limit);
+                ui_hint(c, msg);
+            }
+            ui_hint(c, "The kernel resets this on every reboot; dankc never re-applies it at login.");
+        } else {
+            ui_hint(c, "This battery's driver doesn't expose a charge-limit control");
+        }
+
+        if (ui_toggle(c, "Battery notifications", "Low / critical / charge-limit-reached alerts",
+                      c->cfg->battery_notifications)) {
+            c->cfg->battery_notifications = !c->cfg->battery_notifications;
+            c->changed = true;
+        }
+        if (ui_stepper(c, "Low battery threshold (%)", &c->cfg->low_battery_threshold, 1, 99, 5))
+            c->changed = true;
+        if (ui_stepper(c, "Critical battery threshold (%)", &c->cfg->critical_battery_threshold, 1,
+                      99, 5))
+            c->changed = true;
+        if (ui_toggle(c, "Auto power saver",
+                      "Switch to the Power Saver profile once battery hits the low threshold",
+                      c->cfg->auto_power_saver)) {
+            c->cfg->auto_power_saver = !c->cfg->auto_power_saver;
+            c->changed = true;
+        }
+    }
+
+    ui_section(c, "AUTOMATION");
+    if (ui_toggle(c, "Automatic profile switching",
+                 "Apply a chosen profile on every AC plug/unplug edge",
+                 c->cfg->auto_profile_switch)) {
+        c->cfg->auto_profile_switch = !c->cfg->auto_profile_switch;
+        c->changed = true;
+    }
+    if (c->cfg->auto_profile_switch) {
+        int ac_clicked =
+            ui_segmented(c, "Profile on AC", dc_power_profile_opts, 3, c->cfg->profile_on_ac);
+        if (ac_clicked >= 0 && ac_clicked != c->cfg->profile_on_ac) {
+            c->cfg->profile_on_ac = ac_clicked;
+            c->changed = true;
+        }
+        int bat_clicked = ui_segmented(c, "Profile on battery", dc_power_profile_opts, 3,
+                                       c->cfg->profile_on_battery);
+        if (bat_clicked >= 0 && bat_clicked != c->cfg->profile_on_battery) {
+            c->cfg->profile_on_battery = bat_clicked;
+            c->changed = true;
+        }
     }
 
     /* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.9: Idle & Lid, a thin view
@@ -2842,13 +2924,13 @@ static void tab_power(uictx *c)
     if (lc.from_dropin)
         ui_hint(c, "Some of these are overridden by an existing logind.conf.d drop-in.");
 
-    static const char *const idle_opts[4] = {"Ignore", "Lock", "Suspend", "Poweroff"};
-    static const char *const idle_vals[4] = {"ignore", "lock", "suspend", "poweroff"};
+    static const char *const idle_opts[5] = {"Ignore", "Lock", "Suspend", "Hibernate", "Poweroff"};
+    static const char *const idle_vals[5] = {"ignore", "lock", "suspend", "hibernate", "poweroff"};
     int idle_cur = -1;
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 5; i++)
         if (strcmp(lc.idle_action, idle_vals[i]) == 0)
             idle_cur = i;
-    int idle_clicked = ui_segmented(c, "When idle", idle_opts, 4, idle_cur);
+    int idle_clicked = ui_segmented(c, "When idle", idle_opts, 5, idle_cur);
     if (idle_clicked >= 0 && idle_clicked != idle_cur) {
         snprintf(lc.idle_action, sizeof(lc.idle_action), "%s", idle_vals[idle_clicked]);
         dc_logind_conf_write_dropin(&lc);
@@ -2860,18 +2942,35 @@ static void tab_power(uictx *c)
         dc_logind_conf_write_dropin(&lc);
     }
 
-    static const char *const lid_opts[4] = {"Ignore", "Lock", "Suspend", "Poweroff"};
-    static const char *const lid_vals[4] = {"ignore", "lock", "suspend", "poweroff"};
+    /* Lid-close action is per-power-source in logind (HandleLidSwitch vs.
+     * HandleLidSwitchExternalPower) -- the writer has always accepted both
+     * (logind.c) but this tab only ever exposed the first. Same opts/vals
+     * list for both rows since systemd accepts identical values for each. */
+    static const char *const lid_opts[5] = {"Ignore", "Lock", "Suspend", "Hibernate", "Poweroff"};
+    static const char *const lid_vals[5] = {"ignore", "lock", "suspend", "hibernate", "poweroff"};
     int lid_cur = -1;
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 5; i++)
         if (strcmp(lc.handle_lid_switch, lid_vals[i]) == 0)
             lid_cur = i;
-    int lid_clicked = ui_segmented(c, "Lid close action", lid_opts, 4, lid_cur);
+    int lid_clicked = ui_segmented(c, "Lid close action", lid_opts, 5, lid_cur);
     if (lid_clicked >= 0 && lid_clicked != lid_cur) {
         snprintf(lc.handle_lid_switch, sizeof(lc.handle_lid_switch), "%s", lid_vals[lid_clicked]);
         dc_logind_conf_write_dropin(&lc);
     }
 
+    int lid_ac_cur = -1;
+    for (int i = 0; i < 5; i++)
+        if (strcmp(lc.handle_lid_switch_external_power, lid_vals[i]) == 0)
+            lid_ac_cur = i;
+    int lid_ac_clicked = ui_segmented(c, "Lid close on AC power", lid_opts, 5, lid_ac_cur);
+    if (lid_ac_clicked >= 0 && lid_ac_clicked != lid_ac_cur) {
+        snprintf(lc.handle_lid_switch_external_power, sizeof(lc.handle_lid_switch_external_power),
+                 "%s", lid_vals[lid_ac_clicked]);
+        dc_logind_conf_write_dropin(&lc);
+    }
+
+    ui_hint(c, "Per-power-source idle timeouts need a dedicated idle-detection service");
+    ui_hint(c, "(not available yet) -- \"When idle\" above applies regardless of AC state.");
     ui_hint(c, "Writes /etc/systemd/logind.conf.d/50-dankc.conf via pkexec;");
     ui_hint(c, "a re-login (or reboot) is needed for changes to take effect.");
 }
