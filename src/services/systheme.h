@@ -49,7 +49,11 @@ void dc_systheme_apply(const struct dc_config *cfg);
  * system()/popen() -- see printers.c's dc_printers_available() comment for
  * why). Never creates anything. For the settings UI (a later task) to grey
  * out / hide toggles for apps that aren't present. Recognized ids: "gtk",
- * "qt", "alacritty", "vscode", "kitty", "foot". Unknown ids return false. */
+ * "qt", "alacritty", "vscode", "kitty", "foot", "kvantum", "kde", "ghostty",
+ * "wezterm", "konsole", "xresources", "zed", "helix", "neovim", "vim",
+ * "sublime", "emacs", "rofi", "wofi", "fuzzel", "tofi", "mako", "dunst",
+ * "swaync", "btop", "cava", "zathura", "qutebrowser", "spicetify", "gtk2",
+ * "firefox", "discord". Unknown ids return false. */
 bool dc_systheme_app_detected(const char *app);
 
 #endif /* DC_SERVICES_SYSTHEME_H */
