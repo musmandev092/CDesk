@@ -88,6 +88,13 @@ typedef struct dc_config {
     float animation_speed;                /* duration multiplier (0.25..4.0; 1 = DMS) */
     bool dynamic_color;                   /* derive the palette from the wallpaper */
     char wallpaper[DC_CONFIG_PATH_MAX];   /* image for dynamic color */
+    /* Optional per-mode overrides (docs/29-SMALL-FEATURES-PLAN.md sec.3,
+     * wallpaper T2). Config keys "wallpaperLight"/"wallpaperDark", default
+     * empty (unset -> `wallpaper` above is used regardless of mode). Resolved
+     * by dc_wallpaper_effective() (services/wallpaper.h), which is the only
+     * place that should branch on these + `wallpaper`. */
+    char wallpaper_light[DC_CONFIG_PATH_MAX];
+    char wallpaper_dark[DC_CONFIG_PATH_MAX];
 
     dc_bar_position bar_position;         /* top or bottom edge */
     int bar_spacing;                      /* gap between the bar rect and the outer edge/screen sides */
