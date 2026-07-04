@@ -14,7 +14,32 @@ A lightweight desktop shell for the **niri** Wayland compositor, written in C �
 DankMaterialShell's core (QML/Quickshell + Go) as one native binary. Full spec in `docs/` (00–11).
 niri-only, ~99% C (one C++ file for Material colors), plugins deferred.
 
-## Current status — STRUCTURE + PERFORMANCE + FONT/POLISH COMPLETE ✅ (2026-07-03, main @ HEAD)
+## Current status — SETTINGS-COMPLETENESS + SYSTEM THEMING COMPLETE ✅ (2026-07-04, main @ HEAD)
+Both `make` and `meson` build zero-warning; repo clean; test suites pass (calc, text_edit, systheme).
+- **Settings completeness DONE**: every system setting is changeable from the Settings app (~29 tabs).
+  Added this round: Displays (niri IPC: res/scale/rotate/arrange/VRR/enable/save-default), Night Light
+  (gammastep/wlsunset temp+schedule), Network (ethernet/hotspot/saved), Printers (CUPS), Firewall
+  (ufw/firewalld via polkit), Mouse/Touchpad/Keyboard (niri input → ~/.config/niri/dankc-input.kdl),
+  Date & Time (timedatectl NTP+timezone), Power idle/lid (logind.conf.d drop-in via pkexec). All
+  system writes DANKC_*_DRYRUN-gated + backup + niri validate where relevant.
+- **⭐ System-wide theming DONE** (docs/21): dankc natively writes each app's theme file from its own
+  dc_theme palette (Approach B — no matugen binary), covering ~33 apps across 10 systheme_*.c emitters
+  (toolkits GTK3/4+Qt5/6ct+Kvantum+KDE+GTK2, terminals alacritty/kitty/foot/ghostty/wezterm/konsole/
+  xterm, editors VSCode/Zed/Helix/Neovim/Vim/Sublime/Emacs, launchers rofi/wofi/fuzzel/tofi, notify
+  mako/dunst/swaync, browsers firefox/qutebrowser/discord, media btop/cava/zathura/spicetify) +
+  categorized detected-first Settings UI (Theme & Colors → SYSTEM THEMING) + 33 config toggles + 59-check
+  test (tests/test_systheme.c). Opt-in, backup-before-write, DANKC_THEME_DRYRUN. Palette source is
+  dc_systheme_apply() at the end of apply_theme() in config.c (fires on wallpaper/theme/light-dark change).
+- **OSD variants**: mic-mute, media play/pause, power-profile, audio-output-switch (osd.c, poll-in-tick).
+- **Notepad** (docs/22, IN PROGRESS): text_edit.c multi-line editor widget (51-check test) + notepad_storage.c
+  (tabs/autosave, 21-check test) + notepad.c popout panel + wl.c key-repeat/modifier helpers all merged;
+  main.c wiring (NT4) + launcher entry (NT5) + bar widget (NT6) in flight/next.
+- **Keybind editing** (docs/23): planned, service (KB-T1) in flight.
+Gap triage + roadmap: docs/20. Group-1 remaining after Notepad/keybinds: DND scheduling, missing bar
+widgets, battery protection + power&sleep depth, audio per-device, VPN/IPC/wallpaper/updater/screen-rec,
+connected-frame chrome; then GREETER. DROPPED (user): desktop widgets, plugins, multi-bar, per-widget config.
+
+## Previous status — STRUCTURE + PERFORMANCE + FONT/POLISH COMPLETE ✅ (2026-07-03)
 All of docs/14 (structure), docs/15 (memory perf), docs/16 (runtime perf), plus font/i18n +
 UI polish are done. Both `make`, `make release`, and `meson` build zero-warning; repo clean.
 
