@@ -395,6 +395,17 @@ static void draw_clipboard_pill(dc_bar *bar, const dc_pill *p)
     draw_icon_centered(bar, p, DC_ICON_CONTENT_PASTE, dc_theme_current->surface_text);
 }
 
+static float measure_notepad(dc_bar *bar)
+{
+    DC_UNUSED(bar);
+    return dc_bar_icon_size(dc_config_current, -4);
+}
+
+static void draw_notepad_pill(dc_bar *bar, const dc_pill *p)
+{
+    draw_icon_centered(bar, p, DC_ICON_EDIT, dc_theme_current->surface_text);
+}
+
 static float measure_notif(dc_bar *bar)
 {
     DC_UNUSED(bar);
@@ -1649,6 +1660,7 @@ static const dc_bar_widget_def *find_widget(const char *id)
         {"systemTray", measure_tray, draw_tray_pill, false, true, DC_BAR_REGION_NONE},
         {"clipboard", measure_clipboard, draw_clipboard_pill, true, false,
          DC_BAR_REGION_CLIPBOARD},
+        {"notepad", measure_notepad, draw_notepad_pill, true, false, DC_BAR_REGION_NOTEPAD},
         {"cpuUsage", measure_cpu, draw_cpu_pill, true, false, DC_BAR_REGION_CPU},
         {"memUsage", measure_mem, draw_mem_pill, true, false, DC_BAR_REGION_MEM},
         {"notificationButton", measure_notif, draw_notif_pill, true, false,
