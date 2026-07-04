@@ -15,6 +15,7 @@
 #include "services/clipboard.h"
 #include "services/dbus.h"
 #include "services/audio.h"
+#include "services/battery_auto.h"
 #include "services/display.h"
 #include "services/autostart.h"
 #include "services/firewall.h"
@@ -232,6 +233,9 @@ static void clock_tick(void *data)
 {
     struct tick_ctx *ctx = data;
     dc_notifications_tick(ctx->notifications);
+    /* Battery-protection automation (docs/24-BATTERY-POWER-PLAN.md sec.2):
+     * self-limits its own sysfs read to ~5s, so calling every tick is cheap. */
+    dc_battery_auto_tick(ctx->notifications);
     dc_lock_tick(ctx->lock);
     dc_notepad_tick(ctx->notepad); /* autosave debounce check (docs/22-NOTEPAD-PLAN.md NT4) */
     dc_sysmon_poll(); /* self-limits to 3s (docs/12-BAR-SPEC.md sec.4 cpuUsage/memUsage) */
