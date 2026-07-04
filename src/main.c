@@ -39,6 +39,7 @@
 #include "ui/keybinds_modal.h"
 #include "ui/launcher.h"
 #include "ui/lock.h"
+#include "ui/notepad.h"
 #include "ui/notifcenter.h"
 #include "ui/osd.h"
 #include "ui/polkit_modal.h"
@@ -137,6 +138,7 @@ struct tick_ctx {
     dc_lock *lock;
     dc_processes *processes;
     dc_dashboard *dashboard;
+    dc_notepad *notepad;
     int last_volume;
     bool last_muted;
     int last_brightness;
@@ -231,6 +233,7 @@ static void clock_tick(void *data)
     struct tick_ctx *ctx = data;
     dc_notifications_tick(ctx->notifications);
     dc_lock_tick(ctx->lock);
+    dc_notepad_tick(ctx->notepad); /* autosave debounce check (docs/22-NOTEPAD-PLAN.md NT4) */
     dc_sysmon_poll(); /* self-limits to 3s (docs/12-BAR-SPEC.md sec.4 cpuUsage/memUsage) */
     /* Both self-limit/no-op while the Processes popout is closed (docs/13-
      * POPOUTS-SPEC.md: "2s poll only while open, no background cost"). */
@@ -382,6 +385,7 @@ struct click_ctx {
     dc_launcher *launcher;
     dc_notif_center *notif_center;
     dc_clip_picker *clip_picker;
+    dc_notepad *notepad;
     dc_processes *processes;
     dc_settings *settings;
     dc_dashboard *dashboard;
@@ -404,6 +408,7 @@ static void logind_lock(void *data)
 struct kbd_ctx {
     dc_launcher *launcher;
     dc_clip_picker *clip_picker;
+    dc_notepad *notepad;
     dc_processes *processes;
     dc_lock *lock;
     dc_settings *settings;
@@ -426,6 +431,8 @@ static void handle_key(uint32_t keysym, const char *utf8, void *data)
         dc_control_center_handle_key(k->control_center, keysym, utf8);
     else if (dc_clip_picker_visible(k->clip_picker))
         dc_clip_picker_handle_key(k->clip_picker, keysym, utf8);
+    else if (dc_notepad_visible(k->notepad))
+        dc_notepad_handle_key(k->notepad, keysym, utf8);
     else if (dc_processes_visible(k->processes))
         dc_processes_handle_key(k->processes, keysym, utf8);
     else if (dc_powermenu_visible(k->powermenu))
@@ -444,6 +451,7 @@ struct control_ctx {
     dc_battery_popout *battery_popout;
     dc_notif_center *notif_center;
     dc_clip_picker *clip_picker;
+    dc_notepad *notepad;
     dc_processes *processes;
     dc_settings *settings;
     dc_dashboard *dashboard;
@@ -505,6 +513,8 @@ static void control_dispatch(const char *cmd, void *data)
     }
     else if (strcmp(cmd, "clipboard") == 0 || strcmp(cmd, "clipboard toggle") == 0)
         dc_clip_picker_toggle(c->clip_picker, out);
+    else if (strcmp(cmd, "notepad") == 0 || strcmp(cmd, "notepad toggle") == 0)
+        dc_notepad_toggle(c->notepad, out);
     else if (strcmp(cmd, "dock") == 0 || strcmp(cmd, "dock toggle") == 0)
         /* Live show/hide, independent of the persistent dockEnabled config
          * key (docs/POLISH.md P5) -- mainly for verification/testing. */
@@ -659,6 +669,11 @@ static void handle_left_click(struct wl_surface *surface, double x, double y, st
     if (dc_clip_picker_visible(ctx->clip_picker) &&
         surface == dc_clip_picker_surface(ctx->clip_picker)) {
         dc_clip_picker_handle_click(ctx->clip_picker, x, y);
+        return;
+    }
+
+    if (dc_notepad_visible(ctx->notepad) && surface == dc_notepad_surface(ctx->notepad)) {
+        dc_notepad_handle_click(ctx->notepad, x, y);
         return;
     }
 
@@ -822,6 +837,10 @@ static void handle_bar_motion(struct wl_surface *surface, double x, double y, vo
         dc_clip_picker_handle_motion(ctx->clip_picker, x, y);
         return;
     }
+    if (dc_notepad_visible(ctx->notepad) && surface == dc_notepad_surface(ctx->notepad)) {
+        dc_notepad_handle_motion(ctx->notepad, x, y);
+        return;
+    }
     if (dc_dock_visible(ctx->dock) && surface == dc_dock_surface(ctx->dock)) {
         /* Also the dock's reveal-on-enter trigger (docs/POLISH.md P5/docs/11
          * sec.8): a motion callback fires for wl_pointer.enter too. */
@@ -864,6 +883,10 @@ static void handle_bar_leave(struct wl_surface *surface, void *data)
         dc_clip_picker_handle_leave(ctx->clip_picker);
         return;
     }
+    if (dc_notepad_visible(ctx->notepad) && surface == dc_notepad_surface(ctx->notepad)) {
+        dc_notepad_handle_leave(ctx->notepad);
+        return;
+    }
 }
 
 /* Left button released over any DankC surface: only control center currently
@@ -889,6 +912,7 @@ struct axis_ctx {
     struct bar_set *set;
     dc_notif_center *notif_center;
     dc_clip_picker *clip_picker;
+    dc_notepad *notepad;
     dc_processes *processes;
     dc_launcher *launcher;
     dc_settings *settings;
@@ -925,6 +949,10 @@ static void handle_bar_axis(struct wl_surface *surface, int steps_v, int steps_h
     if (dc_clip_picker_visible(actx->clip_picker) &&
         surface == dc_clip_picker_surface(actx->clip_picker)) {
         dc_clip_picker_handle_scroll(actx->clip_picker, steps_v);
+        return;
+    }
+    if (dc_notepad_visible(actx->notepad) && surface == dc_notepad_surface(actx->notepad)) {
+        dc_notepad_handle_scroll(actx->notepad, steps_v);
         return;
     }
     if (dc_processes_visible(actx->processes) && surface == dc_processes_surface(actx->processes)) {
@@ -1282,15 +1310,18 @@ int main(int argc, char **argv)
 
     dc_clipboard *clipboard = dc_clipboard_create(wl, g_loop);
     dc_clip_picker *clip_picker = dc_clip_picker_create(wl, &egl, &render, clipboard);
+    dc_notepad *notepad = dc_notepad_create(wl, &egl, &render);
     dc_settings *settings = dc_settings_create(wl, &egl, &render);
     dc_dashboard *dashboard = dc_dashboard_create(wl, &egl, &render);
     struct dash_settings_ctx dash_settings = {.settings = settings, .wl = wl};
     dc_dashboard_set_settings_cb(dashboard, dashboard_open_settings, &dash_settings);
     tick.dashboard = dashboard;
+    tick.notepad = notepad;
 
     struct kbd_ctx kbd = {
         .launcher = launcher,
         .clip_picker = clip_picker,
+        .notepad = notepad,
         .processes = processes,
         .lock = lock,
         .settings = settings,
@@ -1309,6 +1340,7 @@ int main(int argc, char **argv)
                              .launcher = launcher,
                              .notif_center = notif_center,
                              .clip_picker = clip_picker,
+                             .notepad = notepad,
                              .processes = processes,
                              .settings = settings,
                              .dashboard = dashboard,
@@ -1326,6 +1358,7 @@ int main(int argc, char **argv)
     struct axis_ctx actx = {.set = &set,
                             .notif_center = notif_center,
                             .clip_picker = clip_picker,
+                            .notepad = notepad,
                             .processes = processes,
                             .launcher = launcher,
                             .settings = settings,
@@ -1340,6 +1373,7 @@ int main(int argc, char **argv)
                                       .battery_popout = battery_popout,
                                       .notif_center = notif_center,
                                       .clip_picker = clip_picker,
+                                      .notepad = notepad,
                                       .processes = processes,
                                       .settings = settings,
                                       .dashboard = dashboard,
@@ -1505,6 +1539,7 @@ int main(int argc, char **argv)
     dc_dashboard_destroy(dashboard);
     dc_settings_destroy(settings);
     dc_clip_picker_destroy(clip_picker);
+    dc_notepad_destroy(notepad);
     dc_processes_destroy(processes);
     dc_clipboard_destroy(clipboard);
     dc_control_destroy(control);
