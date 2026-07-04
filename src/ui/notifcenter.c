@@ -24,6 +24,8 @@
 #include <string.h>
 #include <time.h>
 
+#include <xkbcommon/xkbcommon-keysyms.h>
+
 #include "fractional-scale-v1-client-protocol.h"
 #include "nanovg.h"
 #include "viewporter-client-protocol.h"
@@ -240,6 +242,16 @@ struct dc_notif_center {
      * re-render when the hovered id actually changes. */
     int hover_id;
 
+    /* Keyboard nav (accessibility nicety, additive to the mouse-only UI
+     * above): index into the *current tab's* flattened row list as built by
+     * nc_build_rows() (same order nc_render() draws in) -- -1 means no
+     * keyboard selection yet (panel just opened, or the list is empty).
+     * Reset to -1 on open and on tab switch since the row list itself is
+     * rebuilt from scratch each time (nc_build_rows() isn't identity-stable
+     * across a filter/tab change, so clamping in place would silently
+     * highlight an unrelated row). */
+    int key_sel;
+
     bool visible;
     bool configured;
     bool egl_ready;
@@ -344,6 +356,159 @@ static void nc_group_toggle_expanded(dc_notif_center *nc, const char *key)
         nc->group_state[nc->group_state_count].expanded = true;
         nc->group_state_count++;
     }
+}
+
+/* One notification-history row after grouping+filtering: either an app-group
+ * header (member_index<0) or one member card. Shared by nc_render() (which
+ * draws these in order) and the keyboard-nav helpers further down (which walk
+ * the identical list to move/resolve nc->key_sel) -- factored into
+ * nc_build_rows() below so the two never drift apart. */
+typedef struct {
+    char key[DC_NOTIF_APP];
+    const dc_notification *members[DC_NC_MAX_CARDS];
+    int member_count;
+} nc_group;
+
+typedef struct {
+    int group_index;
+    int member_index; /* -1 = header row */
+    float height;
+} nc_row;
+
+/* Collects the active tab's entries (after the History time-filter), groups
+ * them by app_name, and flattens into the exact row order nc_render() draws
+ * -- one header row per group with >1 member (plus one row per member if
+ * that group is expanded), one plain card row per lone notification. Returns
+ * row_count; writes *group_count_out and fills groups[]/rows[] (both sized
+ * DC_NC_MAX_GROUPS/DC_NC_MAX_ROWS by the caller, matching nc_render()'s own
+ * stack arrays). */
+static int nc_build_rows(dc_notif_center *nc, nc_group *groups, int *group_count_out, nc_row *rows)
+{
+    const dc_notification *entries[DC_NC_MAX_CARDS];
+    int count = (nc->tab == DC_NC_TAB_CURRENT)
+                   ? dc_notifications_current(nc->notifications, entries, DC_NC_MAX_CARDS)
+                   : dc_notifications_history(nc->notifications, entries, DC_NC_MAX_CARDS);
+
+    if (nc->tab == DC_NC_TAB_HISTORY && nc->history_filter != NC_HIST_ALL) {
+        time_t now_t = time(NULL);
+        struct tm tm_mid;
+        localtime_r(&now_t, &tm_mid);
+        tm_mid.tm_hour = 0;
+        tm_mid.tm_min = 0;
+        tm_mid.tm_sec = 0;
+        time_t today0 = mktime(&tm_mid);
+        struct tm tm_y = tm_mid;
+        tm_y.tm_mday -= 1;
+        time_t yest0 = mktime(&tm_y);
+        struct tm tm_w = tm_mid;
+        tm_w.tm_mday -= 6;
+        time_t week0 = mktime(&tm_w);
+
+        int64_t today0_ms = (int64_t)today0 * 1000;
+        int64_t yest0_ms = (int64_t)yest0 * 1000;
+        int64_t week0_ms = (int64_t)week0 * 1000;
+
+        int kept = 0;
+        for (int i = 0; i < count; i++) {
+            int64_t wm = entries[i]->created_wall_ms;
+            bool keep;
+            switch (nc->history_filter) {
+            case NC_HIST_TODAY:
+                keep = wm >= today0_ms;
+                break;
+            case NC_HIST_YESTERDAY:
+                keep = wm >= yest0_ms && wm < today0_ms;
+                break;
+            case NC_HIST_WEEK:
+                keep = wm >= week0_ms;
+                break;
+            default:
+                keep = true;
+                break;
+            }
+            if (keep)
+                entries[kept++] = entries[i];
+        }
+        count = kept;
+    }
+
+    int group_count = 0;
+    for (int i = 0; i < count; i++) {
+        char key[DC_NOTIF_APP];
+        nc_group_key(entries[i], key, sizeof(key));
+        int found = -1;
+        for (int g = 0; g < group_count; g++) {
+            if (strcmp(groups[g].key, key) == 0) {
+                found = g;
+                break;
+            }
+        }
+        if (found < 0 && group_count < DC_NC_MAX_GROUPS) {
+            found = group_count++;
+            snprintf(groups[found].key, sizeof(groups[found].key), "%s", key);
+            groups[found].member_count = 0;
+        }
+        if (found >= 0 && groups[found].member_count < DC_NC_MAX_CARDS)
+            groups[found].members[groups[found].member_count++] = entries[i];
+    }
+
+    int row_count = 0;
+    for (int gi = 0; gi < group_count && row_count < DC_NC_MAX_ROWS; gi++) {
+        if (groups[gi].member_count > 1) {
+            rows[row_count].group_index = gi;
+            rows[row_count].member_index = -1;
+            rows[row_count].height = DC_NC_GROUP_HEADER_H;
+            row_count++;
+            if (nc_group_is_expanded(nc, groups[gi].key)) {
+                for (int m = 0; m < groups[gi].member_count && row_count < DC_NC_MAX_ROWS; m++) {
+                    rows[row_count].group_index = gi;
+                    rows[row_count].member_index = m;
+                    rows[row_count].height = DC_NC_CARD_H;
+                    row_count++;
+                }
+            }
+        } else if (groups[gi].member_count == 1) {
+            rows[row_count].group_index = gi;
+            rows[row_count].member_index = 0;
+            rows[row_count].height = DC_NC_CARD_H;
+            row_count++;
+        }
+    }
+
+    *group_count_out = group_count;
+    return row_count;
+}
+
+/* Pure geometry, no drawing: the card list's viewport rect (logical px),
+ * exactly matching the y0/y1 nc_render() computes for its own nvgScissor --
+ * every term here is a fixed layout constant or nc->tab, never a measured
+ * text width, so it can be recomputed outside a render pass (used by the
+ * keyboard-nav helpers to scroll a newly-selected row into view before the
+ * next nc_render() call actually draws it). */
+static void nc_list_rect(dc_notif_center *nc, float *out_y0, float *out_y1)
+{
+    const float h = (float)nc->logical_height;
+    const bool bottom_bar = dc_config_current->bar_position == DC_BAR_POSITION_BOTTOM;
+    int pad_near, pad_side, pad_far;
+    dc_popout_chrome_pads(dc_config_current, &pad_near, &pad_side, &pad_far);
+    const float pad_top = bottom_bar ? (float)pad_far : (float)pad_near;
+    const float pad_bottom = bottom_bar ? (float)pad_near : (float)pad_far;
+
+    const float header_y = pad_top + DC_NC_HEADER_TOP;
+    const float tabs_y = header_y + DC_NC_HEADER_H + DC_NC_TABS_GAP;
+    const float dnd_row_y = tabs_y + DC_NC_TABS_H + DC_NC_LIST_GAP;
+    const float after_dnd_y = dnd_row_y + DC_NC_CHIP_ROW_H;
+
+    float list_y0;
+    if (nc->tab == DC_NC_TAB_HISTORY) {
+        const float hist_row_y = after_dnd_y + DC_NC_LIST_GAP;
+        list_y0 = hist_row_y + DC_NC_CHIP_ROW_H + DC_NC_LIST_GAP;
+    } else {
+        list_y0 = after_dnd_y + DC_NC_LIST_GAP;
+    }
+
+    *out_y0 = list_y0;
+    *out_y1 = h - pad_bottom - DC_NC_BOTTOM_PAD;
 }
 
 /* "app-name • time" label per docs/13-POPOUTS-SPEC.md sec.3: same calendar
@@ -856,6 +1021,24 @@ static void draw_nc_hover(dc_notif_center *nc)
     nvgFill(vg);
 }
 
+/* Keyboard-selection ring (accessibility nicety, additive to the mouse-only
+ * hover above): a subtle 2px primary-color outline traced just inside the
+ * row's own bounds, same 12px corner radius draw_card()/draw_group_header()
+ * already use for that row so it reads as "this row" rather than a generic
+ * box. Deliberately a stroke, not a fill, so it stays visually distinct from
+ * draw_nc_hover()'s fill if the mouse happens to be hovering a different row
+ * at the same time. */
+static void nc_draw_key_highlight(dc_notif_center *nc, float x, float y, float w, float h)
+{
+    NVGcontext *vg = nc->render->vg;
+    const dc_theme *t = dc_theme_current;
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, x + 1.0f, y + 1.0f, w - 2.0f, h - 2.0f, 12.0f);
+    nvgStrokeWidth(vg, 2.0f);
+    nvgStrokeColor(vg, tc_alpha(t->primary, 200));
+    nvgStroke(vg);
+}
+
 static void nc_render(dc_notif_center *nc)
 {
     if (!nc->configured || nc->phys_width <= 0)
@@ -1082,115 +1265,18 @@ static void nc_render(dc_notif_center *nc)
     const float list_y1 = h - pad_bottom - DC_NC_BOTTOM_PAD;
     const float list_h = list_y1 - list_y0;
 
-    const dc_notification *entries[DC_NC_MAX_CARDS];
-    int count = (nc->tab == DC_NC_TAB_CURRENT)
-                   ? dc_notifications_current(nc->notifications, entries, DC_NC_MAX_CARDS)
-                   : dc_notifications_history(nc->notifications, entries, DC_NC_MAX_CARDS);
-
-    /* History time-filter (docs/26-DND-SCHEDULING-PLAN.md UI/T3): compare
-     * each entry's created_wall_ms against local-midnight boundaries computed
-     * once here per render via localtime_r/mktime (not per-entry) -- cheap
-     * enough at 1 render/interaction and avoids DST edge cases from a flat
-     * +/-N*86400s offset in seconds. */
-    if (nc->tab == DC_NC_TAB_HISTORY && nc->history_filter != NC_HIST_ALL) {
-        time_t now_t = time(NULL);
-        struct tm tm_mid;
-        localtime_r(&now_t, &tm_mid);
-        tm_mid.tm_hour = 0;
-        tm_mid.tm_min = 0;
-        tm_mid.tm_sec = 0;
-        time_t today0 = mktime(&tm_mid);
-        struct tm tm_y = tm_mid;
-        tm_y.tm_mday -= 1;
-        time_t yest0 = mktime(&tm_y);
-        struct tm tm_w = tm_mid;
-        tm_w.tm_mday -= 6;
-        time_t week0 = mktime(&tm_w);
-
-        int64_t today0_ms = (int64_t)today0 * 1000;
-        int64_t yest0_ms = (int64_t)yest0 * 1000;
-        int64_t week0_ms = (int64_t)week0 * 1000;
-
-        int kept = 0;
-        for (int i = 0; i < count; i++) {
-            int64_t wm = entries[i]->created_wall_ms;
-            bool keep;
-            switch (nc->history_filter) {
-            case NC_HIST_TODAY:
-                keep = wm >= today0_ms;
-                break;
-            case NC_HIST_YESTERDAY:
-                keep = wm >= yest0_ms && wm < today0_ms;
-                break;
-            case NC_HIST_WEEK:
-                keep = wm >= week0_ms;
-                break;
-            default:
-                keep = true;
-                break;
-            }
-            if (keep)
-                entries[kept++] = entries[i];
-        }
-        count = kept;
-    }
-
-    typedef struct {
-        char key[DC_NOTIF_APP];
-        const dc_notification *members[DC_NC_MAX_CARDS];
-        int member_count;
-    } nc_group;
     nc_group groups[DC_NC_MAX_GROUPS];
     int group_count = 0;
-    for (int i = 0; i < count; i++) {
-        char key[DC_NOTIF_APP];
-        nc_group_key(entries[i], key, sizeof(key));
-        int found = -1;
-        for (int g = 0; g < group_count; g++) {
-            if (strcmp(groups[g].key, key) == 0) {
-                found = g;
-                break;
-            }
-        }
-        if (found < 0 && group_count < DC_NC_MAX_GROUPS) {
-            found = group_count++;
-            snprintf(groups[found].key, sizeof(groups[found].key), "%s", key);
-            groups[found].member_count = 0;
-        }
-        if (found >= 0 && groups[found].member_count < DC_NC_MAX_CARDS)
-            groups[found].members[groups[found].member_count++] = entries[i];
-    }
-
-    /* One row per header (group with >1 member) or standalone card (group
-     * with exactly 1 member); expanded groups also get one row per member. */
-    typedef struct {
-        int group_index;
-        int member_index; /* -1 for a header row */
-        float height;
-    } nc_row;
     nc_row rows[DC_NC_MAX_ROWS];
-    int row_count = 0;
-    for (int gi = 0; gi < group_count && row_count < DC_NC_MAX_ROWS; gi++) {
-        if (groups[gi].member_count > 1) {
-            rows[row_count].group_index = gi;
-            rows[row_count].member_index = -1;
-            rows[row_count].height = DC_NC_GROUP_HEADER_H;
-            row_count++;
-            if (nc_group_is_expanded(nc, groups[gi].key)) {
-                for (int m = 0; m < groups[gi].member_count && row_count < DC_NC_MAX_ROWS; m++) {
-                    rows[row_count].group_index = gi;
-                    rows[row_count].member_index = m;
-                    rows[row_count].height = DC_NC_CARD_H;
-                    row_count++;
-                }
-            }
-        } else if (groups[gi].member_count == 1) {
-            rows[row_count].group_index = gi;
-            rows[row_count].member_index = 0;
-            rows[row_count].height = DC_NC_CARD_H;
-            row_count++;
-        }
-    }
+    int row_count = nc_build_rows(nc, groups, &group_count, rows);
+
+    /* Keyboard selection (additive nav, docs task: accessibility nicety) --
+     * clamp whenever the row list changes shape (dismiss shrank it, a new
+     * notification grew it, a group toggled, etc.), same convention as the
+     * scroll clamp just below. Sets key_sel to -1 (no highlight) when the
+     * list is empty, since row_count-1 == -1 there. */
+    if (nc->key_sel >= row_count)
+        nc->key_sel = row_count - 1;
 
     float content_h = 0.0f;
     for (int r = 0; r < row_count; r++)
@@ -1206,7 +1292,7 @@ static void nc_render(dc_notif_center *nc)
     nc->hit_count = 0;
     nc->group_hit_count = 0;
 
-    if (count == 0) {
+    if (row_count == 0) {
         dc_color dim = t->surface_text;
         dim.a = 90;
         dc_render_icon(nc->render, DC_ICON_NOTIFICATIONS, w / 2.0f, list_y0 + list_h / 2.0f - 16.0f,
@@ -1236,6 +1322,8 @@ static void nc_render(dc_notif_center *nc)
                                   iw);
             else
                 draw_card(nc, grp->members[rows[r].member_index], ix, row_y, iw);
+            if (r == nc->key_sel)
+                nc_draw_key_highlight(nc, ix, row_y, iw, row_h);
         }
         nvgRestore(vg);
 
@@ -1321,6 +1409,7 @@ dc_notif_center *dc_notif_center_create(dc_wayland *wl, dc_egl *egl, dc_render *
     nc->logical_height = DC_NC_HEIGHT;
     nc->scale120 = DC_SCALE_BASE;
     nc->tab = DC_NC_TAB_CURRENT;
+    nc->key_sel = -1;
     return nc;
 }
 
@@ -1330,6 +1419,7 @@ static void nc_show(dc_notif_center *nc, dc_output *output)
     nc->configured = false;
     nc->egl_ready = false;
     nc->scale120 = (output && output->scale > 0 ? output->scale : 1) * DC_SCALE_BASE;
+    nc->key_sel = -1; /* fresh open -- no keyboard selection until Up/Down/j/k */
     dc_anim_start(&nc->anim, DC_DUR_MEDIUM, DC_EASE_EXPRESSIVE);
 
     nc->surface = wl_compositor_create_surface(nc->wl->compositor);
@@ -1355,6 +1445,16 @@ static void nc_show(dc_notif_center *nc, dc_output *output)
     zwlr_layer_surface_v1_set_size(nc->layer_surface, (uint32_t)nc->logical_width, DC_NC_HEIGHT);
     zwlr_layer_surface_v1_set_margin(nc->layer_surface, pa.margin_top, pa.margin_right,
                                      pa.margin_bottom, pa.margin_left);
+    /* On-demand keyboard so Up/Down/Enter/Delete/Escape list nav works while
+     * the panel is open, without permanently stealing focus the way an
+     * EXCLUSIVE grab (launcher.c's) would -- same rationale as
+     * controlcenter.c's net_pw/bluez-agent text entry. NOTE: the compositor
+     * side is only half the wiring -- main.c's handle_key()/kbd_ctx (see
+     * dc_control_center_wants_keyboard()'s callers) also need a branch for
+     * dc_notif_center_wants_keyboard()/dc_notif_center_handle_key() before
+     * key events actually reach this panel; out of this file's touch-scope. */
+    zwlr_layer_surface_v1_set_keyboard_interactivity(
+        nc->layer_surface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND);
     zwlr_layer_surface_v1_add_listener(nc->layer_surface, &layer_surface_listener, nc);
 
     wl_surface_commit(nc->surface);
@@ -1493,6 +1593,7 @@ void dc_notif_center_handle_click(dc_notif_center *nc, double x, double y)
     if (in_rect(x, y, nc->tab_x0[0], nc->tab_y0[0], nc->tab_x1[0], nc->tab_y1[0])) {
         if (nc->tab != DC_NC_TAB_CURRENT) {
             nc->tab = DC_NC_TAB_CURRENT;
+            nc->key_sel = -1; /* row list is rebuilt for the other tab -- stale index */
             nc_render(nc);
         }
         return;
@@ -1500,6 +1601,7 @@ void dc_notif_center_handle_click(dc_notif_center *nc, double x, double y)
     if (in_rect(x, y, nc->tab_x0[1], nc->tab_y0[1], nc->tab_x1[1], nc->tab_y1[1])) {
         if (nc->tab != DC_NC_TAB_HISTORY) {
             nc->tab = DC_NC_TAB_HISTORY;
+            nc->key_sel = -1;
             nc_render(nc);
         }
         return;
@@ -1562,6 +1664,7 @@ void dc_notif_center_handle_click(dc_notif_center *nc, double x, double y)
                     nc->hist_chip_y1[i])) {
             if (nc->history_filter != i) {
                 nc->history_filter = i;
+                nc->key_sel = -1; /* row list is rebuilt under the new filter -- stale index */
                 nc_render(nc);
             }
             return;
@@ -1637,6 +1740,178 @@ void dc_notif_center_handle_scroll(dc_notif_center *nc, int steps_v)
         return;
     nc->scroll[nc->tab] = s;
     nc_render(nc);
+}
+
+/* --- Keyboard nav (accessibility nicety, additive to the mouse-only UI
+ * above) --------------------------------------------------------------
+ *
+ * Up/Down/j/k walk nc->key_sel over nc_build_rows()'s row list (same order
+ * nc_render() draws); Enter/Delete resolve nc->key_sel back to a concrete
+ * group/notification via one more nc_build_rows() call each (cheap -- a
+ * handful of live notifications, once per keypress, same cost nc_render()
+ * already pays every frame it's open). */
+
+/* Scrolls nc->scroll[tab] just enough to bring row `sel` (already known
+ * in-range) fully into the list viewport -- mirrors a typical listbox's
+ * keyboard-nav auto-scroll. Uses nc_list_rect() for the viewport and sums
+ * rows[] heights/gaps for the row's own offset, the same geometry nc_render()
+ * will lay out on its next call; if that next render computes a slightly
+ * different scroll_max (content changed between this call and then) it
+ * re-clamps anyway, so an approximate scroll_max read from the last render is
+ * fine here. */
+static void nc_scroll_into_view(dc_notif_center *nc, int row_count, const nc_row *rows)
+{
+    if (nc->key_sel < 0 || nc->key_sel >= row_count)
+        return;
+
+    float list_y0, list_y1;
+    nc_list_rect(nc, &list_y0, &list_y1);
+    float list_h = list_y1 - list_y0;
+
+    float row_top = 0.0f;
+    for (int r = 0; r < nc->key_sel; r++)
+        row_top += rows[r].height + DC_NC_CARD_GAP;
+    float row_bottom = row_top + rows[nc->key_sel].height;
+
+    float scroll = nc->scroll[nc->tab];
+    if (row_top < scroll)
+        scroll = row_top;
+    else if (row_bottom > scroll + list_h)
+        scroll = row_bottom - list_h;
+    if (scroll < 0.0f)
+        scroll = 0.0f;
+    if (scroll > nc->scroll_max[nc->tab])
+        scroll = nc->scroll_max[nc->tab];
+    nc->scroll[nc->tab] = scroll;
+}
+
+/* Up/Down or k/j: move nc->key_sel by `dir` (-1/+1) over the active tab's row
+ * list, entering nav at the near end (0 for Down, last row for Up) the first
+ * time it's used since the panel opened/tab switched (key_sel == -1). */
+static void nc_key_move(dc_notif_center *nc, int dir)
+{
+    nc_group groups[DC_NC_MAX_GROUPS];
+    int group_count = 0;
+    nc_row rows[DC_NC_MAX_ROWS];
+    int row_count = nc_build_rows(nc, groups, &group_count, rows);
+    DC_UNUSED(group_count);
+
+    if (row_count == 0) {
+        if (nc->key_sel != -1) {
+            nc->key_sel = -1;
+            nc_render(nc);
+        }
+        return;
+    }
+
+    if (nc->key_sel < 0)
+        nc->key_sel = (dir > 0) ? 0 : row_count - 1;
+    else {
+        nc->key_sel += dir;
+        if (nc->key_sel < 0)
+            nc->key_sel = 0;
+        if (nc->key_sel >= row_count)
+            nc->key_sel = row_count - 1;
+    }
+
+    nc_scroll_into_view(nc, row_count, rows);
+    nc_render(nc);
+}
+
+/* Enter: on a group header, toggle expand (same effect as clicking it); on a
+ * card, invoke its first action button -- there's no separate "click the
+ * body" gesture in this panel's mouse UI to mirror (see draw_card()'s bottom
+ * button row: only close/dismiss/action buttons are clickable, never the
+ * body), and the spec's actual "default" action key is filtered out of
+ * actions[] at parse time (notifications.h's dc_notif_action comment), so
+ * it's simply not retrievable here -- actions[0] is the closest equivalent,
+ * and it's the same dc_notifications_invoke_action() call a mouse click on
+ * that first action button already makes. No-op if the card has zero
+ * actions, matching mouse behavior on a plain card body. */
+static void nc_key_activate(dc_notif_center *nc)
+{
+    nc_group groups[DC_NC_MAX_GROUPS];
+    int group_count = 0;
+    nc_row rows[DC_NC_MAX_ROWS];
+    int row_count = nc_build_rows(nc, groups, &group_count, rows);
+    DC_UNUSED(group_count);
+    if (nc->key_sel < 0 || nc->key_sel >= row_count)
+        return;
+
+    const nc_row *row = &rows[nc->key_sel];
+    const nc_group *grp = &groups[row->group_index];
+    if (row->member_index < 0) {
+        nc_group_toggle_expanded(nc, grp->key);
+        nc_render(nc);
+        return;
+    }
+    const dc_notification *n = grp->members[row->member_index];
+    if (n->action_count > 0) {
+        dc_notifications_invoke_action(nc->notifications, n->id, 0);
+        nc_render(nc);
+    }
+}
+
+/* Delete/BackSpace: dismiss the selected card one step further (Current ->
+ * History -> gone), same dc_notifications_dismiss() a click on its X/Dismiss
+ * button makes. No-op on a group header row -- there's no single id to
+ * dismiss there; expand it (Enter) and select a member row instead. */
+static void nc_key_dismiss(dc_notif_center *nc)
+{
+    nc_group groups[DC_NC_MAX_GROUPS];
+    int group_count = 0;
+    nc_row rows[DC_NC_MAX_ROWS];
+    int row_count = nc_build_rows(nc, groups, &group_count, rows);
+    DC_UNUSED(group_count);
+    if (nc->key_sel < 0 || nc->key_sel >= row_count)
+        return;
+
+    const nc_row *row = &rows[nc->key_sel];
+    if (row->member_index < 0)
+        return;
+    const nc_group *grp = &groups[row->group_index];
+    const dc_notification *n = grp->members[row->member_index];
+    dc_notifications_dismiss(nc->notifications, n->id);
+    nc_render(nc);
+}
+
+/* True while the panel wants keyboard focus. This popout has no text field
+ * (unlike controlcenter.c's net_pw/bluez-agent prompts), so unlike that
+ * panel's "on demand" contract, it's simply "open == wants keyboard". */
+bool dc_notif_center_wants_keyboard(dc_notif_center *nc)
+{
+    return nc && nc->visible && !nc->closing;
+}
+
+void dc_notif_center_handle_key(dc_notif_center *nc, uint32_t keysym, const char *utf8)
+{
+    DC_UNUSED(utf8); /* no text entry in this panel -- nav keys only */
+    if (!nc->visible || nc->closing)
+        return;
+
+    switch (keysym) {
+    case XKB_KEY_Escape:
+        nc_begin_close(nc);
+        return;
+    case XKB_KEY_Up:
+    case XKB_KEY_k:
+        nc_key_move(nc, -1);
+        return;
+    case XKB_KEY_Down:
+    case XKB_KEY_j:
+        nc_key_move(nc, 1);
+        return;
+    case XKB_KEY_Return:
+    case XKB_KEY_KP_Enter:
+        nc_key_activate(nc);
+        return;
+    case XKB_KEY_Delete:
+    case XKB_KEY_BackSpace:
+        nc_key_dismiss(nc);
+        return;
+    default:
+        return;
+    }
 }
 
 void dc_notif_center_destroy(dc_notif_center *nc)

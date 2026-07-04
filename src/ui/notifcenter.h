@@ -8,6 +8,7 @@
 #define DC_UI_NOTIFCENTER_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 struct dc_wayland;
 struct dc_egl;
@@ -45,5 +46,19 @@ void dc_notif_center_handle_leave(dc_notif_center *nc);
 /* Mouse wheel over the panel: scroll the active tab's card list by
  * `steps_v` debounced wheel steps (positive = down), clamped to content. */
 void dc_notif_center_handle_scroll(dc_notif_center *nc, int steps_v);
+
+/* True while the panel wants keyboard focus for list navigation -- always
+ * true while visible (this popout has no text field, unlike controlcenter.c's
+ * "on demand" contract, so it's simpler: open == wants keyboard). */
+bool dc_notif_center_wants_keyboard(dc_notif_center *nc);
+
+/* Keyboard nav over the active tab's card list (accessibility nicety, mouse
+ * behavior unchanged): Up/Down or k/j move a selection highlight; Enter
+ * activates the selected notification's first action button (if it has one)
+ * or toggles a group header's expand state; Delete/BackSpace dismisses the
+ * selected card one step further (X/Dismiss equivalent); Escape closes the
+ * popout. `utf8` is accepted for signature parity with the other panels'
+ * handle_key() but unused -- this panel has no text entry. */
+void dc_notif_center_handle_key(dc_notif_center *nc, uint32_t keysym, const char *utf8);
 
 #endif /* DC_UI_NOTIFCENTER_H */
