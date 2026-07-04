@@ -1,9 +1,13 @@
 #include "services/battery.h"
 
+#include "core/log.h"
+
 #include <dirent.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define DC_POWER_SUPPLY_DIR "/sys/class/power_supply"
 
@@ -206,4 +210,81 @@ bool dc_battery_read(dc_battery_info *out)
         out->ac_online = atoi(fake_ac) != 0;
 
     return found;
+}
+
+/* --- write: charge_control_end_threshold via pkexec ------------------------
+ *
+ * See battery.h's doc-comment for the fire-and-forget/no-success-signal/
+ * DANKC_BATTERY_DRYRUN contract. Shape mirrors logind.c's
+ * dc_logind_conf_write_dropin() (fork + execlp("pkexec", ...)), but the
+ * privileged command here is `pkexec tee <path>` reading the value off a
+ * pipe on its stdin, not `pkexec install <tmpfile> <dest>` -- sysfs
+ * attributes are magic files (0 size, single value) rather than regular
+ * files a copy-based tool can stage/rename into place, and argv-exec into
+ * tee sidesteps any shell-quoting concerns entirely (no `sh -c` involved).
+ */
+static bool battery_dryrun_enabled(void)
+{
+    const char *v = getenv("DANKC_BATTERY_DRYRUN");
+    return v && v[0] == '1';
+}
+
+bool dc_battery_set_charge_limit(const char *batt_dir, int pct)
+{
+    if (pct < 50 || pct > 100)
+        return false;
+    if (!batt_dir || !batt_dir[0] || strchr(batt_dir, '/') != NULL)
+        return false;
+
+    char path[512];
+    snprintf(path, sizeof(path), DC_POWER_SUPPLY_DIR "/%s/charge_control_end_threshold",
+            batt_dir);
+
+    if (battery_dryrun_enabled()) {
+        dc_info("[DRYRUN] battery: would write %d to %s", pct, path);
+        return true;
+    }
+
+    int fds[2];
+    if (pipe(fds) < 0) {
+        dc_warn("battery: pipe() failed, cannot set charge limit");
+        return false;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        dc_warn("battery: fork() failed, cannot set charge limit");
+        close(fds[0]);
+        close(fds[1]);
+        return false;
+    }
+
+    if (pid == 0) { /* child: pkexec tee <path>, value arrives on its stdin */
+        dup2(fds[0], STDIN_FILENO);
+        close(fds[0]);
+        close(fds[1]);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            close(devnull);
+        }
+        setsid();
+        execlp("pkexec", "pkexec", "tee", path, (char *)NULL);
+        _exit(127);
+    }
+
+    /* Parent: fire-and-forget -- write "%d\n" and close our end so tee sees
+     * EOF and exits after writing once; the polkit prompt (answered by
+     * dankc's own agent, see polkit.c) and the actual privileged write run
+     * fully detached. Reaped by main's SIGCHLD = SIG_IGN, so there is no
+     * waitpid() here to learn the outcome -- see battery.h. */
+    close(fds[0]);
+    char value[16];
+    int len = snprintf(value, sizeof(value), "%d\n", pct);
+    ssize_t written = write(fds[1], value, (size_t)len);
+    (void)written; /* best-effort; nothing useful to do if the pipe write is short/fails */
+    close(fds[1]);
+
+    dc_info("battery: requested charge limit %d on %s (via pkexec tee)", pct, path);
+    return true;
 }
