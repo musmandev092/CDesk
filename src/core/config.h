@@ -385,6 +385,20 @@ typedef struct dc_config {
     int audio_aliases_n;
     char audio_hidden[DC_CONFIG_AUDIO_DEVICES_MAX][DC_CONFIG_AUDIO_NAME_MAX];
     int audio_hidden_n;
+
+    /* System updater (docs/29-SMALL-FEATURES-PLAN.md sec.4, services/
+     * updates.c): update_terminal_cmd overrides the terminal dc_updates_
+     * run_upgrade() spawns to run the interactive upgrade command -- a
+     * printf-style template containing exactly one literal "%s" (substituted
+     * with the upgrade command), e.g. foot -e sh -c '%s; read -p done'.
+     * Default "" (empty) auto-probes foot/alacritty/kitty/wezterm/ghostty/
+     * xterm on PATH instead (see updates.c). updates_check_interval_min is
+     * minutes between automatic background checks (dc_updates_check_async());
+     * default 0 = manual only (never auto-checks), matching the existing
+     * settings.c updater tab's click-to-check behavior -- wiring the
+     * periodic timer into main.c's clock_tick is a later task. */
+    char update_terminal_cmd[256];
+    int updates_check_interval_min;
 } dc_config;
 
 /* The active config. Read-only for the rest of the app. */

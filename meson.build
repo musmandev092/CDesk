@@ -135,6 +135,7 @@ src = files(
   'src/services/sound.c', 'src/services/polkit.c',
   'src/services/nightlight.c', 'src/services/firewall.c',
   'src/services/screenrec.c',
+  'src/services/updates.c',
   'src/services/niri_input.c', 'src/services/timedate.c', 'src/services/keybinds.c',
   'src/services/systheme.c', 'src/services/systheme_term.c', 'src/services/systheme_apps.c',
   'src/services/systheme_launchers.c',
