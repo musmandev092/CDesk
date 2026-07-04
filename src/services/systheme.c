@@ -43,6 +43,7 @@
 #include "services/systheme_apps.h"
 #include "services/systheme_internal.h"
 #include "services/systheme_launchers.h"
+#include "services/systheme_notify.h"
 #include "services/systheme_term.h"
 #include "services/systheme_term2.h"
 
@@ -832,4 +833,10 @@ void dc_systheme_apply(const struct dc_config *cfg)
         dc_systheme_apply_konsole(light);
     if (cfg->systheme_xresources && dc_systheme_app_detected("xresources"))
         dc_systheme_apply_xresources(light);
+    if (cfg->systheme_mako && dc_systheme_app_detected("mako"))
+        dc_systheme_apply_mako(light);
+    if (cfg->systheme_dunst && dc_systheme_app_detected("dunst"))
+        dc_systheme_apply_dunst(light);
+    if (cfg->systheme_swaync && dc_systheme_app_detected("swaync"))
+        dc_systheme_apply_swaync(light);
 }
