@@ -25,6 +25,7 @@
 #include "services/updates.h"
 #include "services/weather.h"
 #include "theme/theme.h"
+#include "ui/connected.h"
 #include "ui/material_bg.h"
 #include "ui/popout.h"
 #include "wayland/egl.h"
@@ -62,12 +63,66 @@
 #define DC_CONTENT_INSET 24.0f
 #define DC_SET_THEME_COLS 5
 
+/* Card-fill padding (docs/27-CONNECTED-FRAME-PLAN.md): floating chrome
+ * reserves a flat 6px of shadow room on all four sides; connected chrome
+ * widens the lateral (side) pad to 12 for the connector fillets and drops
+ * the bar-facing (near) pad to 0, leaving the far pad at 6 -- see
+ * dc_popout_chrome_pads(). Which physical edge is "near" vs "far" swaps
+ * with bar_position, so top/bottom below are resolved from that (same
+ * convention as controlcenter.c's cc_get_layout() / processes.c's
+ * ps_get_layout()). These recompute from dc_config_current on every call
+ * (cheap: two ints + a branch) rather than caching, since settings.c's
+ * geometry helpers (content_left/body_top/etc.) are called from many sites
+ * across this file and none of them carry a layout struct today. */
+static float sp_pad_side(void)
+{
+    int pad_side;
+    dc_popout_chrome_pads(dc_config_current, NULL, &pad_side, NULL);
+    return (float)pad_side;
+}
+static bool sp_bottom_bar(void)
+{
+    return dc_config_current->bar_position == DC_BAR_POSITION_BOTTOM;
+}
+static float sp_pad_top(void)
+{
+    int pad_near, pad_far;
+    dc_popout_chrome_pads(dc_config_current, &pad_near, NULL, &pad_far);
+    return sp_bottom_bar() ? (float)pad_far : (float)pad_near;
+}
+static float sp_pad_bottom(void)
+{
+    int pad_near, pad_far;
+    dc_popout_chrome_pads(dc_config_current, &pad_near, NULL, &pad_far);
+    return sp_bottom_bar() ? (float)pad_near : (float)pad_far;
+}
+
+/* Logical surface width. DC_SET_WIDTH already bakes in the floating
+ * chrome's flat 6px pad on every side; connected_frame widens the lateral
+ * (side) pad to 12 for the connector fillets, so the surface needs
+ * 2*(pad_side-6) more logical px to keep the card CONTENT rect -- inset by
+ * pad_side, see content_left()/content_width() -- exactly where it sits
+ * when floating (mirrors controlcenter.c's cc_surface_width()).
+ * connected_frame off: pad_side==6, so this is just DC_SET_WIDTH,
+ * unchanged. Height is untouched: it's a fixed constant (DC_SET_HEIGHT)
+ * rather than content-driven like controlcenter's, and the near/far pad
+ * split nets to a *smaller* total (6 vs 12) when connected, so no widening
+ * is needed there. */
+static int sp_surface_width(void)
+{
+    int pad_side = 6;
+    dc_popout_chrome_pads(dc_config_current, NULL, &pad_side, NULL);
+    return DC_SET_WIDTH + 2 * (pad_side - 6);
+}
+
 /* Sidebar tab-list geometry (docs/14-COMPLETION-PLAN.md W2 added 6 more
  * tabs, 20 total -- no longer all fit in DC_SET_HEIGHT at once, so the
  * sidebar scrolls independently of the content pane; see sidebar_scroll_y
  * below and dc_settings_handle_scroll()'s x-position routing). */
 #define DC_SIDEBAR_ITEM_H 42.0f
-#define DC_SIDEBAR_ITEMS_TOP (DC_SET_PAD + 56.0f)
+/* Was a flat DC_SET_PAD+56 macro; now sidebar_body_top()'s near-edge pad
+ * varies with bar_position/connected_frame, so every former
+ * DC_SIDEBAR_ITEMS_TOP reference below calls that function instead. */
 
 /* Sidebar/control icon aliases -- render/icons.h owns the actual codepoints
  * (see its "Settings window" block) so scripts/subset-fonts.sh keeps the
@@ -327,20 +382,20 @@ static void s_teardown(dc_settings *s);
 static float content_left(const dc_settings *s)
 {
     DC_UNUSED(s);
-    return DC_SET_PAD + DC_SIDEBAR_W + DC_CONTENT_INSET;
+    return sp_pad_side() + DC_SIDEBAR_W + DC_CONTENT_INSET;
 }
 static float content_width(const dc_settings *s)
 {
-    return (float)s->logical_width - DC_SET_PAD - DC_CONTENT_INSET - content_left(s);
+    return (float)s->logical_width - sp_pad_side() - DC_CONTENT_INSET - content_left(s);
 }
 static float body_top(const dc_settings *s)
 {
     DC_UNUSED(s);
-    return DC_SET_PAD + 60.0f;
+    return sp_pad_top() + 60.0f;
 }
 static float body_height(const dc_settings *s)
 {
-    return (float)s->logical_height - DC_SET_PAD - 12.0f - body_top(s);
+    return (float)s->logical_height - sp_pad_bottom() - 12.0f - body_top(s);
 }
 
 /* Sidebar tab-list scroll geometry (mirrors content's body_top/body_height
@@ -349,11 +404,11 @@ static float body_height(const dc_settings *s)
 static float sidebar_body_top(const dc_settings *s)
 {
     DC_UNUSED(s);
-    return DC_SIDEBAR_ITEMS_TOP;
+    return sp_pad_top() + 56.0f;
 }
 static float sidebar_body_height(const dc_settings *s)
 {
-    return (float)s->logical_height - DC_SET_PAD - 8.0f - sidebar_body_top(s);
+    return (float)s->logical_height - sp_pad_bottom() - 8.0f - sidebar_body_top(s);
 }
 static float sidebar_items_total_h(void)
 {
@@ -5059,9 +5114,10 @@ static const struct wl_callback_listener s_frame_listener = {.done = s_frame_don
 
 static void draw_sidebar(dc_settings *s, NVGcontext *vg, const dc_theme *t)
 {
-    const float x0 = DC_SET_PAD, w = DC_SIDEBAR_W;
+    const float x0 = sp_pad_side(), w = DC_SIDEBAR_W;
+    const float pad_top = sp_pad_top(), pad_bottom = sp_pad_bottom();
     nvgBeginPath(vg);
-    nvgRoundedRect(vg, x0, DC_SET_PAD, w, (float)s->logical_height - 2.0f * DC_SET_PAD, 16.0f);
+    nvgRoundedRect(vg, x0, pad_top, w, (float)s->logical_height - pad_top - pad_bottom, 16.0f);
     nvgFillColor(vg, tc(t->surface_container_high));
     nvgFill(vg);
 
@@ -5069,7 +5125,7 @@ static void draw_sidebar(dc_settings *s, NVGcontext *vg, const dc_theme *t)
     nvgFontSize(vg, 20.0f);
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
     nvgFillColor(vg, tc(t->surface_text));
-    nvgText(vg, x0 + 16.0f, DC_SET_PAD + 28.0f, "Settings", NULL);
+    nvgText(vg, x0 + 16.0f, pad_top + 28.0f, "Settings", NULL);
 
     const float item_h = DC_SIDEBAR_ITEM_H, top = sidebar_body_top(s), mx = x0 + 8.0f,
                 mw = w - 16.0f;
@@ -5135,7 +5191,11 @@ static void s_render(dc_settings *s)
     NVGcontext *vg = s->render->vg;
     const dc_theme *t = dc_theme_current;
     dc_config *cfg = dc_config_mut();
-    const float w = s->logical_width, h = s->logical_height, pad = DC_SET_PAD;
+    const float w = s->logical_width, h = s->logical_height;
+    const bool bottom_bar = sp_bottom_bar();
+    const float pad_side = sp_pad_side();
+    const float pad_top = sp_pad_top();
+    const float pad_bottom = sp_pad_bottom();
 
     glViewport(0, 0, s->phys_width, s->phys_height);
     glClearColor(0, 0, 0, 0);
@@ -5147,24 +5207,24 @@ static void s_render(dc_settings *s)
         p = 1.0f - (p > 1.0f ? 1.0f : p);
     float alpha = p > 1.0f ? 1.0f : p;
     float scale = 0.94f + 0.06f * p;
-    float ox = pad + (w - 2.0f * pad) * s->anim_ox;
-    float oy = pad + (h - 2.0f * pad) * s->anim_oy;
+    float ox = pad_side + (w - 2.0f * pad_side) * s->anim_ox;
+    float oy = pad_top + (h - pad_top - pad_bottom) * s->anim_oy;
     nvgGlobalAlpha(vg, alpha);
     nvgTranslate(vg, ox, oy);
     nvgScale(vg, scale, scale);
     nvgTranslate(vg, -ox, -oy);
 
-    NVGpaint shadow = nvgBoxGradient(vg, pad, pad + 2.0f, w - 2 * pad, h - 2 * pad, 16.0f, 20.0f,
-                                     nvgRGBA(0, 0, 0, 110), nvgRGBA(0, 0, 0, 0));
-    nvgBeginPath(vg);
-    nvgRect(vg, 0, 0, w, h);
-    nvgRoundedRect(vg, pad, pad, w - 2 * pad, h - 2 * pad, 16.0f);
-    nvgPathWinding(vg, NVG_HOLE);
-    nvgFillPaint(vg, shadow);
-    nvgFill(vg);
-    /* Card: blurred+dimmed wallpaper ("material" bg) when enabled, else the
-     * flat surfaceContainer fill (docs/POLISH.md P2, ui/material_bg.c). */
-    dc_material_bg_fill_card(vg, s->render, pad, pad, w - 2 * pad, h - 2 * pad, 16.0f);
+    /* Card chrome: shadow + fill + outline, floating (flat pad 6, rounded
+     * corners) or stitched into the bar (square near corners, connector
+     * fillets, scissored shadow, 3-side outline) depending on
+     * connected_frame -- see ui/connected.h. Note: this converges settings'
+     * floating-mode chrome onto the same look every other popout already
+     * uses (corner radius 16->12, shadow blur 20->18/alpha 110->90, and a
+     * 1px outline that settings' old inline block never drew) rather than
+     * reproducing its slightly-different pre-existing constants
+     * byte-for-byte -- same convergence dashboard.c's T4 conversion already
+     * made (its old shadow was blur 22/alpha 100 vs the shared 18/90). */
+    dc_connected_card_chrome(vg, s->render, w, h, bottom_bar);
 
     draw_sidebar(s, vg, t);
 
@@ -5174,7 +5234,7 @@ static void s_render(dc_settings *s)
     nvgFontSize(vg, 20.0f);
     nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
     nvgFillColor(vg, tc(t->surface_text));
-    nvgText(vg, cl, pad + 30.0f, TABS[s->active_tab].label, NULL);
+    nvgText(vg, cl, pad_top + 30.0f, TABS[s->active_tab].label, NULL);
 
     /* Clamp scroll against last frame's measured content height. */
     float scroll_max = s->content_h - bh;
@@ -5196,7 +5256,7 @@ static void s_render(dc_settings *s)
 
     /* Scrollbar hint. */
     if (scroll_max > 0) {
-        float track_x = w - pad - 6.0f;
+        float track_x = w - pad_side - 6.0f;
         float thumb_h = bh * (bh / s->content_h);
         if (thumb_h < 24.0f)
             thumb_h = 24.0f;
@@ -5233,7 +5293,7 @@ static void layer_surface_handle_configure(void *data, struct zwlr_layer_surface
 {
     dc_settings *s = data;
     zwlr_layer_surface_v1_ack_configure(surface, serial);
-    s->logical_width = width > 0 ? (int)width : DC_SET_WIDTH;
+    s->logical_width = width > 0 ? (int)width : sp_surface_width();
     s->logical_height = height > 0 ? (int)height : DC_SET_HEIGHT;
     s->configured = true;
     recompute_physical(s);
@@ -5284,7 +5344,7 @@ dc_settings *dc_settings_create(dc_wayland *wl, dc_egl *egl, dc_render *render)
     s->wl = wl;
     s->egl = egl;
     s->render = render;
-    s->logical_width = DC_SET_WIDTH;
+    s->logical_width = sp_surface_width();
     s->logical_height = DC_SET_HEIGHT;
     s->scale120 = DC_SCALE_BASE;
     s->wr_new_opacity = 1.0f;
@@ -5314,7 +5374,7 @@ static void s_show(dc_settings *s, dc_output *output)
      * point; it's only overridden once the first configure event arrives). */
     {
         float item_h = DC_SIDEBAR_ITEM_H;
-        float body_h = (float)s->logical_height - DC_SET_PAD - 8.0f - DC_SIDEBAR_ITEMS_TOP;
+        float body_h = sidebar_body_height(s);
         float total_h = TAB_COUNT * item_h;
         float max_scroll = total_h - body_h;
         if (max_scroll < 0.0f)
@@ -5352,7 +5412,8 @@ static void s_show(dc_settings *s, dc_output *output)
     s->anim_ox = pa.origin_x;
     s->anim_oy = pa.origin_y;
     zwlr_layer_surface_v1_set_anchor(s->layer_surface, pa.anchor);
-    zwlr_layer_surface_v1_set_size(s->layer_surface, DC_SET_WIDTH, DC_SET_HEIGHT);
+    s->logical_width = sp_surface_width();
+    zwlr_layer_surface_v1_set_size(s->layer_surface, (uint32_t)s->logical_width, DC_SET_HEIGHT);
     zwlr_layer_surface_v1_set_margin(s->layer_surface, pa.margin_top, pa.margin_right,
                                      pa.margin_bottom, pa.margin_left);
     /* On-demand keyboard so text fields (weather lat/lon) can be typed into
@@ -5451,7 +5512,8 @@ void dc_settings_handle_scroll(dc_settings *s, double x, int steps_v)
 {
     if (!s->visible || s->closing)
         return;
-    if (x >= DC_SET_PAD && x <= DC_SET_PAD + DC_SIDEBAR_W) {
+    float pad_side = sp_pad_side();
+    if (x >= pad_side && x <= pad_side + DC_SIDEBAR_W) {
         s->sidebar_scroll_y += steps_v * 48.0f;
         float smax = sidebar_scroll_max(s);
         if (s->sidebar_scroll_y > smax)
@@ -5488,8 +5550,9 @@ void dc_settings_handle_click(dc_settings *s, double x, double y)
     }
 
     /* Sidebar tab switch. */
-    if (x >= DC_SET_PAD && x <= DC_SET_PAD + DC_SIDEBAR_W) {
-        const float item_h = DC_SIDEBAR_ITEM_H, top = DC_SIDEBAR_ITEMS_TOP;
+    float pad_side = sp_pad_side();
+    if (x >= pad_side && x <= pad_side + DC_SIDEBAR_W) {
+        const float item_h = DC_SIDEBAR_ITEM_H, top = sidebar_body_top(s);
         float sb_top = sidebar_body_top(s), sb_h = sidebar_body_height(s);
         if (y < sb_top || y > sb_top + sb_h)
             return; /* click on the header/outside the scrolled tab list */
