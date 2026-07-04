@@ -137,7 +137,11 @@ src = files(
   'src/services/systheme.c', 'src/services/systheme_term.c', 'src/services/systheme_apps.c',
   'src/services/systheme_launchers.c',
   'src/services/systheme_term2.c',
+<<<<<<< HEAD
   'src/services/systheme_notify.c',
+=======
+  'src/services/systheme_qtkde.c',
+>>>>>>> wt/theme_t5
   'src/niri/niri.c',
   'src/theme/theme.c',
   'src/ipc/control.c',

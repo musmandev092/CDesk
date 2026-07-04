@@ -44,6 +44,7 @@
 #include "services/systheme_internal.h"
 #include "services/systheme_launchers.h"
 #include "services/systheme_notify.h"
+#include "services/systheme_qtkde.h"
 #include "services/systheme_term.h"
 #include "services/systheme_term2.h"
 
@@ -839,4 +840,10 @@ void dc_systheme_apply(const struct dc_config *cfg)
         dc_systheme_apply_dunst(light);
     if (cfg->systheme_swaync && dc_systheme_app_detected("swaync"))
         dc_systheme_apply_swaync(light);
+    if (cfg->systheme_kvantum && dc_systheme_app_detected("kvantum"))
+        dc_systheme_apply_kvantum(light);
+    if (cfg->systheme_kde && dc_systheme_app_detected("kde"))
+        dc_systheme_apply_kde(light);
+    if (cfg->systheme_gtk2 && dc_systheme_app_detected("gtk2"))
+        dc_systheme_apply_gtk2(light);
 }
