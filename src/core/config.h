@@ -201,6 +201,13 @@ typedef struct dc_config {
     bool frame_enabled;
     float frame_radius;
 
+    /* Connected-frame chrome: stitches popouts and the dock into the bar
+     * (docs/27-CONNECTED-FRAME-PLAN.md) instead of floating as separate
+     * rounded cards. Independent of frame_enabled (the screen-corner
+     * overlay above) -- do not conflate the two. Defaults off; v1 (T1) is
+     * config-only, no rendering reads this yet. */
+    bool connected_frame;
+
     /* Material background: blurred+dimmed wallpaper behind panel cards
      * instead of a flat surfaceContainer fill (docs/POLISH.md P2,
      * ui/material_bg.c). Falls back to the flat fill when disabled or when
