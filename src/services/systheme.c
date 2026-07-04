@@ -44,6 +44,7 @@
 #include "services/systheme_internal.h"
 #include "services/systheme_launchers.h"
 #include "services/systheme_term.h"
+#include "services/systheme_term2.h"
 
 #include "core/config.h"
 #include "core/log.h"
@@ -823,4 +824,12 @@ void dc_systheme_apply(const struct dc_config *cfg)
         dc_systheme_apply_fuzzel(light);
     if (cfg->systheme_tofi && dc_systheme_app_detected("tofi"))
         dc_systheme_apply_tofi(light);
+    if (cfg->systheme_ghostty && dc_systheme_app_detected("ghostty"))
+        dc_systheme_apply_ghostty(light);
+    if (cfg->systheme_wezterm && dc_systheme_app_detected("wezterm"))
+        dc_systheme_apply_wezterm(light);
+    if (cfg->systheme_konsole && dc_systheme_app_detected("konsole"))
+        dc_systheme_apply_konsole(light);
+    if (cfg->systheme_xresources && dc_systheme_app_detected("xresources"))
+        dc_systheme_apply_xresources(light);
 }
