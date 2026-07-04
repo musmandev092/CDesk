@@ -195,6 +195,26 @@ typedef struct dc_config {
     float input_mouse_accel_speed; /* -1..1 */
     bool input_keyboard_numlock;
     char input_keyboard_layout[32]; /* xkb layout string e.g. "us"; empty = unset */
+
+    /* System-wide theming (services/systheme.c): dankc writes each app's own
+     * native theme file directly from dc_theme_current + dc_config_light_mode()
+     * (no external `matugen` invocation). systheme_enabled is the master
+     * switch, off by default so a fresh install never touches any app's
+     * config until the user opts in via Settings > Theme & Colors. Each
+     * per-app toggle defaults on (matching "opt into the feature once, get
+     * every supported app") but is only ever acted on when BOTH
+     * systheme_enabled is true AND dc_systheme_app_detected() finds the app
+     * actually installed -- see systheme.c's file header for the full
+     * safety contract. Task 1 only implements the "gtk" tier; the rest are
+     * wired here so later tasks don't need another config.h/config.c
+     * change. */
+    bool systheme_enabled;
+    bool systheme_gtk;
+    bool systheme_qt;
+    bool systheme_alacritty;
+    bool systheme_vscode;
+    bool systheme_kitty;
+    bool systheme_foot;
 } dc_config;
 
 /* The active config. Read-only for the rest of the app. */
