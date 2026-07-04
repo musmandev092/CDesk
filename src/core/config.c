@@ -3,6 +3,7 @@
 #include "core/dms_import.h"
 #include "core/log.h"
 #include "services/systheme.h"
+#include "services/wallpaper.h"
 #include "theme/dynamic.h"
 #include "theme/theme.h"
 
@@ -575,16 +576,24 @@ static void apply_theme(void)
     bool light = dc_config_light_mode();
     dc_theme_set_light(light);
     dc_theme_set(config.theme_id);
-    if (config.dynamic_color && config.wallpaper[0]) {
+    /* Dynamic color samples whatever is actually being shown (light/dark
+     * override if one applies), not always the base `wallpaper` key -- see
+     * dc_wallpaper_effective() (services/wallpaper.h, wallpaper T2). */
+    const char *effective_wallpaper = dc_wallpaper_effective();
+    if (config.dynamic_color && effective_wallpaper[0]) {
         dc_theme generated;
-        if (dc_dynamic_from_image(config.wallpaper, light, &generated)) {
+        if (dc_dynamic_from_image(effective_wallpaper, light, &generated)) {
             dc_theme_set_custom(&generated);
-            dc_info("dynamic color from %s (%s)", config.wallpaper, light ? "light" : "dark");
+            dc_info("dynamic color from %s (%s)", effective_wallpaper, light ? "light" : "dark");
         } else {
-            dc_warn("dynamic color: could not read %s", config.wallpaper);
+            dc_warn("dynamic color: could not read %s", effective_wallpaper);
         }
     }
     dc_systheme_apply(&config);
+    /* Auto-swap the painted wallpaper when the effective path changed (e.g. a
+     * dark<->light mode flip with wallpaperLight/Dark configured). No-ops
+     * (skips the swaybg respawn) when it's the same path as last time. */
+    dc_wallpaper_apply_effective();
 }
 
 /* Resolve the config.json path. Returns false if no HOME/XDG. */
@@ -642,6 +651,8 @@ void dc_config_load(void)
     get_float(root, "animationSpeed", &config.animation_speed, 0.25f, 4.0f);
     get_bool(root, "dynamicColor", &config.dynamic_color);
     get_string(root, "wallpaper", config.wallpaper, sizeof(config.wallpaper));
+    get_string(root, "wallpaperLight", config.wallpaper_light, sizeof(config.wallpaper_light));
+    get_string(root, "wallpaperDark", config.wallpaper_dark, sizeof(config.wallpaper_dark));
 
     get_bar_position(root, "barPosition", &config.bar_position);
     get_int(root, "barSpacing", &config.bar_spacing, 0, 64);
@@ -851,6 +862,10 @@ void dc_config_save(void)
     cJSON_AddBoolToObject(root, "dynamicColor", config.dynamic_color);
     if (config.wallpaper[0])
         cJSON_AddStringToObject(root, "wallpaper", config.wallpaper);
+    if (config.wallpaper_light[0])
+        cJSON_AddStringToObject(root, "wallpaperLight", config.wallpaper_light);
+    if (config.wallpaper_dark[0])
+        cJSON_AddStringToObject(root, "wallpaperDark", config.wallpaper_dark);
 
     cJSON_AddStringToObject(root, "barPosition",
                             config.bar_position == DC_BAR_POSITION_BOTTOM ? "bottom" : "top");

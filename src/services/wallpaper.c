@@ -65,8 +65,30 @@ void dc_wallpaper_apply(const char *path)
 
 const char *dc_wallpaper_effective(void)
 {
-    /* TODO(wallpaper T2/T4): resolve wallpaperLight/Dark + wallpaperPerMonitor
-     * here once those keys exist; for now the config's single `wallpaper`
-     * field is the only source of truth. */
-    return dc_config_current->wallpaper;
+    const dc_config *cfg = dc_config_current;
+    bool light = dc_config_light_mode();
+    if (light && cfg->wallpaper_light[0])
+        return cfg->wallpaper_light;
+    if (!light && cfg->wallpaper_dark[0])
+        return cfg->wallpaper_dark;
+    /* TODO(wallpaper T4): resolve wallpaperPerMonitor here once that key
+     * exists (per-output override, primary output drives the palette). */
+    return cfg->wallpaper;
+}
+
+/* Last path actually handed to dc_wallpaper_apply() by _apply_effective(),
+ * so repeat calls (e.g. every dc_config_reapply() after an unrelated
+ * settings edit) don't respawn swaybg when nothing actually changed.
+ * Starts empty each process run -- the first call after startup always
+ * "changes" (empty -> whatever's effective) if a wallpaper is configured. */
+static char g_last_applied[DC_CONFIG_PATH_MAX];
+
+void dc_wallpaper_apply_effective(void)
+{
+    const char *effective = dc_wallpaper_effective();
+    if (strncmp(effective, g_last_applied, sizeof(g_last_applied)) == 0)
+        return;
+    snprintf(g_last_applied, sizeof(g_last_applied), "%s", effective);
+    if (effective[0])
+        dc_wallpaper_apply(effective);
 }

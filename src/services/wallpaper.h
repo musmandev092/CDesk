@@ -20,14 +20,25 @@
  * $PATH — the config/palette still update regardless via the caller. */
 void dc_wallpaper_apply(const char *path);
 
-/* Returns the currently-effective wallpaper path, i.e. what dc_wallpaper_
- * apply() was last told to paint / what dynamic color samples from.
- * Right now this is just dc_config_current->wallpaper verbatim.
+/* Returns the currently-effective wallpaper path: dc_config_current->
+ * wallpaper_light or ->wallpaper_dark when one is set and matches
+ * dc_config_light_mode()'s current light/dark mode, else falling back to
+ * dc_config_current->wallpaper. Callers should always go through this
+ * instead of reading the config wallpaper fields directly, so they never
+ * have to re-derive the light/dark precedence themselves.
  *
- * TODO(wallpaper T2/T4): once wallpaperLight/Dark and wallpaperPerMonitor
- * exist, this becomes the single place that resolves which of those (light/
- * dark mode, per-output override) is "effective" right now, so callers never
- * have to branch on the new config keys themselves. */
+ * TODO(wallpaper T4): also resolve wallpaperPerMonitor here once that key
+ * exists (per-output override; primary output still drives the palette). */
 const char *dc_wallpaper_effective(void);
+
+/* Re-derive dc_wallpaper_effective() and, only if it differs from the path
+ * last handed to dc_wallpaper_apply() (tracked in a file-local static),
+ * respawn swaybg with the new one. Call this after anything that might
+ * change the effective path -- config.c's apply_theme() does, since a
+ * themeMode flip (or a settings edit to wallpaper/wallpaperLight/Dark) is
+ * exactly when the shown wallpaper needs to swap. A no-op the rest of the
+ * time (e.g. every dc_config_reapply() from an unrelated settings tweak)
+ * keeps this from respawning swaybg on every save. */
+void dc_wallpaper_apply_effective(void);
 
 #endif /* DC_SERVICES_WALLPAPER_H */
