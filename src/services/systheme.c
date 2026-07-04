@@ -42,6 +42,7 @@
 
 #include "services/systheme_apps.h"
 #include "services/systheme_internal.h"
+#include "services/systheme_launchers.h"
 #include "services/systheme_term.h"
 
 #include "core/config.h"
@@ -813,4 +814,13 @@ void dc_systheme_apply(const struct dc_config *cfg)
         dc_systheme_apply_qt(light);
     if (cfg->systheme_vscode && dc_systheme_app_detected("vscode"))
         dc_systheme_apply_vscode(light);
+
+    if (cfg->systheme_rofi && dc_systheme_app_detected("rofi"))
+        dc_systheme_apply_rofi(light);
+    if (cfg->systheme_wofi && dc_systheme_app_detected("wofi"))
+        dc_systheme_apply_wofi(light);
+    if (cfg->systheme_fuzzel && dc_systheme_app_detected("fuzzel"))
+        dc_systheme_apply_fuzzel(light);
+    if (cfg->systheme_tofi && dc_systheme_app_detected("tofi"))
+        dc_systheme_apply_tofi(light);
 }
