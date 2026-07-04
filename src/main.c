@@ -26,8 +26,10 @@
 #include "services/notifications.h"
 #include "services/polkit.h"
 #include "services/power.h"
+#include "services/screenrec.h"
 #include "services/sysmon.h"
 #include "services/tray.h"
+#include "services/wallpaper.h"
 #include "services/weather.h"
 #include "theme/theme.h"
 #include "ui/bar/bar.h"
@@ -40,6 +42,7 @@
 #include "ui/keybinds_modal.h"
 #include "ui/launcher.h"
 #include "ui/lock.h"
+#include "ui/material_bg.h"
 #include "ui/notepad.h"
 #include "ui/notifcenter.h"
 #include "ui/osd.h"
@@ -603,6 +606,112 @@ static void control_dispatch(const char *cmd, void *data)
          * pgrep/pkill/gammastep-O-4000 one-shot. Persists + re-applies the
          * configured temperature/schedule instead of a hardcoded 4000K. */
         dc_nightlight_toggle();
+    else if (strcmp(cmd, "night on") == 0)
+        dc_nightlight_enable(true);
+    else if (strcmp(cmd, "night off") == 0)
+        dc_nightlight_enable(false);
+    /* --- Richer IPC batch (docs/29-SMALL-FEATURES-PLAN.md sec.2) --------- */
+    else if (strcmp(cmd, "volume up") == 0 || strcmp(cmd, "volume down") == 0) {
+        /* 5% step (no config knob for this exists yet -- matches the
+         * brightness step below). Relative move needs a read-then-write
+         * since dc_audio_set_volume() only takes an absolute percent. */
+        dc_audio_info info = {0};
+        dc_audio_read(&info);
+        int step = strcmp(cmd, "volume up") == 0 ? 5 : -5;
+        int v = info.volume + step;
+        dc_audio_set_volume(v < 0 ? 0 : (v > 100 ? 100 : v));
+    }
+    else if (strncmp(cmd, "volume set ", 11) == 0) {
+        int pct = atoi(cmd + 11);
+        dc_audio_set_volume(pct < 0 ? 0 : (pct > 100 ? 100 : pct));
+    }
+    else if (strcmp(cmd, "volume mute") == 0)
+        /* Toggle, not set -- matches controlcenter.c's tile handler
+         * (cc_click, row 1 col 0). */
+        run_sh("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
+    else if (strcmp(cmd, "mic mute") == 0)
+        run_sh("wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle");
+    else if (strcmp(cmd, "brightness up") == 0)
+        /* brightnessctl's own relative syntax -- no read-back needed, unlike
+         * volume up/down above. */
+        run_sh("brightnessctl set 5%+ 2>/dev/null");
+    else if (strcmp(cmd, "brightness down") == 0)
+        run_sh("brightnessctl set 5%- 2>/dev/null");
+    else if (strncmp(cmd, "brightness set ", 15) == 0) {
+        int pct = atoi(cmd + 15);
+        pct = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+        char sh[64];
+        snprintf(sh, sizeof(sh), "brightnessctl set %d%% 2>/dev/null", pct);
+        run_sh(sh);
+    }
+    else if (strcmp(cmd, "media play-pause") == 0)
+        dc_mpris_play_pause();
+    else if (strcmp(cmd, "media next") == 0)
+        dc_mpris_next();
+    else if (strcmp(cmd, "media prev") == 0)
+        dc_mpris_previous();
+    else if (strcmp(cmd, "dnd on") == 0 || strcmp(cmd, "dnd off") == 0 ||
+             strcmp(cmd, "dnd toggle") == 0) {
+        dc_config *cfg = dc_config_mut();
+        cfg->dnd_enabled =
+            strcmp(cmd, "dnd toggle") == 0 ? !cfg->dnd_enabled : strcmp(cmd, "dnd on") == 0;
+        dc_config_save();
+        dc_config_notify_changed();
+    }
+    else if (strcmp(cmd, "theme dark") == 0 || strcmp(cmd, "theme light") == 0 ||
+             strcmp(cmd, "theme auto") == 0) {
+        /* cmd + 6 skips "theme " -- "dark"/"light"/"auto" all fit
+         * dc_config.theme_mode's char[8] with room to spare. */
+        dc_config *cfg = dc_config_mut();
+        snprintf(cfg->theme_mode, sizeof(cfg->theme_mode), "%s", cmd + 6);
+        dc_config_reapply();
+        dc_config_save();
+        dc_config_notify_changed();
+    }
+    else if (strcmp(cmd, "theme dynamic on") == 0 || strcmp(cmd, "theme dynamic off") == 0) {
+        dc_config *cfg = dc_config_mut();
+        cfg->dynamic_color = strcmp(cmd, "theme dynamic on") == 0;
+        dc_config_reapply();
+        dc_config_save();
+        dc_config_notify_changed();
+    }
+    else if (strcmp(cmd, "profile performance") == 0)
+        dc_power_set_mode(DC_POWER_MODE_PERFORMANCE);
+    else if (strcmp(cmd, "profile balanced") == 0)
+        dc_power_set_mode(DC_POWER_MODE_BALANCED);
+    else if (strcmp(cmd, "profile powersaver") == 0)
+        dc_power_set_mode(DC_POWER_MODE_POWER_SAVER);
+    else if (strncmp(cmd, "wallpaper set ", 14) == 0) {
+        /* Same shape as dashboard.c's wall_set_active() (Wallpapers tab
+         * thumbnail click): reapply (stock theme + dynamic-color overlay)
+         * and invalidate the cached material background unconditionally,
+         * but gate the actual disk write + swaybg respawn behind
+         * DANKC_WALL_DRY like that path does, for in-place verification. */
+        const char *path = cmd + 14;
+        dc_config *cfg = dc_config_mut();
+        if (strcmp(cfg->wallpaper, path) != 0) {
+            snprintf(cfg->wallpaper, sizeof(cfg->wallpaper), "%s", path);
+            dc_config_reapply();
+            dc_material_bg_invalidate();
+            if (!getenv("DANKC_WALL_DRY")) {
+                dc_config_save();
+                dc_wallpaper_apply(path);
+            }
+            dc_config_notify_changed();
+        }
+    }
+    else if (strcmp(cmd, "record start") == 0)
+        dc_screenrec_start(c->notifications, false);
+    else if (strcmp(cmd, "record region") == 0)
+        dc_screenrec_start(c->notifications, true);
+    else if (strcmp(cmd, "record stop") == 0)
+        dc_screenrec_stop(c->notifications);
+    else if (strcmp(cmd, "record toggle") == 0) {
+        if (dc_screenrec_active())
+            dc_screenrec_stop(c->notifications);
+        else
+            dc_screenrec_start(c->notifications, false);
+    }
     else if (strcmp(cmd, "quit") == 0)
         dc_loop_stop(g_loop);
     else
@@ -637,7 +746,26 @@ static void print_keybinds(void)
            "    Mod+Shift+P      { spawn \"dankc\" \"ctl\" \"color-picker\"; }\n"
            "    Mod+Shift+N      { spawn \"dankc\" \"ctl\" \"night\"; }\n"
            "    Mod+Comma        { spawn \"dankc\" \"ctl\" \"settings\"; }\n"
-           "    Mod+Escape       { spawn \"dankc\" \"ctl\" \"power-menu\"; }\n");
+           "    Mod+Escape       { spawn \"dankc\" \"ctl\" \"power-menu\"; }\n"
+           "\n"
+           "    // Media keys / richer IPC verbs (docs/29-SMALL-FEATURES-PLAN.md sec.2)\n"
+           "    XF86AudioRaiseVolume { spawn \"dankc\" \"ctl\" \"volume\" \"up\"; }\n"
+           "    XF86AudioLowerVolume { spawn \"dankc\" \"ctl\" \"volume\" \"down\"; }\n"
+           "    XF86AudioMute        { spawn \"dankc\" \"ctl\" \"volume\" \"mute\"; }\n"
+           "    XF86AudioMicMute     { spawn \"dankc\" \"ctl\" \"mic\" \"mute\"; }\n"
+           "    XF86MonBrightnessUp   { spawn \"dankc\" \"ctl\" \"brightness\" \"up\"; }\n"
+           "    XF86MonBrightnessDown { spawn \"dankc\" \"ctl\" \"brightness\" \"down\"; }\n"
+           "    XF86AudioPlay        { spawn \"dankc\" \"ctl\" \"media\" \"play-pause\"; }\n"
+           "    XF86AudioNext        { spawn \"dankc\" \"ctl\" \"media\" \"next\"; }\n"
+           "    XF86AudioPrev        { spawn \"dankc\" \"ctl\" \"media\" \"prev\"; }\n"
+           "    Mod+Shift+D          { spawn \"dankc\" \"ctl\" \"dnd\" \"toggle\"; }\n"
+           "    Mod+Shift+T          { spawn \"dankc\" \"ctl\" \"theme\" \"dark\"; }\n"
+           "                         // also: \"theme\" \"light\" | \"auto\", \"theme\" \"dynamic\" \"on\"|\"off\"\n"
+           "                         // \"profile\" \"performance\"|\"balanced\"|\"powersaver\"\n"
+           "                         // \"wallpaper\" \"set\" \"<path>\", \"volume\"/\"brightness\" \"set\" \"<0-100>\"\n"
+           "    Mod+Shift+R          { spawn \"dankc\" \"ctl\" \"record\" \"toggle\"; }\n"
+           "                         // also: \"record\" \"start\"|\"region\"|\"stop\"\n"
+           "                         // \"night\" \"on\"|\"off\" (plain \"night\" still toggles)\n");
 }
 
 /* Route a left click: into the control-center popup if it's the target, else to
