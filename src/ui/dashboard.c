@@ -12,6 +12,7 @@
 #include "services/weather.h"
 #include "theme/theme.h"
 #include "ui/bar/bar_tokens.h"
+#include "ui/connected.h"
 #include "ui/material_bg.h"
 #include "ui/popout.h"
 #include "wayland/egl.h"
@@ -416,14 +417,14 @@ static const struct {
     {DC_DASH_SETTINGS, DC_ICON_SETTINGS, "Settings"},
 };
 
-static void draw_tabbar(dc_dashboard *d, float w)
+static void draw_tabbar(dc_dashboard *d, float w, float pad_side, float pad_top)
 {
     NVGcontext *vg = d->render->vg;
     const dc_theme *t = dc_theme_current;
-    const float x0 = DC_DASH_PAD;
-    const float slot_w = (w - 2.0f * DC_DASH_PAD) / 5.0f;
-    const float icon_y = DC_DASH_PAD + 26.0f;
-    const float label_y = DC_DASH_PAD + 52.0f;
+    const float x0 = pad_side;
+    const float slot_w = (w - 2.0f * pad_side) / 5.0f;
+    const float icon_y = pad_top + 26.0f;
+    const float label_y = pad_top + 52.0f;
 
     for (int i = 0; i < 5; i++) {
         const float cx = x0 + slot_w * ((float)i + 0.5f);
@@ -449,13 +450,13 @@ static void draw_tabbar(dc_dashboard *d, float w)
             nvgFillColor(vg, tc(t->primary));
             nvgFill(vg);
         }
-        push_hit(d, cx - slot_w / 2.0f, DC_DASH_PAD, cx + slot_w / 2.0f, DC_DASH_TABBAR_H,
+        push_hit(d, cx - slot_w / 2.0f, pad_top, cx + slot_w / 2.0f, DC_DASH_TABBAR_H,
                  HIT_TAB, (int)k_tabs[i].tab);
     }
 
     /* Divider under the tab bar. */
     nvgBeginPath(vg);
-    nvgRect(vg, x0, DC_DASH_TABBAR_H, w - 2.0f * DC_DASH_PAD, 1.0f);
+    nvgRect(vg, x0, DC_DASH_TABBAR_H, w - 2.0f * pad_side, 1.0f);
     nvgFillColor(vg, tc_alpha(t->outline, 40));
     nvgFill(vg);
 }
@@ -864,10 +865,10 @@ static void draw_media_card(dc_dashboard *d, float x, float y, float w, float h)
     draw_transport(d, cx, y + h - 30.0f, m.playing, 18.0f, 6.0f);
 }
 
-static void draw_overview(dc_dashboard *d, float w)
+static void draw_overview(dc_dashboard *d, float w, float pad_side)
 {
-    const float cx0 = DC_DASH_PAD + DC_DASH_MARGIN;
-    const float cw = w - 2.0f * (DC_DASH_PAD + DC_DASH_MARGIN);
+    const float cx0 = pad_side + DC_DASH_MARGIN;
+    const float cw = w - 2.0f * (pad_side + DC_DASH_MARGIN);
     const float cy0 = DC_DASH_TABBAR_H + 10.0f;
     const float sm = 8.0f;
 
@@ -882,12 +883,12 @@ static void draw_overview(dc_dashboard *d, float w)
 
 /* --- Media tab ------------------------------------------------------------ */
 
-static void draw_media_tab(dc_dashboard *d, float w, float h)
+static void draw_media_tab(dc_dashboard *d, float w, float h, float pad_side)
 {
     NVGcontext *vg = d->render->vg;
     const dc_theme *t = dc_theme_current;
-    const float cx0 = DC_DASH_PAD + DC_DASH_MARGIN;
-    const float cw = w - 2.0f * (DC_DASH_PAD + DC_DASH_MARGIN);
+    const float cx0 = pad_side + DC_DASH_MARGIN;
+    const float cw = w - 2.0f * (pad_side + DC_DASH_MARGIN);
     const float cy0 = DC_DASH_TABBAR_H + 12.0f;
     const float ch = h - cy0 - DC_DASH_MARGIN;
     draw_card(vg, cx0, cy0, cw, ch, tc(t->surface_container_high));
@@ -1097,14 +1098,14 @@ static void draw_hour_card(dc_dashboard *d, float x, float y, float w, float h, 
     nvgText(vg, x + w / 2.0f, y + h - 16.0f, temp, NULL);
 }
 
-static void draw_weather_tab(dc_dashboard *d, float w, float h)
+static void draw_weather_tab(dc_dashboard *d, float w, float h, float pad_side)
 {
     NVGcontext *vg = d->render->vg;
     const dc_theme *t = dc_theme_current;
     const dc_config *cfg = dc_config_current;
     const char *unit = cfg->weather_fahrenheit ? "F" : "C";
-    const float cx0 = DC_DASH_PAD + DC_DASH_MARGIN;
-    const float cw = w - 2.0f * (DC_DASH_PAD + DC_DASH_MARGIN);
+    const float cx0 = pad_side + DC_DASH_MARGIN;
+    const float cw = w - 2.0f * (pad_side + DC_DASH_MARGIN);
     const float cy0 = DC_DASH_TABBAR_H + 12.0f;
 
     dc_weather_state ws;
@@ -1385,13 +1386,13 @@ static void wall_set_active(dc_dashboard *d, const dc_wall_entry *e)
     dc_info("wallpaper set: %s%s", e->path, getenv("DANKC_WALL_DRY") ? " (dry)" : "");
 }
 
-static void draw_wallpapers_tab(dc_dashboard *d, float w, float h)
+static void draw_wallpapers_tab(dc_dashboard *d, float w, float h, float pad_side)
 {
     NVGcontext *vg = d->render->vg;
     const dc_theme *t = dc_theme_current;
     const dc_config *cfg = dc_config_current;
-    const float cx0 = DC_DASH_PAD + DC_DASH_MARGIN;
-    const float cw = w - 2.0f * (DC_DASH_PAD + DC_DASH_MARGIN);
+    const float cx0 = pad_side + DC_DASH_MARGIN;
+    const float cw = w - 2.0f * (pad_side + DC_DASH_MARGIN);
     const float list_y0 = DC_DASH_TABBAR_H + 12.0f;
     const float footer_h = 26.0f;
     const float list_h = h - list_y0 - DC_DASH_MARGIN - footer_h;
@@ -1556,10 +1557,14 @@ static void dash_render(dc_dashboard *d)
         wp_viewport_set_destination(d->viewport, d->logical_width, d->logical_height);
 
     NVGcontext *vg = d->render->vg;
-    const dc_theme *t = dc_theme_current;
     const float w = d->logical_width;
     const float h = d->logical_height;
-    const float pad = DC_DASH_PAD;
+
+    int pad_near, pad_side, pad_far;
+    dc_popout_chrome_pads(dc_config_current, &pad_near, &pad_side, &pad_far);
+    const bool bottom_bar = dc_config_current->bar_position == DC_BAR_POSITION_BOTTOM;
+    const float pad_top = bottom_bar ? (float)pad_far : (float)pad_near;
+    const float pad_bottom = bottom_bar ? (float)pad_near : (float)pad_far;
 
     d->hit_count = 0;
 
@@ -1574,44 +1579,33 @@ static void dash_render(dc_dashboard *d)
         p = 1.0f - (p > 1.0f ? 1.0f : p);
     float alpha = p > 1.0f ? 1.0f : p;
     float scale = 0.96f + 0.04f * p;
-    float ox = pad + (w - 2.0f * pad) * d->anim_ox;
-    float oy = pad + (h - 2.0f * pad) * d->anim_oy;
+    float ox = (float)pad_side + (w - 2.0f * (float)pad_side) * d->anim_ox;
+    float oy = pad_top + (h - pad_top - pad_bottom) * d->anim_oy;
     nvgGlobalAlpha(vg, alpha);
     nvgTranslate(vg, ox, oy);
     nvgScale(vg, scale, scale);
     nvgTranslate(vg, -ox, -oy);
 
-    /* Drop shadow. */
-    NVGpaint shadow = nvgBoxGradient(vg, pad, pad + 2.0f, w - 2 * pad, h - 2 * pad, 12.0f, 22.0f,
-                                     nvgRGBA(0, 0, 0, 100), nvgRGBA(0, 0, 0, 0));
-    nvgBeginPath(vg);
-    nvgRect(vg, 0, 0, w, h);
-    nvgRoundedRect(vg, pad, pad, w - 2 * pad, h - 2 * pad, 12.0f);
-    nvgPathWinding(vg, NVG_HOLE);
-    nvgFillPaint(vg, shadow);
-    nvgFill(vg);
+    /* Shadow + card fill (material bg when enabled, else flat
+     * surfaceContainer) + outline: floating chrome byte-identical to before
+     * when connected_frame is off, stitched into the bar when on
+     * (docs/27-CONNECTED-FRAME-PLAN.md, ui/connected.c). */
+    dc_connected_card_chrome(vg, d->render, w, h, bottom_bar);
 
-    /* Card: blurred+dimmed wallpaper ("material" bg) when enabled, else the
-     * flat surfaceContainer fill (docs/POLISH.md P2, ui/material_bg.c). */
-    dc_material_bg_fill_card(vg, d->render, pad, pad, w - 2 * pad, h - 2 * pad, 12.0f);
-    nvgStrokeColor(vg, tc_alpha(t->outline, 40));
-    nvgStrokeWidth(vg, 1.0f);
-    nvgStroke(vg);
-
-    draw_tabbar(d, w);
+    draw_tabbar(d, w, (float)pad_side, pad_top);
 
     switch (d->tab) {
     case DC_DASH_OVERVIEW:
-        draw_overview(d, w);
+        draw_overview(d, w, (float)pad_side);
         break;
     case DC_DASH_MEDIA:
-        draw_media_tab(d, w, h);
+        draw_media_tab(d, w, h, (float)pad_side);
         break;
     case DC_DASH_WEATHER:
-        draw_weather_tab(d, w, h);
+        draw_weather_tab(d, w, h, (float)pad_side);
         break;
     case DC_DASH_WALLPAPERS:
-        draw_wallpapers_tab(d, w, h);
+        draw_wallpapers_tab(d, w, h, (float)pad_side);
         break;
     case DC_DASH_SETTINGS:
         break; /* action tab: never a rendered page */
@@ -1642,12 +1636,28 @@ static const struct wp_fractional_scale_v1_listener fractional_scale_listener = 
     .preferred_scale = fractional_scale_handle_preferred,
 };
 
+/* Requested popout width: DC_DASH_WIDTH, widened on each side by however
+ * much dc_popout_chrome_pads()'s side pad grew past the floating-chrome 6px
+ * baseline, so the connected-mode connector fillets get their extra 6px of
+ * room without shrinking the tab content (cx0/cw in draw_overview() et al.
+ * key off the same pad_side, so the content rect stays put -- see
+ * docs/27-CONNECTED-FRAME-PLAN.md T4). No-op (returns DC_DASH_WIDTH) when
+ * connected_frame is off. */
+static int dash_surface_width(void)
+{
+    int pad_near, pad_side, pad_far;
+    dc_popout_chrome_pads(dc_config_current, &pad_near, &pad_side, &pad_far);
+    DC_UNUSED(pad_near);
+    DC_UNUSED(pad_far);
+    return DC_DASH_WIDTH + 2 * (pad_side - 6);
+}
+
 static void layer_surface_handle_configure(void *data, struct zwlr_layer_surface_v1 *surface,
                                             uint32_t serial, uint32_t width, uint32_t height)
 {
     dc_dashboard *d = data;
     zwlr_layer_surface_v1_ack_configure(surface, serial);
-    d->logical_width = width > 0 ? (int)width : DC_DASH_WIDTH;
+    d->logical_width = width > 0 ? (int)width : dash_surface_width();
     d->logical_height = height > 0 ? (int)height : DC_DASH_HEIGHT;
     d->configured = true;
     recompute_physical(d);
@@ -1672,7 +1682,7 @@ dc_dashboard *dc_dashboard_create(dc_wayland *wl, dc_egl *egl, dc_render *render
     d->wl = wl;
     d->egl = egl;
     d->render = render;
-    d->logical_width = DC_DASH_WIDTH;
+    d->logical_width = dash_surface_width();
     d->logical_height = DC_DASH_HEIGHT;
     d->scale120 = DC_SCALE_BASE;
     return d;
@@ -1708,7 +1718,7 @@ static void dash_show(dc_dashboard *d, dc_output *output, dc_dash_tab tab)
     d->anim_ox = pa.origin_x;
     d->anim_oy = pa.origin_y;
     zwlr_layer_surface_v1_set_anchor(d->layer_surface, pa.anchor);
-    zwlr_layer_surface_v1_set_size(d->layer_surface, DC_DASH_WIDTH, DC_DASH_HEIGHT);
+    zwlr_layer_surface_v1_set_size(d->layer_surface, dash_surface_width(), DC_DASH_HEIGHT);
     zwlr_layer_surface_v1_set_margin(d->layer_surface, pa.margin_top, pa.margin_right,
                                      pa.margin_bottom, pa.margin_left);
     zwlr_layer_surface_v1_set_exclusive_zone(d->layer_surface, -1);
