@@ -19,6 +19,8 @@ struct zwlr_data_control_manager_v1;
 struct ext_session_lock_manager_v1;
 struct wp_cursor_shape_manager_v1;
 struct wp_cursor_shape_device_v1;
+struct zwp_keyboard_shortcuts_inhibit_manager_v1;
+struct zwp_keyboard_shortcuts_inhibitor_v1;
 struct xkb_context;
 struct xkb_keymap;
 struct xkb_state;
@@ -84,6 +86,12 @@ typedef struct dc_wayland {
     struct zwlr_data_control_manager_v1 *data_control_manager;
     struct ext_session_lock_manager_v1 *session_lock_manager;
     struct wp_cursor_shape_manager_v1 *cursor_shape_manager;
+    /* Keybind-editing capture (docs/23-KEYBIND-EDITING-PLAN.md sec.3): nullable
+     * optional, like cursor_shape_manager -- if the compositor lacks it,
+     * dc_wayland_shortcuts_inhibit() just returns false and capture degrades
+     * to relying on layer-shell keyboard focus alone. */
+    struct zwp_keyboard_shortcuts_inhibit_manager_v1 *shortcuts_inhibit_manager;
+    struct zwp_keyboard_shortcuts_inhibitor_v1 *shortcuts_inhibitor; /* at most one active */
     struct wl_seat *seat;
 
     /* Pointer state. */
@@ -122,6 +130,13 @@ typedef struct dc_wayland {
     struct xkb_state *xkb_state;
     dc_key_cb key_cb;
     void *key_data;
+    /* Raw xkb keycode of the most recent key press, recorded in
+     * keyboard_handle_key() before the key callback runs (docs/23-KEYBIND-
+     * EDITING-PLAN.md sec.3). 0 (an invalid xkb keycode -- xkb keycodes start
+     * at 8) doubles as "no key pressed yet" sentinel. Lets a capture flow read
+     * dc_wayland_base_keysym() to get the LEVEL-0 keysym for the key, so
+     * e.g. Shift+2 records base "2" rather than the shifted "at". */
+    uint32_t last_keycode;
 
     /* Key-repeat state (docs/22-NOTEPAD-PLAN.md sec.2.6): the currently-held
      * repeatable key, if any, and a timerfd the event loop drives to
@@ -184,5 +199,33 @@ void dc_wayland_repeat_fire(dc_wayland *wl);
 /* Modifier state helpers (for the notepad editor's Ctrl/Shift shortcuts). */
 bool dc_wayland_ctrl_down(dc_wayland *wl);
 bool dc_wayland_shift_down(dc_wayland *wl);
+
+/* Modifier state helpers for keybind chord capture (docs/23-KEYBIND-EDITING-
+ * PLAN.md sec.3): Super ("Mod" in niri chord syntax) and Alt. Clones of
+ * dc_wayland_ctrl_down/dc_wayland_shift_down. */
+bool dc_wayland_super_down(dc_wayland *wl);
+bool dc_wayland_alt_down(dc_wayland *wl);
+
+/* The LEVEL-0 (unshifted, base-layout-group) keysym of the most recently
+ * pressed key (see dc_wayland.last_keycode), independent of which modifiers
+ * are currently held. Used by keybind chord capture so a chord like
+ * Shift+2 records base keysym "2" rather than the shifted "at" (docs/23-
+ * KEYBIND-EDITING-PLAN.md sec.3). Returns 0 if no key has been pressed yet or
+ * the keymap has no level-0 symbol for the keycode. */
+uint32_t dc_wayland_base_keysym(dc_wayland *wl);
+
+/* Keyboard-shortcuts-inhibit (docs/23-KEYBIND-EDITING-PLAN.md sec.3): niri
+ * runs its own compositor keybinds before forwarding key events to layer-
+ * shell clients, so a settings surface capturing a chord needs to ask the
+ * compositor to route ALL key events to it instead, via
+ * zwp_keyboard_shortcuts_inhibit_manager_v1 -- plain keyboard focus is not
+ * enough. Both are no-ops (return false / do nothing) if the compositor
+ * doesn't expose the protocol; callers must tolerate that and keep working
+ * (some shortcuts may still be swallowed by the compositor during capture,
+ * but capture itself does not fail to build or run). At most one inhibitor
+ * is tracked at a time; a second dc_wayland_shortcuts_inhibit() call implicitly
+ * uninhibits the previous one first. */
+bool dc_wayland_shortcuts_inhibit(dc_wayland *wl, struct wl_surface *surface);
+void dc_wayland_shortcuts_uninhibit(dc_wayland *wl);
 
 #endif /* DC_WAYLAND_WL_H */
