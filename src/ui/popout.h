@@ -46,8 +46,27 @@ typedef struct {
  * START/END align) and opens with an ~8px visual gap above the bar's
  * rounded rect (bar at bottom) or below it (bar at top) — see
  * dc_bar_window_height(), which already accounts for the bar's own
- * outer-edge spacing gap. */
+ * outer-edge spacing gap.
+ *
+ * When cfg->connected_frame is on, the gap collapses to a 1px seam overlap
+ * instead (docs/27-CONNECTED-FRAME-PLAN.md G1) and `side_margin` is clamped
+ * upward so the connector fillets a converted panel draws (ui/connected.c)
+ * land directly under the bar's own rounded corner. When it's off, behavior
+ * is byte-identical to before this option existed. */
 dc_popout_anchor dc_popout_bar_adjacent(const struct dc_config *cfg, dc_popout_align align,
                                         int32_t side_margin);
+
+/* Card-fill padding a bar-adjacent popout should reserve on its near side
+ * (the bar-facing edge), its two lateral sides, and its far side, instead of
+ * every panel hardcoding a flat 6px on all four (the assumption baked into
+ * today's floating chrome). Any output pointer may be NULL.
+ *
+ * connected_frame off: near=side=far=6 (today's floating chrome, unchanged).
+ * connected_frame on: near=0 (card fill is flush with the bar, no shadow
+ * room needed there), side=12 (room for the connector fillets), far=6
+ * (unchanged). Pass these to dc_connected_card_chrome() call sites (T3+)
+ * instead of a hardcoded `pad = 6.0f`. */
+void dc_popout_chrome_pads(const struct dc_config *cfg, int *pad_near, int *pad_side,
+                           int *pad_far);
 
 #endif /* DC_UI_POPOUT_H */
