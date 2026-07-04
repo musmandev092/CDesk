@@ -13,8 +13,8 @@
 #include "services/net.h"
 #include "theme/theme.h"
 #include "ui/bar/bar_tokens.h"
+#include "ui/connected.h"
 #include "ui/hover.h"
-#include "ui/material_bg.h"
 #include "ui/popout.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
@@ -50,6 +50,20 @@
 /* Inset from the screen's right edge when bar-adjacent (docs/13-POPOUTS-SPEC.md
  * sec.0/1: opens near the bar's right cluster, a few px in from the edge). */
 #define DC_CC_SIDE_MARGIN 12
+
+/* Logical surface width. DC_CC_WIDTH already bakes in the floating chrome's
+ * flat 6px pad on every side; connected_frame widens the lateral (side) pad
+ * to 12 for the connector fillets (dc_popout_chrome_pads()), so the surface
+ * needs 2*(pad_side-6) more logical px to keep the card CONTENT rect --
+ * inset by pad_side + margin, see cc_get_layout() -- exactly where it sits
+ * when floating (docs/27-CONNECTED-FRAME-PLAN.md T3 pad=6 layout-math risk).
+ * connected_frame off: pad_side==6, so this is just DC_CC_WIDTH, unchanged. */
+static int cc_surface_width(void)
+{
+    int pad_side = 6;
+    dc_popout_chrome_pads(dc_config_current, NULL, &pad_side, NULL);
+    return DC_CC_WIDTH + 2 * (pad_side - 6);
+}
 
 /* Max visible rows in the network/bluetooth expand panel -- defined ahead of
  * cc_hover_id below so the enum can size CC_HOVER_EXPAND_ROW_BASE's reserved
@@ -354,13 +368,24 @@ static cc_layout cc_get_layout(float w, bool media_active, int expand_kind, int 
                                int pw_after_row, dc_bluez_agent_kind bt_agent_kind,
                                const bool *net_row_saved, const bool *bt_row_paired)
 {
-    const float pad = 6.0f;   /* room for the drop shadow */
+    /* Card-fill padding (docs/27-CONNECTED-FRAME-PLAN.md T3): floating chrome
+     * reserves a flat 6px of shadow room on all four sides; connected chrome
+     * widens the lateral (side) pad to 12 for the connector fillets and
+     * drops the bar-facing (near) pad to 0, leaving the far pad at 6 -- see
+     * dc_popout_chrome_pads(). Which physical edge is "near" vs "far" swaps
+     * with bar_position, so top/bottom here are resolved from that. */
+    int pad_near, pad_side, pad_far;
+    dc_popout_chrome_pads(dc_config_current, &pad_near, &pad_side, &pad_far);
+    const bool bottom_bar = dc_config_current->bar_position == DC_BAR_POSITION_BOTTOM;
+    const float pad_top = bottom_bar ? (float)pad_far : (float)pad_near;
+    const float pad_bottom = bottom_bar ? (float)pad_near : (float)pad_far;
+    const float pad_side_f = (float)pad_side;
     const float margin = 16.0f; /* content inset from the card edge (~Theme.spacingL) */
     const float gap = 8.0f;     /* ~Theme.spacingS, used between every stacked row */
 
     cc_layout l;
     memset(&l, 0, sizeof(l));
-    l.ix = pad + margin;
+    l.ix = pad_side_f + margin;
     l.iw = w - 2.0f * l.ix;
 
     if (net_row_saved)
@@ -373,7 +398,7 @@ static cc_layout cc_get_layout(float w, bool media_active, int expand_kind, int 
     l.bt_remove_cx = l.ix + l.iw - l.bt_action_r - 4.0f;
     l.bt_trust_cx = l.bt_remove_cx - 2.0f * l.bt_action_r - 6.0f;
 
-    l.header_y = pad + margin;
+    l.header_y = pad_top + margin;
     l.header_h = 70.0f;
     l.avatar_r = 30.0f;
     l.avatar_cx = l.ix + 16.0f + l.avatar_r;
@@ -496,9 +521,9 @@ static cc_layout cc_get_layout(float w, bool media_active, int expand_kind, int 
         }
 
         l.expand_h = 22.0f + (float)rows * l.expand_row_h + l.pw_panel_h + bt_agent_panel_h + 6.0f;
-        l.total_h = l.expand_y0 + l.expand_h + margin + pad;
+        l.total_h = l.expand_y0 + l.expand_h + margin + pad_bottom;
     } else {
-        l.total_h = tiles_end + margin + pad;
+        l.total_h = tiles_end + margin + pad_bottom;
     }
 
     return l;
@@ -1688,7 +1713,7 @@ static void cc_render(dc_control_center *cc)
     if (desired_h != cc->logical_height && cc->layer_surface) {
         cc->logical_height = desired_h;
         recompute_physical(cc);
-        zwlr_layer_surface_v1_set_size(cc->layer_surface, (uint32_t)DC_CC_WIDTH,
+        zwlr_layer_surface_v1_set_size(cc->layer_surface, (uint32_t)cc->logical_width,
                                        (uint32_t)desired_h);
         /* Applies the pending set_size (double-buffered, like every other
          * layer-shell request) without waiting for the compositor's
@@ -1718,7 +1743,12 @@ static void cc_render(dc_control_center *cc)
     const dc_theme *t = dc_theme_current;
     const float w = cc->logical_width;
     const float h = cc->logical_height;
-    const float pad = 6.0f; /* room for the drop shadow */
+    const bool bottom_bar = dc_config_current->bar_position == DC_BAR_POSITION_BOTTOM;
+    int pad_near, pad_side, pad_far;
+    dc_popout_chrome_pads(dc_config_current, &pad_near, &pad_side, &pad_far);
+    const float pad_top = bottom_bar ? (float)pad_far : (float)pad_near;
+    const float pad_bottom = bottom_bar ? (float)pad_near : (float)pad_far;
+    const float pad_side_f = (float)pad_side;
 
     glViewport(0, 0, cc->phys_width, cc->phys_height);
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f); /* transparent -> rounded card over wallpaper */
@@ -1728,38 +1758,28 @@ static void cc_render(dc_control_center *cc)
 
     /* Entrance/exit: fade + scale from the bar-facing edge (docs/13-POPOUTS-
      * SPEC.md sec.0) — pivot set by dc_popout_bar_adjacent() in cc_show().
-     * Closing runs the progress in reverse. */
+     * Closing runs the progress in reverse. Pivot uses the same per-side
+     * pads as the card content rect below (byte-identical to the old flat
+     * pad=6 pivot when connected_frame is off) so the near edge stays glued
+     * through the scale in both modes. */
     float p = dc_anim_progress(&cc->anim);
     if (cc->closing)
         p = 1.0f - (p > 1.0f ? 1.0f : p);
     float alpha = p > 1.0f ? 1.0f : p;
     float scale = 0.94f + 0.06f * p;
-    float ox = pad + (w - 2.0f * pad) * cc->anim_ox;
-    float oy = pad + (h - 2.0f * pad) * cc->anim_oy;
+    float ox = pad_side_f + (w - 2.0f * pad_side_f) * cc->anim_ox;
+    float oy = pad_top + (h - pad_top - pad_bottom) * cc->anim_oy;
     nvgGlobalAlpha(vg, alpha);
     nvgTranslate(vg, ox, oy);
     nvgScale(vg, scale, scale);
     nvgTranslate(vg, -ox, -oy);
 
-    /* Soft drop shadow. */
-    NVGpaint shadow = nvgBoxGradient(vg, pad, pad + 2.0f, w - 2 * pad, h - 2 * pad, 12.0f, 18.0f,
-                                     nvgRGBA(0, 0, 0, 90), nvgRGBA(0, 0, 0, 0));
-    nvgBeginPath(vg);
-    nvgRect(vg, 0, 0, w, h);
-    nvgRoundedRect(vg, pad, pad, w - 2 * pad, h - 2 * pad, 12.0f);
-    nvgPathWinding(vg, NVG_HOLE);
-    nvgFillPaint(vg, shadow);
-    nvgFill(vg);
-
-    /* Card: blurred+dimmed wallpaper ("material" bg) when enabled, else the
-     * flat surfaceContainer fill (docs/POLISH.md P2, ui/material_bg.c). No
-     * separate "Control Center" title -- the reference screenshot goes
-     * straight from the card edge into the user header card
-     * (docs/13-POPOUTS-SPEC.md sec.1). */
-    dc_material_bg_fill_card(vg, cc->render, pad, pad, w - 2 * pad, h - 2 * pad, 12.0f);
-    nvgStrokeColor(vg, nvgRGBA(t->outline.r, t->outline.g, t->outline.b, 40));
-    nvgStrokeWidth(vg, 1.0f);
-    nvgStroke(vg);
+    /* Card chrome: shadow + fill + outline, floating (flat pad 6, rounded
+     * corners) or stitched into the bar (square near corners, connector
+     * fillets, scissored shadow, 3-side outline) depending on
+     * connected_frame -- see ui/connected.h. Byte-identical to the old
+     * inline floating-chrome block when the toggle is off. */
+    dc_connected_card_chrome(vg, cc->render, w, h, bottom_bar);
 
     /* --- User header card (HeaderPane.qml) --------------------------- */
     nvgBeginPath(vg);
@@ -2129,7 +2149,7 @@ static void layer_surface_handle_configure(void *data, struct zwlr_layer_surface
 {
     dc_control_center *cc = data;
     zwlr_layer_surface_v1_ack_configure(surface, serial);
-    cc->logical_width = width > 0 ? (int)width : DC_CC_WIDTH;
+    cc->logical_width = width > 0 ? (int)width : cc_surface_width();
     cc->logical_height = height > 0 ? (int)height : DC_CC_HEIGHT;
     cc->configured = true;
     recompute_physical(cc);
@@ -2154,7 +2174,7 @@ dc_control_center *dc_control_center_create(dc_wayland *wl, dc_egl *egl, dc_rend
     cc->wl = wl;
     cc->egl = egl;
     cc->render = render;
-    cc->logical_width = DC_CC_WIDTH;
+    cc->logical_width = cc_surface_width();
     cc->logical_height = DC_CC_HEIGHT;
     cc->scale120 = DC_SCALE_BASE;
     return cc;
@@ -2188,7 +2208,8 @@ static void cc_show(dc_control_center *cc, dc_output *output)
     cc->anim_ox = pa.origin_x;
     cc->anim_oy = pa.origin_y;
     zwlr_layer_surface_v1_set_anchor(cc->layer_surface, pa.anchor);
-    zwlr_layer_surface_v1_set_size(cc->layer_surface, DC_CC_WIDTH, DC_CC_HEIGHT);
+    cc->logical_width = cc_surface_width();
+    zwlr_layer_surface_v1_set_size(cc->layer_surface, (uint32_t)cc->logical_width, DC_CC_HEIGHT);
     zwlr_layer_surface_v1_set_margin(cc->layer_surface, pa.margin_top, pa.margin_right,
                                      pa.margin_bottom, pa.margin_left);
     zwlr_layer_surface_v1_set_exclusive_zone(cc->layer_surface, -1);
