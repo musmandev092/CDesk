@@ -157,6 +157,31 @@ static dc_config config = {
     .systheme_discord = false,
     .systheme_spicetify = false,
     .systheme_gtk2 = true,
+
+    /* docs/24-BATTERY-POWER-PLAN.md: 100 == no charge limit configured;
+     * notifications on by default; low/critical thresholds match common DE
+     * defaults (20%/10%); auto power-saver/profile-switch off until the user
+     * opts in; profileOnAC/Battery default to balanced-on-AC,
+     * power-saver-on-battery (only consulted once autoProfileSwitch is on). */
+    .charge_limit = 100,
+    .battery_notifications = true,
+    .low_battery_threshold = 20,
+    .critical_battery_threshold = 10,
+    .auto_power_saver = false,
+    .auto_profile_switch = false,
+    .profile_on_ac = 1,
+    .profile_on_battery = 0,
+
+    /* Idle timeouts (stretch T7): all disabled until the user opts in. */
+    .idle_timeouts_enabled = false,
+    .idle_lock_ac_min = 0,
+    .idle_lock_batt_min = 0,
+    .idle_monitor_off_ac_min = 0,
+    .idle_monitor_off_batt_min = 0,
+    .idle_suspend_ac_min = 0,
+    .idle_suspend_batt_min = 0,
+    .idle_hibernate_ac_min = 0,
+    .idle_hibernate_batt_min = 0,
 };
 
 const dc_config *dc_config_current = &config;
@@ -609,6 +634,25 @@ void dc_config_load(void)
     get_bool(root, "systemThemeDiscord", &config.systheme_discord);
     get_bool(root, "systemThemeSpicetify", &config.systheme_spicetify);
     get_bool(root, "systemThemeGtk2", &config.systheme_gtk2);
+
+    get_int(root, "chargeLimit", &config.charge_limit, 50, 100);
+    get_bool(root, "batteryNotifications", &config.battery_notifications);
+    get_int(root, "lowBatteryThreshold", &config.low_battery_threshold, 5, 50);
+    get_int(root, "criticalBatteryThreshold", &config.critical_battery_threshold, 2, 25);
+    get_bool(root, "autoPowerSaver", &config.auto_power_saver);
+    get_bool(root, "autoProfileSwitch", &config.auto_profile_switch);
+    get_int(root, "profileOnAC", &config.profile_on_ac, 0, 2);
+    get_int(root, "profileOnBattery", &config.profile_on_battery, 0, 2);
+
+    get_bool(root, "idleTimeoutsEnabled", &config.idle_timeouts_enabled);
+    get_int(root, "idleLockAcMin", &config.idle_lock_ac_min, 0, 240);
+    get_int(root, "idleLockBatteryMin", &config.idle_lock_batt_min, 0, 240);
+    get_int(root, "idleMonitorOffAcMin", &config.idle_monitor_off_ac_min, 0, 240);
+    get_int(root, "idleMonitorOffBatteryMin", &config.idle_monitor_off_batt_min, 0, 240);
+    get_int(root, "idleSuspendAcMin", &config.idle_suspend_ac_min, 0, 240);
+    get_int(root, "idleSuspendBatteryMin", &config.idle_suspend_batt_min, 0, 240);
+    get_int(root, "idleHibernateAcMin", &config.idle_hibernate_ac_min, 0, 240);
+    get_int(root, "idleHibernateBatteryMin", &config.idle_hibernate_batt_min, 0, 240);
     cJSON_Delete(root);
 
     apply_theme();
@@ -794,6 +838,25 @@ void dc_config_save(void)
     cJSON_AddBoolToObject(root, "systemThemeDiscord", config.systheme_discord);
     cJSON_AddBoolToObject(root, "systemThemeSpicetify", config.systheme_spicetify);
     cJSON_AddBoolToObject(root, "systemThemeGtk2", config.systheme_gtk2);
+
+    cJSON_AddNumberToObject(root, "chargeLimit", config.charge_limit);
+    cJSON_AddBoolToObject(root, "batteryNotifications", config.battery_notifications);
+    cJSON_AddNumberToObject(root, "lowBatteryThreshold", config.low_battery_threshold);
+    cJSON_AddNumberToObject(root, "criticalBatteryThreshold", config.critical_battery_threshold);
+    cJSON_AddBoolToObject(root, "autoPowerSaver", config.auto_power_saver);
+    cJSON_AddBoolToObject(root, "autoProfileSwitch", config.auto_profile_switch);
+    cJSON_AddNumberToObject(root, "profileOnAC", config.profile_on_ac);
+    cJSON_AddNumberToObject(root, "profileOnBattery", config.profile_on_battery);
+
+    cJSON_AddBoolToObject(root, "idleTimeoutsEnabled", config.idle_timeouts_enabled);
+    cJSON_AddNumberToObject(root, "idleLockAcMin", config.idle_lock_ac_min);
+    cJSON_AddNumberToObject(root, "idleLockBatteryMin", config.idle_lock_batt_min);
+    cJSON_AddNumberToObject(root, "idleMonitorOffAcMin", config.idle_monitor_off_ac_min);
+    cJSON_AddNumberToObject(root, "idleMonitorOffBatteryMin", config.idle_monitor_off_batt_min);
+    cJSON_AddNumberToObject(root, "idleSuspendAcMin", config.idle_suspend_ac_min);
+    cJSON_AddNumberToObject(root, "idleSuspendBatteryMin", config.idle_suspend_batt_min);
+    cJSON_AddNumberToObject(root, "idleHibernateAcMin", config.idle_hibernate_ac_min);
+    cJSON_AddNumberToObject(root, "idleHibernateBatteryMin", config.idle_hibernate_batt_min);
 
     char *text = cJSON_Print(root);
     cJSON_Delete(root);
