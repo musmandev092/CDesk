@@ -96,6 +96,18 @@ typedef struct dc_config {
     char wallpaper_light[DC_CONFIG_PATH_MAX];
     char wallpaper_dark[DC_CONFIG_PATH_MAX];
 
+    /* Wallpaper cycling (docs/29-SMALL-FEATURES-PLAN.md sec.3, wallpaper T3):
+     * services/wallpaper.c's dc_wallpaper_cycle_tick()/_next() advance
+     * through a directory of images on a timer. Config keys
+     * "wallpaperCycleEnabled"/"wallpaperCycleDir"/"wallpaperCycleIntervalSec".
+     * wallpaper_cycle_dir empty means "resolve like the Wallpapers tab does"
+     * (dashboard.c's wall_pick_dir() logic, mirrored in wallpaper.c so this
+     * header doesn't need to depend on ui/dashboard.h). interval_sec is
+     * 0..86400; 0 means cycling is effectively off even if enabled is true. */
+    bool wallpaper_cycle_enabled;
+    char wallpaper_cycle_dir[DC_CONFIG_PATH_MAX];
+    int wallpaper_cycle_interval_sec;
+
     dc_bar_position bar_position;         /* top or bottom edge */
     int bar_spacing;                      /* gap between the bar rect and the outer edge/screen sides */
     int bar_inner_padding;                /* drives the pill/bar-thickness formulas (docs/12-BAR-SPEC.md) */

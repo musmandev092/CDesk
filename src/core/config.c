@@ -48,6 +48,12 @@ static dc_config config = {
     .nightlight_temp = 4000,
     .nightlight_schedule_mode = 0,
 
+    /* Wallpaper cycling (services/wallpaper.c): off by default (0 interval
+     * also disables it independent of the enabled flag, belt-and-suspenders
+     * with dc_wallpaper_cycle_tick()'s own interval > 0 check). */
+    .wallpaper_cycle_enabled = false,
+    .wallpaper_cycle_interval_sec = 0,
+
     /* User's live DMS layout (docs/12-BAR-SPEC.md sec.0). */
     .bar_left_widgets = {"launcherButton", "workspaceSwitcher", "focusedWindow"},
     .bar_left_widgets_n = 3,
@@ -656,6 +662,9 @@ void dc_config_load(void)
     get_string(root, "wallpaper", config.wallpaper, sizeof(config.wallpaper));
     get_string(root, "wallpaperLight", config.wallpaper_light, sizeof(config.wallpaper_light));
     get_string(root, "wallpaperDark", config.wallpaper_dark, sizeof(config.wallpaper_dark));
+    get_bool(root, "wallpaperCycleEnabled", &config.wallpaper_cycle_enabled);
+    get_string(root, "wallpaperCycleDir", config.wallpaper_cycle_dir, sizeof(config.wallpaper_cycle_dir));
+    get_int(root, "wallpaperCycleIntervalSec", &config.wallpaper_cycle_interval_sec, 0, 86400);
 
     get_bar_position(root, "barPosition", &config.bar_position);
     get_int(root, "barSpacing", &config.bar_spacing, 0, 64);
@@ -873,6 +882,10 @@ void dc_config_save(void)
         cJSON_AddStringToObject(root, "wallpaperLight", config.wallpaper_light);
     if (config.wallpaper_dark[0])
         cJSON_AddStringToObject(root, "wallpaperDark", config.wallpaper_dark);
+    cJSON_AddBoolToObject(root, "wallpaperCycleEnabled", config.wallpaper_cycle_enabled);
+    if (config.wallpaper_cycle_dir[0])
+        cJSON_AddStringToObject(root, "wallpaperCycleDir", config.wallpaper_cycle_dir);
+    cJSON_AddNumberToObject(root, "wallpaperCycleIntervalSec", config.wallpaper_cycle_interval_sec);
 
     cJSON_AddStringToObject(root, "barPosition",
                             config.bar_position == DC_BAR_POSITION_BOTTOM ? "bottom" : "top");
