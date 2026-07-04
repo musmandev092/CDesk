@@ -122,7 +122,7 @@ $(TP_OBJ): %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -rf bin protocol/generated $(OBJ) $(CXX_OBJ) $(TP_OBJ) $(PROTO_O) $(DEPS) bin/test_calc bin/test_text_edit bin/test_systheme
+	rm -rf bin protocol/generated $(OBJ) $(CXX_OBJ) $(TP_OBJ) $(PROTO_O) $(DEPS) bin/test_calc bin/test_text_edit bin/test_systheme bin/test_keybinds
 
 DEPS := $(OBJ:.o=.d) $(CXX_OBJ:.o=.d)
 -include $(DEPS)
@@ -183,6 +183,34 @@ bin/test_systheme: tests/test_systheme.c tests/test_systheme_stubs.c src/service
 test-systheme: bin/test_systheme
 	./bin/test_systheme
 
+# Standalone unit test for the keybind-editing backend service
+# (src/services/keybinds.c, docs/23-KEYBIND-EDITING-PLAN.md KB-T1): the
+# generalized include-following KDL bind parser (with per-file source
+# tracking + verbatim action bodies), chord normalization/conflict
+# detection/capture, and the managed-fragment persist+include+backup+
+# validate+rollback pipeline. Unlike test_systheme/test_text_edit,
+# keybinds.c only references core/log.c + libc + libxkbcommon (no EGL/
+# nanovg/theme surface), so this links the real translation unit directly
+# with no link-only stub file needed. Every filesystem-touching test uses a
+# scratch config_dir_override (mkdtemp'd under /tmp) -- never the real
+# ~/.config/niri -- and the rollback test shells out to the real `niri
+# validate` (self-skips if `niri` isn't on $PATH). -flto=auto matches the
+# real OPT_FLAGS profile (see test_systheme's rule above) and avoids a
+# spurious -Wformat-truncation on the "%s/config.kdl"-style snprintf calls
+# that only appears without the fuller inlining context LTO provides -- the
+# real `make`/meson builds of dankc (both -flto=auto) never emit it.
+bin/test_keybinds: tests/test_keybinds.c src/services/keybinds.c src/services/keybinds.h \
+	src/core/log.c
+	@mkdir -p bin
+	$(CC) -std=c11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Isrc \
+		$(WARNINGS) -O2 -g -flto=auto \
+		$(shell $(PKG_CONFIG) --cflags xkbcommon) \
+		-o $@ tests/test_keybinds.c src/services/keybinds.c src/core/log.c \
+		$(shell $(PKG_CONFIG) --libs xkbcommon) -lm
+
+test-keybinds: bin/test_keybinds
+	./bin/test_keybinds
+
 # Shipped/packaged build: -O2 -flto -DNDEBUG, no -g (see OPT_FLAGS above).
 # Object files from a dev build aren't LTO/flag-compatible, so always start
 # from clean.
@@ -190,4 +218,4 @@ release:
 	$(MAKE) clean
 	$(MAKE) RELEASE=1 all
 
-.PHONY: all clean test-calc test-text-edit test-systheme release
+.PHONY: all clean test-calc test-text-edit test-systheme test-keybinds release
