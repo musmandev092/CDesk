@@ -23,6 +23,7 @@
 #include "services/systheme.h"
 #include "services/timedate.h"
 #include "services/updates.h"
+#include "services/wallpaper.h"
 #include "services/weather.h"
 #include "theme/theme.h"
 #include "ui/connected.h"
@@ -275,7 +276,9 @@ struct dc_settings {
 
     int focus_field; /* 0 none, 1 latitude, 2 longitude, 3 weather location,
                       * 4 wallpaper path, 5 dock pinned-app id (add), 15 audio
-                      * device rename (see audio_rename_target below) */
+                      * device rename (see audio_rename_target below), 18 light-
+                      * mode wallpaper path, 19 dark-mode wallpaper path, 20
+                      * wallpaper cycle folder */
     char edit_buf[256];
 
     bool test_clicks_done; /* DANKC_SETTINGS_CLICK consumed (see s_show) */
@@ -1214,6 +1217,60 @@ static void tab_personalization(uictx *c)
         c->cfg->material_blur = !c->cfg->material_blur;
         c->changed = true;
         c->bars = true;
+    }
+
+    /* Per-mode wallpaper override (services/wallpaper.h's dc_wallpaper_
+     * effective(): wallpaper_light/dark win over the base `wallpaper` above
+     * when set and matching the current light/dark mode). Blank means "use
+     * the base wallpaper regardless of mode". */
+    bool wpl_focus = c->s->focus_field == 18;
+    char wplbuf[256];
+    if (wpl_focus)
+        snprintf(wplbuf, sizeof(wplbuf), "%s", c->s->edit_buf);
+    else
+        copy_trunc(wplbuf, sizeof(wplbuf), c->cfg->wallpaper_light);
+    if (ui_textfield(c, "Light mode wallpaper (optional)", wplbuf, wpl_focus)) {
+        c->s->focus_field = 18;
+        copy_trunc(c->s->edit_buf, sizeof(c->s->edit_buf), c->cfg->wallpaper_light);
+    }
+    bool wpd_focus = c->s->focus_field == 19;
+    char wpdbuf[256];
+    if (wpd_focus)
+        snprintf(wpdbuf, sizeof(wpdbuf), "%s", c->s->edit_buf);
+    else
+        copy_trunc(wpdbuf, sizeof(wpdbuf), c->cfg->wallpaper_dark);
+    if (ui_textfield(c, "Dark mode wallpaper (optional)", wpdbuf, wpd_focus)) {
+        c->s->focus_field = 19;
+        copy_trunc(c->s->edit_buf, sizeof(c->s->edit_buf), c->cfg->wallpaper_dark);
+    }
+    ui_hint(c, "Leave either blank to use the wallpaper above in that mode");
+
+    /* Wallpaper cycling (services/wallpaper.c, docs/29-SMALL-FEATURES-PLAN.md
+     * sec.3): rotate through a directory of images on a timer via
+     * dc_wallpaper_cycle_tick()/_next(), driven from main.c's 1 Hz clock. */
+    ui_section(c, "WALLPAPER CYCLING");
+    if (ui_toggle(c, "Cycle wallpapers", "Rotate through a folder of images on a timer",
+                  c->cfg->wallpaper_cycle_enabled)) {
+        c->cfg->wallpaper_cycle_enabled = !c->cfg->wallpaper_cycle_enabled;
+        c->changed = true;
+    }
+    bool wpc_focus = c->s->focus_field == 20;
+    char wpcbuf[256];
+    if (wpc_focus)
+        snprintf(wpcbuf, sizeof(wpcbuf), "%s", c->s->edit_buf);
+    else
+        copy_trunc(wpcbuf, sizeof(wpcbuf), c->cfg->wallpaper_cycle_dir);
+    if (ui_textfield(c, "Cycle folder (optional)", wpcbuf, wpc_focus)) {
+        c->s->focus_field = 20;
+        copy_trunc(c->s->edit_buf, sizeof(c->s->edit_buf), c->cfg->wallpaper_cycle_dir);
+    }
+    ui_hint(c, "Blank resolves like the Dashboard's Wallpapers tab does");
+    int cyc_min = c->cfg->wallpaper_cycle_interval_sec / 60;
+    if (cyc_min < 1)
+        cyc_min = 1;
+    if (ui_stepper(c, "Cycle interval (minutes)", &cyc_min, 1, 1440, 1)) {
+        c->cfg->wallpaper_cycle_interval_sec = cyc_min * 60;
+        c->changed = true;
     }
 
     ui_section(c, "SCREEN FRAME");
@@ -5081,6 +5138,22 @@ static void commit_edit(dc_settings *s)
               * (update_terminal_cmd) -- empty clears the override back to
               * dc_updates_run_upgrade()'s auto-probe. */
         copy_trunc(cfg->update_terminal_cmd, sizeof(cfg->update_terminal_cmd), s->edit_buf);
+        break;
+    case 18: /* Personalization tab's light-mode wallpaper override
+              * (wallpaper_light) -- re-derive + repaint immediately since it
+              * may be the mode currently in effect. */
+        copy_trunc(cfg->wallpaper_light, sizeof(cfg->wallpaper_light), s->edit_buf);
+        dc_wallpaper_apply_effective();
+        break;
+    case 19: /* Personalization tab's dark-mode wallpaper override
+              * (wallpaper_dark) */
+        copy_trunc(cfg->wallpaper_dark, sizeof(cfg->wallpaper_dark), s->edit_buf);
+        dc_wallpaper_apply_effective();
+        break;
+    case 20: /* Personalization tab's wallpaper-cycling folder override
+              * (wallpaper_cycle_dir) -- only consulted by the next
+              * dc_wallpaper_cycle_next() tick, nothing to repaint now. */
+        copy_trunc(cfg->wallpaper_cycle_dir, sizeof(cfg->wallpaper_cycle_dir), s->edit_buf);
         break;
     default:
         break;
