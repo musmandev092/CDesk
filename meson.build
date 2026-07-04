@@ -141,6 +141,7 @@ src = files(
   'src/services/systheme_qtkde.c',
   'src/services/systheme_editors.c',
   'src/services/systheme_browser.c',
+  'src/services/systheme_misc.c',
   'src/niri/niri.c',
   'src/theme/theme.c',
   'src/ipc/control.c',
