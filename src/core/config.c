@@ -62,6 +62,10 @@ static dc_config config = {
     .notif_timeout_normal_sec = 5,
     .notif_timeout_critical_sec = 0,
     .dnd_enabled = false,
+    .dnd_until_epoch = 0,
+    .dnd_until_hour = 8,
+    .notif_privacy_mode = false,
+    .notif_rules_n = 0,
 
     /* docs/14-COMPLETION-PLAN.md W1.3: matches DMS SettingsData.soundsEnabled/
      * soundNewNotification defaults (both on). */
@@ -216,6 +220,23 @@ static void get_int(const cJSON *root, const char *key, int *out, int lo, int hi
     }
 }
 
+/* Like get_int() but 64-bit, for wall-clock epoch seconds (dnd_until_epoch)
+ * which don't fit get_int()'s int clamp. cJSON stores numbers as a double
+ * internally, which is lossless for epoch-second values well past the
+ * heat-death of any config file. */
+static void get_int64(const cJSON *root, const char *key, int64_t *out, int64_t lo, int64_t hi)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (cJSON_IsNumber(item)) {
+        int64_t v = (int64_t)item->valuedouble;
+        if (v < lo)
+            v = lo;
+        if (v > hi)
+            v = hi;
+        *out = v;
+    }
+}
+
 /* Like get_float() but double-precision, for the weather widget's lat/lon
  * (docs/12-BAR-SPEC.md sec.4 weather). */
 static void get_double(const cJSON *root, const char *key, double *out, double lo, double hi)
@@ -261,6 +282,111 @@ static void add_string_array(cJSON *root, const char *key, char arr[][DC_CONFIG_
     cJSON *a = cJSON_CreateArray();
     for (int i = 0; i < n; i++)
         cJSON_AddItemToArray(a, cJSON_CreateString(arr[i]));
+    cJSON_AddItemToObject(root, key, a);
+}
+
+/* Parse a JSON array of per-app notification rule objects
+ * ({"match":"discord","action":"mute","urgency":"critical"}) into a fixed
+ * dc_notif_rule[] table (docs/26-DND-SCHEDULING-PLAN.md rule-engine
+ * section). Forgiving like get_string_array(): a non-array/absent key leaves
+ * `arr`/`out_n` untouched (defaults survive); a non-object entry or one
+ * missing "match" is skipped; an unrecognized action/urgency string falls
+ * back to its default (mute / keep) rather than erroring. Entries beyond
+ * `cap` are dropped. */
+static void get_rule_array(const cJSON *root, const char *key, dc_notif_rule *arr, int cap,
+                           int *out_n)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!cJSON_IsArray(item))
+        return;
+
+    int n = 0;
+    const cJSON *entry;
+    cJSON_ArrayForEach(entry, item)
+    {
+        if (n >= cap)
+            break;
+        if (!cJSON_IsObject(entry))
+            continue;
+        const cJSON *match = cJSON_GetObjectItemCaseSensitive(entry, "match");
+        if (!cJSON_IsString(match) || !match->valuestring || !match->valuestring[0])
+            continue; /* a rule with no match string can never fire; skip it */
+
+        dc_notif_rule r = {0};
+        r.urgency = -1; /* default: keep the notification's own urgency */
+        snprintf(r.match, sizeof(r.match), "%s", match->valuestring);
+
+        const cJSON *action = cJSON_GetObjectItemCaseSensitive(entry, "action");
+        if (cJSON_IsString(action) && action->valuestring) {
+            if (strcmp(action->valuestring, "ignore") == 0)
+                r.action = 1;
+            else if (strcmp(action->valuestring, "popup_only") == 0)
+                r.action = 2;
+            else if (strcmp(action->valuestring, "no_history") == 0)
+                r.action = 3;
+            /* "mute" or anything unrecognized -> 0 (mute, r.action's zero-init) */
+        }
+
+        const cJSON *urgency = cJSON_GetObjectItemCaseSensitive(entry, "urgency");
+        if (cJSON_IsString(urgency) && urgency->valuestring) {
+            if (strcmp(urgency->valuestring, "low") == 0)
+                r.urgency = 0;
+            else if (strcmp(urgency->valuestring, "normal") == 0)
+                r.urgency = 1;
+            else if (strcmp(urgency->valuestring, "critical") == 0)
+                r.urgency = 2;
+            /* "keep" or anything unrecognized -> -1 (keep, r.urgency's default above) */
+        }
+
+        arr[n] = r;
+        n++;
+    }
+    *out_n = n;
+}
+
+static void add_rule_array(cJSON *root, const char *key, const dc_notif_rule *arr, int n)
+{
+    cJSON *a = cJSON_CreateArray();
+    for (int i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "match", arr[i].match);
+
+        const char *action_str = "mute";
+        switch (arr[i].action) {
+        case 1:
+            action_str = "ignore";
+            break;
+        case 2:
+            action_str = "popup_only";
+            break;
+        case 3:
+            action_str = "no_history";
+            break;
+        default:
+            action_str = "mute";
+            break;
+        }
+        cJSON_AddStringToObject(o, "action", action_str);
+
+        const char *urgency_str = "keep";
+        switch (arr[i].urgency) {
+        case 0:
+            urgency_str = "low";
+            break;
+        case 1:
+            urgency_str = "normal";
+            break;
+        case 2:
+            urgency_str = "critical";
+            break;
+        default:
+            urgency_str = "keep";
+            break;
+        }
+        cJSON_AddStringToObject(o, "urgency", urgency_str);
+
+        cJSON_AddItemToArray(a, o);
+    }
     cJSON_AddItemToObject(root, key, a);
 }
 
@@ -402,6 +528,11 @@ void dc_config_load(void)
     get_int(root, "notifTimeoutNormal", &config.notif_timeout_normal_sec, 0, 120);
     get_int(root, "notifTimeoutCritical", &config.notif_timeout_critical_sec, 0, 120);
     get_bool(root, "dndEnabled", &config.dnd_enabled);
+    get_int64(root, "dndUntilEpoch", &config.dnd_until_epoch, 0, INT64_MAX);
+    get_int(root, "dndUntilHour", &config.dnd_until_hour, 0, 23);
+    get_bool(root, "notifPrivacyMode", &config.notif_privacy_mode);
+    get_rule_array(root, "notifAppRules", config.notif_rules, DC_CONFIG_NOTIF_RULES_MAX,
+                   &config.notif_rules_n);
 
     get_bool(root, "soundsEnabled", &config.sounds_enabled);
     get_bool(root, "soundNewNotification", &config.notif_sound_enabled);
@@ -583,6 +714,10 @@ void dc_config_save(void)
     cJSON_AddNumberToObject(root, "notifTimeoutNormal", config.notif_timeout_normal_sec);
     cJSON_AddNumberToObject(root, "notifTimeoutCritical", config.notif_timeout_critical_sec);
     cJSON_AddBoolToObject(root, "dndEnabled", config.dnd_enabled);
+    cJSON_AddNumberToObject(root, "dndUntilEpoch", (double)config.dnd_until_epoch);
+    cJSON_AddNumberToObject(root, "dndUntilHour", config.dnd_until_hour);
+    cJSON_AddBoolToObject(root, "notifPrivacyMode", config.notif_privacy_mode);
+    add_rule_array(root, "notifAppRules", config.notif_rules, config.notif_rules_n);
 
     cJSON_AddBoolToObject(root, "soundsEnabled", config.sounds_enabled);
     cJSON_AddBoolToObject(root, "soundNewNotification", config.notif_sound_enabled);
