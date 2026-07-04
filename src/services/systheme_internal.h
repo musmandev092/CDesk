@@ -67,6 +67,19 @@ bool dc_systheme_write_owned(const char *path, const char *data, size_t len);
 bool dc_systheme_ensure_line(const char *path, const char *needle, const char *marker_comment,
                              const char *line);
 
+/* Same idempotent-marker/backup/dryrun contract as dc_systheme_ensure_line()
+ * above (idempotency check searches `user_file` for `line` itself, matching
+ * how every real caller of dc_systheme_ensure_line() already passes the same
+ * string as both the needle and the line -- see systheme.c's GTK emitter),
+ * except the marker+line are INSERTED AT THE FILE HEAD instead of appended.
+ * Needed by configs where an include/@import directive must precede the
+ * rest of the file to take effect (e.g. mako, swaync, wofi, helix). If
+ * `user_file` exists, it is backed up once to "<user_file>.bak-<epoch>"
+ * before being rewritten as: `marker` + "\n" + `line` + "\n" + original
+ * contents. If it doesn't exist yet, it's atomically created as just
+ * `marker` + "\n" + `line` + "\n". DRYRUN-gated like dc_systheme_ensure_line(). */
+bool dc_systheme_ensure_line_top(const char *user_file, const char *line, const char *marker);
+
 /* True iff `dir` exists (any type) -- the config-dir half of an app's
  * "installed" check. Never creates `dir`. */
 bool dc_systheme_dir_exists(const char *dir);

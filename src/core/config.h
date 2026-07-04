@@ -215,6 +215,45 @@ typedef struct dc_config {
     bool systheme_vscode;
     bool systheme_kitty;
     bool systheme_foot;
+
+    /* System-wide theming, wave 2 (docs, Task 0 "foundation" of the
+     * comprehensive expansion): toggles for the emitters landing in Tasks
+     * 1-7. Same contract as the wave-1 toggles above -- each is only acted
+     * on when systheme_enabled AND the per-app toggle AND
+     * dc_systheme_app_detected() are all true. Default true (opt into the
+     * feature once, get every detected app) except the Tier-3 "hard
+     * caveat" apps below, which default false because touching them is
+     * either disruptive to a running app (Firefox/Discord need an external
+     * userChrome/Vencord mod to actually read dankc's output) or not
+     * something a fresh install should silently rewrite (Konsole's
+     * colorscheme, ~/.Xresources). */
+    bool systheme_kvantum;
+    bool systheme_kde;
+    bool systheme_ghostty;
+    bool systheme_wezterm;
+    bool systheme_konsole;    /* default false: touches KDE's global colorscheme */
+    bool systheme_xresources; /* default false: touches ~/.Xresources directly */
+    bool systheme_zed;
+    bool systheme_helix;
+    bool systheme_neovim;
+    bool systheme_vim;
+    bool systheme_sublime;
+    bool systheme_emacs;
+    bool systheme_rofi;
+    bool systheme_wofi;
+    bool systheme_fuzzel;
+    bool systheme_tofi;
+    bool systheme_mako;
+    bool systheme_dunst;
+    bool systheme_swaync;
+    bool systheme_btop;
+    bool systheme_cava;
+    bool systheme_zathura;
+    bool systheme_qutebrowser;
+    bool systheme_firefox;   /* default false: needs userChrome.css / a theme mod to take effect */
+    bool systheme_discord;   /* default false: needs Vesktop/Vencord, not stock Discord */
+    bool systheme_spicetify; /* default false: rewrites a Spotify client mod's theme files */
+    bool systheme_gtk2;
 } dc_config;
 
 /* The active config. Read-only for the rest of the app. */
