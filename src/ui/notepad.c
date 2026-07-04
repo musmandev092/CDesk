@@ -9,6 +9,7 @@
 #include "render/shape.h"
 #include "services/notepad_storage.h"
 #include "theme/theme.h"
+#include "ui/connected.h"
 #include "ui/hover.h"
 #include "ui/popout.h"
 #include "ui/text_edit.h"
@@ -41,6 +42,20 @@
 #define DC_NP_RADIUS 14.0f
 #define DC_NP_INSET 16.0f /* left/right content inset inside the card */
 
+/* Logical surface width. DC_NP_WIDTH already bakes in the floating chrome's
+ * flat 6px pad on every side; connected_frame widens the lateral (side) pad
+ * to 12 for the connector fillets (dc_popout_chrome_pads()), so the surface
+ * needs 2*(pad_side-6) more logical px to keep the card CONTENT rect --
+ * inset by pad_side + DC_NP_INSET, see np_get_layout() -- exactly where it
+ * sits when floating (mirrors controlcenter.c's cc_surface_width()).
+ * connected_frame off: pad_side==6, so this is just DC_NP_WIDTH, unchanged. */
+static int np_surface_width(void)
+{
+    int pad_side = 6;
+    dc_popout_chrome_pads(dc_config_current, NULL, &pad_side, NULL);
+    return DC_NP_WIDTH + 2 * (pad_side - 6);
+}
+
 #define DC_NP_HEADER_TOP 14.0f
 #define DC_NP_HEADER_H 28.0f
 #define DC_NP_TABSTRIP_GAP 10.0f
@@ -72,7 +87,7 @@
  * chip-sizing math all agree -- same convention as clip_picker.c's
  * cp_layout. */
 typedef struct {
-    float pad, ix, iw;
+    float pad_side, ix, iw;
     float header_y, header_h;
     float tabstrip_y, tabstrip_h;
     float editor_x, editor_y, editor_w, editor_h; /* outer box, pre inner-pad */
@@ -81,16 +96,29 @@ typedef struct {
 
 static np_layout np_get_layout(float w, float h)
 {
+    /* Card-fill padding (docs/27-CONNECTED-FRAME-PLAN.md T5-equivalent):
+     * floating chrome reserves a flat 6px of shadow room on all four sides;
+     * connected chrome widens the lateral (side) pad to 12 for the
+     * connector fillets and drops the bar-facing (near) pad to 0, leaving
+     * the far pad at 6 -- see dc_popout_chrome_pads(). Which physical edge
+     * is "near" vs "far" swaps with bar_position. */
+    int pad_near, pad_side, pad_far;
+    dc_popout_chrome_pads(dc_config_current, &pad_near, &pad_side, &pad_far);
+    const bool bottom_bar = dc_config_current->bar_position == DC_BAR_POSITION_BOTTOM;
+    const float pad_top = bottom_bar ? (float)pad_far : (float)pad_near;
+    const float pad_bottom = bottom_bar ? (float)pad_near : (float)pad_far;
+    const float pad_side_f = (float)pad_side;
+
     np_layout l;
-    l.pad = DC_NP_PAD;
-    l.ix = l.pad + DC_NP_INSET;
+    l.pad_side = pad_side_f;
+    l.ix = pad_side_f + DC_NP_INSET;
     l.iw = w - 2.0f * l.ix;
-    l.header_y = l.pad + DC_NP_HEADER_TOP;
+    l.header_y = pad_top + DC_NP_HEADER_TOP;
     l.header_h = DC_NP_HEADER_H;
     l.tabstrip_y = l.header_y + l.header_h + DC_NP_TABSTRIP_GAP;
     l.tabstrip_h = DC_NP_TABSTRIP_H;
     l.footer_h = DC_NP_FOOTER_H;
-    l.footer_y = h - l.pad - DC_NP_BOTTOM_PAD - l.footer_h;
+    l.footer_y = h - pad_bottom - DC_NP_BOTTOM_PAD - l.footer_h;
     l.editor_x = l.ix;
     l.editor_y = l.tabstrip_y + l.tabstrip_h + DC_NP_EDITOR_GAP;
     l.editor_w = l.iw;
@@ -403,7 +431,12 @@ static void np_render(dc_notepad *np)
     NVGcontext *vg = np->render->vg;
     const dc_theme *t = dc_theme_current;
     const float w = np->logical_width, h = np->logical_height;
-    const float pad = DC_NP_PAD;
+    const bool bottom_bar = dc_config_current->bar_position == DC_BAR_POSITION_BOTTOM;
+    int pad_near, pad_side, pad_far;
+    dc_popout_chrome_pads(dc_config_current, &pad_near, &pad_side, &pad_far);
+    const float pad_top = bottom_bar ? (float)pad_far : (float)pad_near;
+    const float pad_bottom = bottom_bar ? (float)pad_near : (float)pad_far;
+    const float pad_side_f = (float)pad_side;
 
     glViewport(0, 0, np->phys_width, np->phys_height);
     glClearColor(0, 0, 0, 0);
@@ -415,28 +448,17 @@ static void np_render(dc_notepad *np)
         pr = 1.0f - (pr > 1.0f ? 1.0f : pr);
     float alpha = pr > 1.0f ? 1.0f : pr;
     float scale = 0.94f + 0.06f * pr;
-    float ox = pad + (w - 2.0f * pad) * np->anim_ox;
-    float oy = pad + (h - 2.0f * pad) * np->anim_oy;
+    float ox = pad_side_f + (w - 2.0f * pad_side_f) * np->anim_ox;
+    float oy = pad_top + (h - pad_top - pad_bottom) * np->anim_oy;
     nvgGlobalAlpha(vg, alpha);
     nvgTranslate(vg, ox, oy);
     nvgScale(vg, scale, scale);
     nvgTranslate(vg, -ox, -oy);
 
-    NVGpaint shadow = nvgBoxGradient(vg, pad, pad + 2.0f, w - 2 * pad, h - 2 * pad, DC_NP_RADIUS,
-                                     18.0f, nvgRGBA(0, 0, 0, 100), nvgRGBA(0, 0, 0, 0));
-    nvgBeginPath(vg);
-    nvgRect(vg, 0, 0, w, h);
-    nvgRoundedRect(vg, pad, pad, w - 2 * pad, h - 2 * pad, DC_NP_RADIUS);
-    nvgPathWinding(vg, NVG_HOLE);
-    nvgFillPaint(vg, shadow);
-    nvgFill(vg);
-    nvgBeginPath(vg);
-    nvgRoundedRect(vg, pad, pad, w - 2 * pad, h - 2 * pad, DC_NP_RADIUS);
-    nvgFillColor(vg, tc(t->surface_container));
-    nvgFill(vg);
-    nvgStrokeColor(vg, tc_alpha(t->outline, 40));
-    nvgStrokeWidth(vg, 1.0f);
-    nvgStroke(vg);
+    /* Card chrome: shadow + fill + outline, floating or stitched into the
+     * bar depending on connected_frame -- see ui/connected.h. Byte-identical
+     * to the old inline floating-chrome block when the toggle is off. */
+    dc_connected_card_chrome(vg, np->render, w, h, bottom_bar);
 
     np_layout l = np_get_layout(w, h);
 
@@ -598,7 +620,7 @@ static void layer_surface_handle_configure(void *data, struct zwlr_layer_surface
 {
     dc_notepad *np = data;
     zwlr_layer_surface_v1_ack_configure(surface, serial);
-    np->logical_width = width > 0 ? (int)width : DC_NP_WIDTH;
+    np->logical_width = width > 0 ? (int)width : np_surface_width();
     np->logical_height = height > 0 ? (int)height : DC_NP_HEIGHT;
     np->configured = true;
     recompute_physical(np);
@@ -621,7 +643,7 @@ dc_notepad *dc_notepad_create(dc_wayland *wl, dc_egl *egl, dc_render *render)
     np->wl = wl;
     np->egl = egl;
     np->render = render;
-    np->logical_width = DC_NP_WIDTH;
+    np->logical_width = np_surface_width();
     np->logical_height = DC_NP_HEIGHT;
     np->scale120 = DC_SCALE_BASE;
     dc_text_edit_init(&np->editor);
@@ -661,7 +683,8 @@ static void np_show(dc_notepad *np, dc_output *output)
     np->anim_ox = pa.origin_x;
     np->anim_oy = pa.origin_y;
     zwlr_layer_surface_v1_set_anchor(np->layer_surface, pa.anchor);
-    zwlr_layer_surface_v1_set_size(np->layer_surface, DC_NP_WIDTH, DC_NP_HEIGHT);
+    np->logical_width = np_surface_width();
+    zwlr_layer_surface_v1_set_size(np->layer_surface, (uint32_t)np->logical_width, DC_NP_HEIGHT);
     zwlr_layer_surface_v1_set_margin(np->layer_surface, pa.margin_top, pa.margin_right,
                                      pa.margin_bottom, pa.margin_left);
     zwlr_layer_surface_v1_set_keyboard_interactivity(

@@ -12,7 +12,7 @@
 #include "services/history.h"
 #include "services/icons.h"
 #include "theme/theme.h"
-#include "ui/material_bg.h"
+#include "ui/connected.h"
 #include "ui/popout.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
@@ -39,6 +39,21 @@
 
 #define DC_LAUNCHER_PAD 6.0f    /* shadow room */
 #define DC_LAUNCHER_INSET 18.0f /* inner content margin */
+
+/* Logical surface width. DC_LAUNCHER_WIDTH already bakes in the floating
+ * chrome's flat 6px pad on every side; connected_frame widens the lateral
+ * (side) pad to 12 for the connector fillets (dc_popout_chrome_pads()), so
+ * the surface needs 2*(pad_side-6) more logical px to keep the card CONTENT
+ * rect -- inset by pad_side + (DC_LAUNCHER_INSET-DC_LAUNCHER_PAD), see
+ * launcher_get_layout() -- exactly where it sits when floating (mirrors
+ * controlcenter.c's cc_surface_width()). connected_frame off: pad_side==6,
+ * so this is just DC_LAUNCHER_WIDTH, unchanged. */
+static int launcher_surface_width(void)
+{
+    int pad_side = 6;
+    dc_popout_chrome_pads(dc_config_current, NULL, &pad_side, NULL);
+    return DC_LAUNCHER_WIDTH + 2 * (pad_side - 6);
+}
 
 #define DC_LAUNCHER_SEARCH_Y 20.0f
 #define DC_LAUNCHER_SEARCH_H 46.0f
@@ -186,7 +201,7 @@ struct dc_launcher {
 /* Shared layout so render, click hit-test, and hover motion all agree — same
  * convention as clip_picker.c's cp_layout. */
 typedef struct {
-    float pad, ix, iw;
+    float pad_side, ix, iw;
     float search_y, search_h;
     float header_y, header_h;
     float list_y0, list_y1, list_h;
@@ -195,16 +210,32 @@ typedef struct {
 
 static launcher_layout launcher_get_layout(float w, float h)
 {
+    /* Card-fill padding (docs/27-CONNECTED-FRAME-PLAN.md T5-equivalent):
+     * floating chrome reserves a flat 6px of shadow room on all four sides;
+     * connected chrome widens the lateral (side) pad to 12 for the
+     * connector fillets and drops the bar-facing (near) pad to 0, leaving
+     * the far pad at 6 -- see dc_popout_chrome_pads(). Which physical edge
+     * is "near" vs "far" swaps with bar_position. DC_LAUNCHER_SEARCH_Y/
+     * DC_LAUNCHER_FOOTER_H's old flat-pad math is preserved by subtracting
+     * DC_LAUNCHER_PAD back out so the on-screen gap from the card's own
+     * edge is unchanged. */
+    int pad_near, pad_side, pad_far;
+    dc_popout_chrome_pads(dc_config_current, &pad_near, &pad_side, &pad_far);
+    const bool bottom_bar = dc_config_current->bar_position == DC_BAR_POSITION_BOTTOM;
+    const float pad_top = bottom_bar ? (float)pad_far : (float)pad_near;
+    const float pad_bottom = bottom_bar ? (float)pad_near : (float)pad_far;
+    const float pad_side_f = (float)pad_side;
+
     launcher_layout l;
-    l.pad = DC_LAUNCHER_PAD;
-    l.ix = DC_LAUNCHER_INSET;
+    l.pad_side = pad_side_f;
+    l.ix = pad_side_f + (DC_LAUNCHER_INSET - DC_LAUNCHER_PAD);
     l.iw = w - 2.0f * l.ix;
-    l.search_y = DC_LAUNCHER_SEARCH_Y;
+    l.search_y = pad_top + (DC_LAUNCHER_SEARCH_Y - DC_LAUNCHER_PAD);
     l.search_h = DC_LAUNCHER_SEARCH_H;
     l.header_y = l.search_y + l.search_h + DC_LAUNCHER_HEADER_GAP;
     l.header_h = DC_LAUNCHER_HEADER_H;
     l.footer_h = DC_LAUNCHER_FOOTER_H;
-    l.footer_y = h - l.pad - l.footer_h;
+    l.footer_y = h - pad_bottom - l.footer_h;
     l.list_y0 = l.header_y + l.header_h + DC_LAUNCHER_LIST_GAP;
     l.list_y1 = l.footer_y - DC_LAUNCHER_LIST_GAP;
     l.list_h = l.list_y1 - l.list_y0;
@@ -945,7 +976,12 @@ static void launcher_render(dc_launcher *l)
     const dc_theme *t = dc_theme_current;
     const float w = l->logical_width;
     const float h = l->logical_height;
-    const float pad = DC_LAUNCHER_PAD;
+    const bool bottom_bar = dc_config_current->bar_position == DC_BAR_POSITION_BOTTOM;
+    int pad_near, pad_side, pad_far;
+    dc_popout_chrome_pads(dc_config_current, &pad_near, &pad_side, &pad_far);
+    const float pad_top = bottom_bar ? (float)pad_far : (float)pad_near;
+    const float pad_bottom = bottom_bar ? (float)pad_near : (float)pad_far;
+    const float pad_side_f = (float)pad_side;
 
     glViewport(0, 0, l->phys_width, l->phys_height);
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
@@ -962,29 +998,17 @@ static void launcher_render(dc_launcher *l)
         p = 1.0f - (p > 1.0f ? 1.0f : p);
     float alpha = p > 1.0f ? 1.0f : p;
     float scale = 0.92f + 0.08f * p;
-    float ox = pad + (w - 2.0f * pad) * l->anim_ox;
-    float oy = pad + (h - 2.0f * pad) * l->anim_oy;
+    float ox = pad_side_f + (w - 2.0f * pad_side_f) * l->anim_ox;
+    float oy = pad_top + (h - pad_top - pad_bottom) * l->anim_oy;
     nvgGlobalAlpha(vg, alpha);
     nvgTranslate(vg, ox, oy);
     nvgScale(vg, scale, scale);
     nvgTranslate(vg, -ox, -oy);
 
-    /* Drop shadow + card. */
-    NVGpaint shadow = nvgBoxGradient(vg, pad, pad + 2.0f, w - 2 * pad, h - 2 * pad, 16.0f, 20.0f,
-                                     nvgRGBA(0, 0, 0, 110), nvgRGBA(0, 0, 0, 0));
-    nvgBeginPath(vg);
-    nvgRect(vg, 0, 0, w, h);
-    nvgRoundedRect(vg, pad, pad, w - 2 * pad, h - 2 * pad, 16.0f);
-    nvgPathWinding(vg, NVG_HOLE);
-    nvgFillPaint(vg, shadow);
-    nvgFill(vg);
-
-    /* Card: blurred+dimmed wallpaper ("material" bg) when enabled, else the
-     * flat surfaceContainer fill (docs/POLISH.md P2, ui/material_bg.c). */
-    dc_material_bg_fill_card(vg, l->render, pad, pad, w - 2 * pad, h - 2 * pad, 16.0f);
-    nvgStrokeColor(vg, tc_alpha(t->outline, 40));
-    nvgStrokeWidth(vg, 1.0f);
-    nvgStroke(vg);
+    /* Card chrome: shadow + fill + outline, floating or stitched into the
+     * bar depending on connected_frame -- see ui/connected.h. Byte-identical
+     * to the old inline floating-chrome block when the toggle is off. */
+    dc_connected_card_chrome(vg, l->render, w, h, bottom_bar);
 
     launcher_layout lay = launcher_get_layout(w, h);
 
@@ -1149,7 +1173,7 @@ static void layer_surface_handle_configure(void *data, struct zwlr_layer_surface
 {
     dc_launcher *l = data;
     zwlr_layer_surface_v1_ack_configure(surface, serial);
-    l->logical_width = width > 0 ? (int)width : DC_LAUNCHER_WIDTH;
+    l->logical_width = width > 0 ? (int)width : launcher_surface_width();
     l->logical_height = height > 0 ? (int)height : DC_LAUNCHER_HEIGHT;
     l->configured = true;
     recompute_physical(l);
@@ -1176,7 +1200,7 @@ dc_launcher *dc_launcher_create(dc_wayland *wl, dc_egl *egl, dc_render *render)
     l->render = render;
     l->apps = dc_apps_load();
     l->hist = dc_history_load();
-    l->logical_width = DC_LAUNCHER_WIDTH;
+    l->logical_width = launcher_surface_width();
     l->logical_height = DC_LAUNCHER_HEIGHT;
     l->scale120 = DC_SCALE_BASE;
     l->view_mode = DC_LAUNCHER_VIEW_LIST;
@@ -1226,7 +1250,9 @@ static void launcher_show(dc_launcher *l, dc_output *output)
     l->anim_ox = pa.origin_x;
     l->anim_oy = pa.origin_y;
     zwlr_layer_surface_v1_set_anchor(l->layer_surface, pa.anchor);
-    zwlr_layer_surface_v1_set_size(l->layer_surface, DC_LAUNCHER_WIDTH, DC_LAUNCHER_HEIGHT);
+    l->logical_width = launcher_surface_width();
+    zwlr_layer_surface_v1_set_size(l->layer_surface, (uint32_t)l->logical_width,
+                                   DC_LAUNCHER_HEIGHT);
     zwlr_layer_surface_v1_set_margin(l->layer_surface, pa.margin_top, pa.margin_right,
                                      pa.margin_bottom, pa.margin_left);
     zwlr_layer_surface_v1_set_keyboard_interactivity(
