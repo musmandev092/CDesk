@@ -149,6 +149,7 @@ src = files(
   'src/ipc/control.c',
   'src/services/greetd.c',
   'src/services/wallpaper.c',
+  'src/services/greeter_data.c',
 )
 
 # The single C++ translation unit (Material colour math).
