@@ -726,6 +726,8 @@ static void handle_left_click(struct wl_surface *surface, double x, double y, st
                 dc_notifications_mark_read(ctx->notifications);
         } else if (region == DC_BAR_REGION_CLIPBOARD) {
             dc_clip_picker_toggle(ctx->clip_picker, dc_bar_output(bar));
+        } else if (region == DC_BAR_REGION_NOTEPAD) {
+            dc_notepad_toggle(ctx->notepad, dc_bar_output(bar));
         } else if (region == DC_BAR_REGION_CONTROL_CENTER) {
             dc_control_center_toggle(cc, dc_bar_output(bar));
         } else if (region == DC_BAR_REGION_BATTERY) {
