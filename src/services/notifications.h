@@ -182,4 +182,12 @@ void dc_notifications_mark_read(dc_notifications *n);
  * a user's live DMS already does). Gated by the caller on $DANKC_NC_DEMO. */
 void dc_notifications_seed_demo(dc_notifications *n);
 
+/* Post a notification from internal dankc code (battery automation, etc.)
+ * without going through D-Bus. Drives the same toast/sound/notification-
+ * center effects a real Notify() arrival would, including the Do Not Disturb
+ * gate, off the same id counter as D-Bus-originated notifications. Returns
+ * the assigned id (0 if `n` is NULL). */
+uint32_t dc_notifications_post_local(dc_notifications *n, const char *app, const char *summary,
+                                     const char *body, dc_urgency urgency);
+
 #endif /* DC_SERVICES_NOTIFICATIONS_H */
