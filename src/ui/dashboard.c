@@ -8,6 +8,7 @@
 #include "render/nvg.h"
 #include "services/mpris.h"
 #include "services/sysmon.h"
+#include "services/wallpaper.h"
 #include "services/weather.h"
 #include "theme/theme.h"
 #include "ui/bar/bar_tokens.h"
@@ -1362,58 +1363,6 @@ static void wall_decode(dc_dashboard *d, dc_wall_entry *e)
     stbi_image_free(src);
 }
 
-/* Best-effort $PATH lookup (no shell): true if `name` is executable. */
-static bool cmd_exists(const char *name)
-{
-    const char *path = getenv("PATH");
-    if (!path)
-        return false;
-    while (*path) {
-        const char *colon = strchr(path, ':');
-        size_t len = colon ? (size_t)(colon - path) : strlen(path);
-        if (len > 0 && len < 400) {
-            char buf[512];
-            snprintf(buf, sizeof(buf), "%.*s/%.100s", (int)len, path, name);
-            if (access(buf, X_OK) == 0)
-                return true;
-        }
-        path += len;
-        if (*path == ':')
-            path++;
-    }
-    return false;
-}
-
-/* dankc doesn't draw a wallpaper layer of its own (the dynamic-color engine
- * only samples the image file), so apply the wallpaper to the compositor the
- * standard niri way: (re)spawn swaybg when it's installed. No-op otherwise —
- * the config + palette still update. */
-static void wall_apply_compositor(const char *path)
-{
-    if (!cmd_exists("swaybg")) {
-        dc_info("wallpaper: swaybg not installed; config/palette updated only");
-        return;
-    }
-    pid_t pid = fork();
-    if (pid == 0) {
-        setsid();
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-        }
-        /* Replace pattern: retire the previous instance, then take over. */
-        pid_t k = fork();
-        if (k == 0) {
-            execlp("pkill", "pkill", "-x", "swaybg", (char *)NULL);
-            _exit(127);
-        }
-        usleep(100 * 1000); /* let the old instance exit */
-        execlp("swaybg", "swaybg", "-m", "fill", "-i", path, (char *)NULL);
-        _exit(127);
-    }
-}
-
 /* Click on a thumbnail: persist config `wallpaper`, re-derive the palette when
  * dynamicColor is on (dc_config_reapply -> apply_theme -> dc_dynamic_from_
  * image), repaint live surfaces, and set the compositor wallpaper.
@@ -1430,7 +1379,7 @@ static void wall_set_active(dc_dashboard *d, const dc_wall_entry *e)
     dc_material_bg_invalidate(); /* new wallpaper -> panels' blurred bg regenerates lazily */
     if (!getenv("DANKC_WALL_DRY")) {
         dc_config_save();
-        wall_apply_compositor(e->path);
+        dc_wallpaper_apply(e->path);
     }
     dc_config_notify_changed(); /* bars pick up the (possibly) new palette */
     dc_info("wallpaper set: %s%s", e->path, getenv("DANKC_WALL_DRY") ? " (dry)" : "");
