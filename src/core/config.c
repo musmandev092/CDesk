@@ -182,6 +182,12 @@ static dc_config config = {
     .idle_suspend_batt_min = 0,
     .idle_hibernate_ac_min = 0,
     .idle_hibernate_batt_min = 0,
+
+    /* docs/25-AUDIO-PERDEVICE-PLAN.md sec.3: no per-device overrides until
+     * the user sets one via settings.c/controlcenter.c (T4/T5). */
+    .audio_max_volumes_n = 0,
+    .audio_aliases_n = 0,
+    .audio_hidden_n = 0,
 };
 
 const dc_config *dc_config_current = &config;
@@ -413,6 +419,120 @@ static void add_rule_array(cJSON *root, const char *key, const dc_notif_rule *ar
         cJSON_AddItemToArray(a, o);
     }
     cJSON_AddItemToObject(root, key, a);
+}
+
+/* WIDE variant of get_string_array()/add_string_array(): same forgiving
+ * semantics (non-array/absent key leaves arr/out_n untouched; non-string
+ * entries skipped; entries beyond cap dropped), but sized for
+ * DC_CONFIG_AUDIO_NAME_MAX (pipewire node.name runs longer than the 32-char
+ * widget-id width the original helper is hardwired to). Used for
+ * "audioHiddenDevices" (docs/25-AUDIO-PERDEVICE-PLAN.md sec.3, T2). */
+static void get_string_array_wide(const cJSON *root, const char *key,
+                                  char arr[][DC_CONFIG_AUDIO_NAME_MAX], int cap, int *out_n)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!cJSON_IsArray(item))
+        return;
+
+    int n = 0;
+    const cJSON *entry;
+    cJSON_ArrayForEach(entry, item)
+    {
+        if (n >= cap)
+            break;
+        if (!cJSON_IsString(entry) || !entry->valuestring)
+            continue;
+        snprintf(arr[n], DC_CONFIG_AUDIO_NAME_MAX, "%s", entry->valuestring);
+        n++;
+    }
+    *out_n = n;
+}
+
+static void add_string_array_wide(cJSON *root, const char *key,
+                                  char arr[][DC_CONFIG_AUDIO_NAME_MAX], int n)
+{
+    cJSON *a = cJSON_CreateArray();
+    for (int i = 0; i < n; i++)
+        cJSON_AddItemToArray(a, cJSON_CreateString(arr[i]));
+    cJSON_AddItemToObject(root, key, a);
+}
+
+/* Parse a JSON object ({"node.name": 150, ...}) into a fixed name/percent
+ * table ("audioDeviceMaxVolumes", docs/25-AUDIO-PERDEVICE-PLAN.md sec.3,
+ * T2). Forgiving like get_string_array(): absent/non-object key leaves
+ * arr/out_n untouched; a non-number value or an empty key name is skipped;
+ * entries beyond cap are dropped. Values are clamped to 100-200 (100 is the
+ * "no override" default, so a value of 100 is kept as an explicit entry
+ * only because the caller asked for it -- dc_config_audio_set_max() is the
+ * one that actually collapses 100 back to "no entry"). */
+static void get_audio_max_map(const cJSON *root, const char *key, dc_audio_max_entry *arr, int cap,
+                              int *out_n)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!cJSON_IsObject(item))
+        return;
+
+    int n = 0;
+    const cJSON *entry;
+    cJSON_ArrayForEach(entry, item)
+    {
+        if (n >= cap)
+            break;
+        if (!cJSON_IsNumber(entry) || !entry->string || !entry->string[0])
+            continue;
+        int v = (int)entry->valuedouble;
+        if (v < 100)
+            v = 100;
+        if (v > 200)
+            v = 200;
+        snprintf(arr[n].name, DC_CONFIG_AUDIO_NAME_MAX, "%s", entry->string);
+        arr[n].max_percent = v;
+        n++;
+    }
+    *out_n = n;
+}
+
+static void add_audio_max_map(cJSON *root, const char *key, const dc_audio_max_entry *arr, int n)
+{
+    cJSON *o = cJSON_CreateObject();
+    for (int i = 0; i < n; i++)
+        cJSON_AddNumberToObject(o, arr[i].name, arr[i].max_percent);
+    cJSON_AddItemToObject(root, key, o);
+}
+
+/* Parse a JSON object ({"node.name": "Alias"}) into a fixed name/alias table
+ * ("audioDeviceAliases", docs/25-AUDIO-PERDEVICE-PLAN.md sec.3, T2). Same
+ * forgiving semantics as get_audio_max_map(): a non-string value or empty
+ * key name is skipped. */
+static void get_audio_alias_map(const cJSON *root, const char *key, dc_audio_alias_entry *arr,
+                                int cap, int *out_n)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!cJSON_IsObject(item))
+        return;
+
+    int n = 0;
+    const cJSON *entry;
+    cJSON_ArrayForEach(entry, item)
+    {
+        if (n >= cap)
+            break;
+        if (!cJSON_IsString(entry) || !entry->valuestring || !entry->string || !entry->string[0])
+            continue;
+        snprintf(arr[n].name, DC_CONFIG_AUDIO_NAME_MAX, "%s", entry->string);
+        snprintf(arr[n].alias, DC_CONFIG_AUDIO_ALIAS_MAX, "%s", entry->valuestring);
+        n++;
+    }
+    *out_n = n;
+}
+
+static void add_audio_alias_map(cJSON *root, const char *key, const dc_audio_alias_entry *arr,
+                                int n)
+{
+    cJSON *o = cJSON_CreateObject();
+    for (int i = 0; i < n; i++)
+        cJSON_AddStringToObject(o, arr[i].name, arr[i].alias);
+    cJSON_AddItemToObject(root, key, o);
 }
 
 static void get_bar_position(const cJSON *root, const char *key, dc_bar_position *out)
@@ -653,6 +773,13 @@ void dc_config_load(void)
     get_int(root, "idleSuspendBatteryMin", &config.idle_suspend_batt_min, 0, 240);
     get_int(root, "idleHibernateAcMin", &config.idle_hibernate_ac_min, 0, 240);
     get_int(root, "idleHibernateBatteryMin", &config.idle_hibernate_batt_min, 0, 240);
+
+    get_audio_max_map(root, "audioDeviceMaxVolumes", config.audio_max_volumes,
+                      DC_CONFIG_AUDIO_DEVICES_MAX, &config.audio_max_volumes_n);
+    get_audio_alias_map(root, "audioDeviceAliases", config.audio_aliases,
+                        DC_CONFIG_AUDIO_DEVICES_MAX, &config.audio_aliases_n);
+    get_string_array_wide(root, "audioHiddenDevices", config.audio_hidden,
+                          DC_CONFIG_AUDIO_DEVICES_MAX, &config.audio_hidden_n);
     cJSON_Delete(root);
 
     apply_theme();
@@ -858,6 +985,11 @@ void dc_config_save(void)
     cJSON_AddNumberToObject(root, "idleHibernateAcMin", config.idle_hibernate_ac_min);
     cJSON_AddNumberToObject(root, "idleHibernateBatteryMin", config.idle_hibernate_batt_min);
 
+    add_audio_max_map(root, "audioDeviceMaxVolumes", config.audio_max_volumes,
+                      config.audio_max_volumes_n);
+    add_audio_alias_map(root, "audioDeviceAliases", config.audio_aliases, config.audio_aliases_n);
+    add_string_array_wide(root, "audioHiddenDevices", config.audio_hidden, config.audio_hidden_n);
+
     char *text = cJSON_Print(root);
     cJSON_Delete(root);
     if (!text)
@@ -873,4 +1005,140 @@ void dc_config_save(void)
         dc_warn("could not write %s", path);
     }
     free(text);
+}
+
+/* --- Audio per-device config accessors/setters ---------------------------
+ * docs/25-AUDIO-PERDEVICE-PLAN.md sec.3 (Config surface), T2. Keyed by
+ * pipewire node.name (D2 in the plan doc: ids are session-local, node.name
+ * is the only stable key). T3 (audio.c) is the first consumer -- these are
+ * unused elsewhere for now. */
+
+int dc_config_audio_max(const char *name)
+{
+    if (!name || !name[0])
+        return 100;
+    for (int i = 0; i < config.audio_max_volumes_n; i++) {
+        if (strcmp(config.audio_max_volumes[i].name, name) == 0)
+            return config.audio_max_volumes[i].max_percent;
+    }
+    return 100;
+}
+
+const char *dc_config_audio_alias(const char *name)
+{
+    if (!name || !name[0])
+        return NULL;
+    for (int i = 0; i < config.audio_aliases_n; i++) {
+        if (strcmp(config.audio_aliases[i].name, name) == 0)
+            return config.audio_aliases[i].alias;
+    }
+    return NULL;
+}
+
+bool dc_config_audio_hidden(const char *name)
+{
+    if (!name || !name[0])
+        return false;
+    for (int i = 0; i < config.audio_hidden_n; i++) {
+        if (strcmp(config.audio_hidden[i], name) == 0)
+            return true;
+    }
+    return false;
+}
+
+void dc_config_audio_set_max(const char *name, int max_percent)
+{
+    if (!name || !name[0])
+        return;
+
+    for (int i = 0; i < config.audio_max_volumes_n; i++) {
+        if (strcmp(config.audio_max_volumes[i].name, name) != 0)
+            continue;
+        if (max_percent <= 100) {
+            /* Reset to default: drop the entry (shift the rest down) so
+             * config.json doesn't accumulate no-op overrides. */
+            for (int j = i; j < config.audio_max_volumes_n - 1; j++)
+                config.audio_max_volumes[j] = config.audio_max_volumes[j + 1];
+            config.audio_max_volumes_n--;
+        } else {
+            config.audio_max_volumes[i].max_percent = max_percent > 200 ? 200 : max_percent;
+        }
+        return;
+    }
+
+    if (max_percent <= 100)
+        return; /* already at the implicit default; nothing to add */
+
+    if (config.audio_max_volumes_n >= DC_CONFIG_AUDIO_DEVICES_MAX) {
+        /* Cap reached: evict the oldest entry to make room. */
+        for (int j = 0; j < config.audio_max_volumes_n - 1; j++)
+            config.audio_max_volumes[j] = config.audio_max_volumes[j + 1];
+        config.audio_max_volumes_n--;
+    }
+    dc_audio_max_entry *e = &config.audio_max_volumes[config.audio_max_volumes_n];
+    snprintf(e->name, DC_CONFIG_AUDIO_NAME_MAX, "%s", name);
+    e->max_percent = max_percent > 200 ? 200 : max_percent;
+    config.audio_max_volumes_n++;
+}
+
+void dc_config_audio_set_alias(const char *name, const char *alias)
+{
+    if (!name || !name[0])
+        return;
+
+    for (int i = 0; i < config.audio_aliases_n; i++) {
+        if (strcmp(config.audio_aliases[i].name, name) != 0)
+            continue;
+        if (!alias || !alias[0]) {
+            for (int j = i; j < config.audio_aliases_n - 1; j++)
+                config.audio_aliases[j] = config.audio_aliases[j + 1];
+            config.audio_aliases_n--;
+        } else {
+            snprintf(config.audio_aliases[i].alias, DC_CONFIG_AUDIO_ALIAS_MAX, "%s", alias);
+        }
+        return;
+    }
+
+    if (!alias || !alias[0])
+        return; /* already unaliased; nothing to add */
+
+    if (config.audio_aliases_n >= DC_CONFIG_AUDIO_DEVICES_MAX) {
+        for (int j = 0; j < config.audio_aliases_n - 1; j++)
+            config.audio_aliases[j] = config.audio_aliases[j + 1];
+        config.audio_aliases_n--;
+    }
+    dc_audio_alias_entry *e = &config.audio_aliases[config.audio_aliases_n];
+    snprintf(e->name, DC_CONFIG_AUDIO_NAME_MAX, "%s", name);
+    snprintf(e->alias, DC_CONFIG_AUDIO_ALIAS_MAX, "%s", alias);
+    config.audio_aliases_n++;
+}
+
+void dc_config_audio_set_hidden(const char *name, bool hidden)
+{
+    if (!name || !name[0])
+        return;
+
+    for (int i = 0; i < config.audio_hidden_n; i++) {
+        if (strcmp(config.audio_hidden[i], name) != 0)
+            continue;
+        if (!hidden) {
+            for (int j = i; j < config.audio_hidden_n - 1; j++)
+                snprintf(config.audio_hidden[j], DC_CONFIG_AUDIO_NAME_MAX, "%s",
+                         config.audio_hidden[j + 1]);
+            config.audio_hidden_n--;
+        }
+        return;
+    }
+
+    if (!hidden)
+        return; /* already visible; nothing to add */
+
+    if (config.audio_hidden_n >= DC_CONFIG_AUDIO_DEVICES_MAX) {
+        for (int j = 0; j < config.audio_hidden_n - 1; j++)
+            snprintf(config.audio_hidden[j], DC_CONFIG_AUDIO_NAME_MAX, "%s",
+                     config.audio_hidden[j + 1]);
+        config.audio_hidden_n--;
+    }
+    snprintf(config.audio_hidden[config.audio_hidden_n], DC_CONFIG_AUDIO_NAME_MAX, "%s", name);
+    config.audio_hidden_n++;
 }
