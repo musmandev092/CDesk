@@ -1,0 +1,165 @@
+#!/bin/bash
+# dankc-greeter — greetd-facing launcher for the dankc login UI.
+#
+# docs/28-GREETER-PLAN.md T5. This is what /etc/greetd/config.toml's
+# `[default_session] command` points at (see packaging/greetd/config.toml.example).
+# It runs as the unprivileged `greeter` system user, with no seat session and
+# (usually) no HOME/XDG dirs of its own, so this script:
+#
+#   1. fakes a writable HOME + XDG_*_HOME under a cache directory dankc's
+#      config/state code (dc_config_load, services/greeter_data.c) can
+#      actually read/write instead of failing on an unwritable/missing $HOME;
+#   2. generates a minimal, throwaway niri config that starts niri
+#      cleanly (no hotkey overlay, no hot corners, black background so a
+#      crash before the first frame doesn't flash the previous VT's
+#      contents) and spawns `dankc greeter`, then quits niri the moment
+#      the greeter process exits — success or failure, greetd is the one
+#      that decides what happens next (respawn this script, or start the
+#      authenticated session);
+#   3. execs niri, replacing this script's process image (greetd tracks
+#      the exec'd niri as the session leader it waits on).
+#
+# niri is the only supported compositor (see docs/28-GREETER-PLAN.md
+# "Ground truth" — dankc itself is niri-only; DMS's dms-greeter reference
+# supports 7 compositors, dankc intentionally does not).
+#
+# This script is NOT meant to be run by hand as a regular user for anything
+# other than a --dry-run config-generation smoke test (see --dry-run below);
+# running it normally reassigns $HOME and is meant to be invoked by greetd
+# as the `greeter` system user. See docs/GREETER.md before touching any real
+# greetd config.
+
+set -euo pipefail
+
+CACHE_DIR="/var/cache/dankc-greeter"
+COMPOSITOR="niri"
+DRY_RUN=0
+
+show_help() {
+    cat <<EOF
+dankc-greeter — greetd launcher for the dankc login UI (niri-only)
+
+Usage: dankc-greeter [OPTIONS]
+
+Options:
+    --cache-dir PATH   Fake HOME/XDG + greeter state directory
+                        (default: /var/cache/dankc-greeter)
+    -C, --compositor NAME
+                        Compositor to launch (only "niri" is supported;
+                        accepted for forward-compat / explicitness in
+                        config.toml, default: niri)
+    --dry-run           Generate the temp niri config, print its path, and
+                        exit 0 without exec'ing niri. Does not touch
+                        \$CACHE_DIR or any real HOME/XDG state. For local
+                        testing only — never used by greetd itself.
+    -h, --help          Show this help message
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cache-dir)
+            CACHE_DIR="$2"
+            shift 2
+            ;;
+        -C|--compositor)
+            COMPOSITOR="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo "dankc-greeter: unknown option: $1" >&2
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+if [[ "$COMPOSITOR" != "niri" ]]; then
+    echo "dankc-greeter: unsupported compositor '$COMPOSITOR' (dankc is niri-only)" >&2
+    exit 1
+fi
+
+if ! command -v niri >/dev/null 2>&1; then
+    echo "dankc-greeter: 'niri' was not found in PATH" >&2
+    exit 1
+fi
+
+TEMP_CONFIG=""
+cleanup() {
+    [[ -n "$TEMP_CONFIG" && -f "$TEMP_CONFIG" ]] && rm -f "$TEMP_CONFIG"
+}
+trap cleanup EXIT
+
+if [[ "$DRY_RUN" -ne 1 ]]; then
+    mkdir -p "$CACHE_DIR"
+fi
+
+export XDG_SESSION_TYPE=wayland
+export HOME="$CACHE_DIR"
+export XDG_STATE_HOME="$CACHE_DIR/.local/state"
+export XDG_DATA_HOME="$CACHE_DIR/.local/share"
+export XDG_CACHE_HOME="$CACHE_DIR/.cache"
+# services/greeter_data.c reads/writes last-user/last-session memory here
+# directly (see docs/28-GREETER-PLAN.md); it's the cache dir itself, not a
+# further XDG subdir.
+export DANKC_GREETER_STATE_DIR="$CACHE_DIR"
+
+# Fallback runtime dir for systems without logind/pam_rundir setting
+# $XDG_RUNTIME_DIR for the greeter user (e.g. seatd-only setups), where
+# niri/EGL abort with "RuntimeDirNotSet" otherwise. Guarded so logind
+# systems keep whatever they were handed.
+if [[ -z "${XDG_RUNTIME_DIR:-}" || ! -d "${XDG_RUNTIME_DIR:-}" ]]; then
+    export XDG_RUNTIME_DIR="$CACHE_DIR/run"
+    if [[ "$DRY_RUN" -ne 1 ]]; then
+        mkdir -p "$XDG_RUNTIME_DIR"
+        chmod 700 "$XDG_RUNTIME_DIR"
+    fi
+fi
+
+TEMP_CONFIG=$(mktemp --suffix=.kdl)
+
+cat > "$TEMP_CONFIG" <<'NIRI_EOF'
+hotkey-overlay {
+    skip-at-startup
+}
+
+gestures {
+    hot-corners {
+        off
+    }
+}
+
+layout {
+    background-color "#000000"
+}
+NIRI_EOF
+
+# Optional site-local overrides (input config, output layout, etc). Not
+# required to exist; skipped silently if absent. See docs/GREETER.md.
+if [[ -e /etc/greetd/niri-overrides.kdl ]]; then
+    cat >> "$TEMP_CONFIG" <<NIRI_EOF
+
+include "/etc/greetd/niri-overrides.kdl"
+NIRI_EOF
+fi
+
+cat >> "$TEMP_CONFIG" <<'NIRI_EOF'
+
+spawn-at-startup "sh" "-c" "dankc greeter; niri msg action quit --skip-confirmation"
+NIRI_EOF
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "$TEMP_CONFIG"
+    trap - EXIT
+    exit 0
+fi
+
+exec niri -c "$TEMP_CONFIG"

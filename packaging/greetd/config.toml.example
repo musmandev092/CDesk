@@ -1,0 +1,18 @@
+# Example /etc/greetd/config.toml for dankc's greeter (docs/28-GREETER-PLAN.md T5).
+#
+# This is an EXAMPLE only — it is never installed or applied automatically.
+# Read docs/GREETER.md in full before touching your real
+# /etc/greetd/config.toml: a broken greeter command means no way to log in
+# graphically. Keep a spare TTY (or another display manager) available while
+# testing.
+#
+# greetd itself is not part of this repo; install it from your distro
+# (e.g. `pacman -S greetd` on Arch) and enable its systemd service/unit
+# separately. This file only documents the `[default_session]` dankc needs.
+
+[terminal]
+vt = 1
+
+[default_session]
+command = "dankc-greeter"
+user = "greeter"
