@@ -9,6 +9,7 @@
 #include "services/battery.h"
 #include "services/power.h"
 #include "theme/theme.h"
+#include "ui/connected.h"
 #include "ui/popout.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
@@ -39,6 +40,20 @@
  * specific widget -- same approximation controlcenter.c makes for the CC
  * pill itself ("opens near the bar's right cluster", not pixel-exact). */
 #define DC_BP_SIDE_MARGIN 12
+
+/* Logical surface width. DC_BP_WIDTH already bakes in the floating chrome's
+ * flat 6px pad on every side; connected_frame widens the lateral (side) pad
+ * to 12 for the connector fillets (dc_popout_chrome_pads()), so the surface
+ * needs 2*(pad_side-6) more logical px to keep the card CONTENT rect --
+ * inset by pad_side + margin, see bp_get_layout() -- exactly where it sits
+ * when floating (mirrors controlcenter.c's cc_surface_width()).
+ * connected_frame off: pad_side==6, so this is just DC_BP_WIDTH, unchanged. */
+static int bp_surface_width(void)
+{
+    int pad_side = 6;
+    dc_popout_chrome_pads(dc_config_current, NULL, &pad_side, NULL);
+    return DC_BP_WIDTH + 2 * (pad_side - 6);
+}
 
 struct dc_battery_popout {
     dc_wayland *wl;
@@ -173,15 +188,26 @@ static void bp_ensure_label_widths(dc_render *r)
  * `active && !dimmed` gate for actually drawing it. */
 static bp_layout bp_get_layout(float w, int icon_mode)
 {
-    const float pad = 6.0f;    /* room for the drop shadow */
+    /* Card-fill padding (docs/27-CONNECTED-FRAME-PLAN.md T5): floating
+     * chrome reserves a flat 6px of shadow room on all four sides;
+     * connected chrome widens the lateral (side) pad to 12 for the
+     * connector fillets and drops the bar-facing (near) pad to 0 -- see
+     * dc_popout_chrome_pads(). Which physical edge is "near" swaps with
+     * bar_position; self-contained the same way controlcenter.c's
+     * cc_get_layout() reads dc_config_current directly. */
+    int pad_near, pad_side, pad_far;
+    dc_popout_chrome_pads(dc_config_current, &pad_near, &pad_side, &pad_far);
+    const bool bottom_bar = dc_config_current->bar_position == DC_BAR_POSITION_BOTTOM;
+    const float pad_top = bottom_bar ? (float)pad_far : (float)pad_near;
+    const float pad_side_f = (float)pad_side;
     const float margin = 20.0f; /* content inset from the card edge */
     const float gap = 16.0f;
 
     bp_layout l = {0};
-    l.ix = pad + margin;
+    l.ix = pad_side_f + margin;
     l.iw = w - 2.0f * l.ix;
 
-    l.header_y = pad + margin;
+    l.header_y = pad_top + margin;
     l.header_h = 48.0f;
     l.header_cy = l.header_y + l.header_h / 2.0f;
     l.icon_x = l.ix;
@@ -399,7 +425,12 @@ static void bp_render(dc_battery_popout *bp)
     const dc_theme *t = dc_theme_current;
     const float w = bp->logical_width;
     const float h = bp->logical_height;
-    const float pad = 6.0f;
+    const bool bottom_bar = dc_config_current->bar_position == DC_BAR_POSITION_BOTTOM;
+    int pad_near, pad_side, pad_far;
+    dc_popout_chrome_pads(dc_config_current, &pad_near, &pad_side, &pad_far);
+    const float pad_top = bottom_bar ? (float)pad_far : (float)pad_near;
+    const float pad_bottom = bottom_bar ? (float)pad_near : (float)pad_far;
+    const float pad_side_f = (float)pad_side;
 
     glViewport(0, 0, bp->phys_width, bp->phys_height);
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
@@ -414,33 +445,17 @@ static void bp_render(dc_battery_popout *bp)
         p = 1.0f - (p > 1.0f ? 1.0f : p);
     float alpha = p > 1.0f ? 1.0f : p;
     float scale = 0.94f + 0.06f * p;
-    float ox = pad + (w - 2.0f * pad) * bp->anim_ox;
-    float oy = pad + (h - 2.0f * pad) * bp->anim_oy;
+    float ox = pad_side_f + (w - 2.0f * pad_side_f) * bp->anim_ox;
+    float oy = pad_top + (h - pad_top - pad_bottom) * bp->anim_oy;
     nvgGlobalAlpha(vg, alpha);
     nvgTranslate(vg, ox, oy);
     nvgScale(vg, scale, scale);
     nvgTranslate(vg, -ox, -oy);
 
-    /* Soft drop shadow. */
-    NVGpaint shadow = nvgBoxGradient(vg, pad, pad + 2.0f, w - 2 * pad, h - 2 * pad, 12.0f, 18.0f,
-                                     nvgRGBA(0, 0, 0, 90), nvgRGBA(0, 0, 0, 0));
-    nvgBeginPath(vg);
-    nvgRect(vg, 0, 0, w, h);
-    nvgRoundedRect(vg, pad, pad, w - 2 * pad, h - 2 * pad, 12.0f);
-    nvgPathWinding(vg, NVG_HOLE);
-    nvgFillPaint(vg, shadow);
-    nvgFill(vg);
-
-    /* Card: opaque surfaceContainer (docs/13-POPOUTS-SPEC.md sec.0: user
-     * popupTransparency=1 -> opaque). */
-    nvgBeginPath(vg);
-    nvgRoundedRect(vg, pad, pad, w - 2 * pad, h - 2 * pad, 12.0f);
-    nvgFillColor(vg, nvgRGBA(t->surface_container.r, t->surface_container.g, t->surface_container.b,
-                             255));
-    nvgFill(vg);
-    nvgStrokeColor(vg, nvgRGBA(t->outline.r, t->outline.g, t->outline.b, 40));
-    nvgStrokeWidth(vg, 1.0f);
-    nvgStroke(vg);
+    /* Card chrome: shadow + fill + outline, floating or stitched into the
+     * bar depending on connected_frame -- see ui/connected.h. Byte-identical
+     * to the old inline floating-chrome block when the toggle is off. */
+    dc_connected_card_chrome(vg, bp->render, w, h, bottom_bar);
 
     bp_ensure_label_widths(bp->render);
     dc_power_info pw = {0};
@@ -549,7 +564,7 @@ static void layer_surface_handle_configure(void *data, struct zwlr_layer_surface
 {
     dc_battery_popout *bp = data;
     zwlr_layer_surface_v1_ack_configure(surface, serial);
-    bp->logical_width = width > 0 ? (int)width : DC_BP_WIDTH;
+    bp->logical_width = width > 0 ? (int)width : bp_surface_width();
     bp->logical_height = height > 0 ? (int)height : DC_BP_HEIGHT;
     bp->configured = true;
     recompute_physical(bp);
@@ -574,7 +589,7 @@ dc_battery_popout *dc_battery_popout_create(dc_wayland *wl, dc_egl *egl, dc_rend
     bp->wl = wl;
     bp->egl = egl;
     bp->render = render;
-    bp->logical_width = DC_BP_WIDTH;
+    bp->logical_width = bp_surface_width();
     bp->logical_height = DC_BP_HEIGHT;
     bp->scale120 = DC_SCALE_BASE;
     return bp;
@@ -607,7 +622,8 @@ static void bp_show(dc_battery_popout *bp, dc_output *output)
     bp->anim_ox = pa.origin_x;
     bp->anim_oy = pa.origin_y;
     zwlr_layer_surface_v1_set_anchor(bp->layer_surface, pa.anchor);
-    zwlr_layer_surface_v1_set_size(bp->layer_surface, DC_BP_WIDTH, DC_BP_HEIGHT);
+    bp->logical_width = bp_surface_width();
+    zwlr_layer_surface_v1_set_size(bp->layer_surface, (uint32_t)bp->logical_width, DC_BP_HEIGHT);
     zwlr_layer_surface_v1_set_margin(bp->layer_surface, pa.margin_top, pa.margin_right,
                                      pa.margin_bottom, pa.margin_left);
     zwlr_layer_surface_v1_set_exclusive_zone(bp->layer_surface, -1);
