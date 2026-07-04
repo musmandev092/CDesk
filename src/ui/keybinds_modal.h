@@ -4,16 +4,25 @@
  * animation pattern as powermenu.c) that lists the user's niri keybinds in
  * categorized, multi-column masonry — matching DankMaterialShell's
  * Modals/KeybindsModal.qml + KeybindsContent.qml *read-only* cheat-sheet view
- * (this is not DMS's editable keybind-remapping UI, just the "what are my
- * shortcuts" overlay).
+ * (this is not DMS's editable keybind-remapping UI -- editing dankc-managed
+ * binds happens in dankc's own Settings > Keybinds tab; this overlay is just
+ * the "what are my shortcuts" reference).
  *
- * Source of truth: ~/.config/niri/config.kdl (and any `include "..."` files it
- * references, e.g. DMS's own dms/binds.kdl) is parsed tolerantly at open time
- * -- see keybinds_modal.c's kb_parse_config() for the exact grammar subset
- * understood. This is deliberately distinct from the existing `dankc keybinds`
- * CLI (main.c's print_keybinds()), which only prints a KDL snippet for
- * dankc's own control commands to paste into a binds{} block; this overlay
- * reads the user's *actual* live binds back out and displays them.
+ * Source of truth: the shared keybind service, services/keybinds.c/.h
+ * (docs/23-KEYBIND-EDITING-PLAN.md, task KB-T4) -- dc_keybinds_load() there
+ * parses ~/.config/niri/config.kdl (and any `include "..."` files it
+ * references, e.g. DMS's own dms/binds.kdl or dankc's own dankc-binds.kdl)
+ * tolerantly, following includes recursively, and is re-called every time
+ * this overlay is shown so edits made in Settings > Keybinds appear on the
+ * next open. This file only keeps the presentation logic (category grouping,
+ * action-label prettification, masonry layout) -- see keybinds_modal.c's
+ * kb_load_config(). Rows for binds owned by dankc (dc_keybind.managed) carry a
+ * small "dankc" badge, and a footer hint points at Settings > Keybinds; this
+ * overlay itself remains strictly read-only. Deliberately distinct from the
+ * existing `dankc keybinds` CLI (main.c's print_keybinds()), which only
+ * prints a KDL snippet for dankc's own control commands to paste into a
+ * binds{} block; this overlay reads the user's *actual* live binds back out
+ * and displays them.
  *
  * Opened via `dankc ctl keybinds-overlay`, following the same
  * dc_<panel>_toggle/hide/visible/surface convention as every other panel.
