@@ -216,7 +216,8 @@ struct dc_settings {
     float sidebar_scroll_y; /* independent scroll for the (now 20-tab) sidebar list */
 
     int focus_field; /* 0 none, 1 latitude, 2 longitude, 3 weather location,
-                      * 4 wallpaper path, 5 dock pinned-app id (add) */
+                      * 4 wallpaper path, 5 dock pinned-app id (add), 15 audio
+                      * device rename (see audio_rename_target below) */
     char edit_buf[256];
 
     bool test_clicks_done; /* DANKC_SETTINGS_CLICK consumed (see s_show) */
@@ -275,6 +276,15 @@ struct dc_settings {
      * truth, same shape as the Displays tab's disp_selected/disp_res_open. */
     bool tz_picker_open;
     char tz_filter[64];
+
+    /* Audio tab (docs/25-AUDIO-PERDEVICE-PLAN.md T4): node.name of whichever
+     * sink/source's "Rename" textfield is mid-edit (focus_field == 15),
+     * committed via dc_config_audio_set_alias() in commit_edit(). Shared by
+     * both the OUTPUT and INPUT cards since focus_field is single-valued --
+     * only one textfield can ever be focused at a time. Not config.json
+     * state itself, just the in-progress edit target (same shape as
+     * net_hotspot_ssid's draft-buffer above). */
+    char audio_rename_target[DC_CONFIG_AUDIO_NAME_MAX];
 };
 
 /* Bounded string copy without gcc's -Wformat-truncation firing: several text
@@ -921,145 +931,6 @@ static void backlight_set(const backlight_info *bl, float frac)
              ">/dev/null 2>&1",
              bl->device, raw);
     run_detached(cmd);
-}
-
-/* --- default audio *source* (mic) mute state; audio.h's dc_audio_read()
- * only targets @DEFAULT_AUDIO_SINK@ (same split as controlcenter.c's
- * audio_source_read()). */
-static bool audio_source_read(dc_audio_info *out)
-{
-    static dc_audio_info cache;
-    static bool cache_ok = false;
-    static time_t cache_time = 0;
-    time_t now = time(NULL);
-    if (cache_time && now - cache_time < SYS_CACHE_SECONDS) {
-        *out = cache;
-        return cache_ok;
-    }
-    cache_time = now;
-    cache_ok = false;
-    memset(&cache, 0, sizeof(cache));
-    FILE *pipe = popen("wpctl get-volume @DEFAULT_AUDIO_SOURCE@ 2>/dev/null", "r");
-    if (pipe) {
-        char line[128];
-        if (fgets(line, sizeof(line), pipe)) {
-            float volume = 0.0f;
-            if (sscanf(line, "Volume: %f", &volume) == 1) {
-                cache.volume = (int)(volume * 100.0f + 0.5f);
-                cache.available = true;
-                cache_ok = true;
-            }
-            if (strstr(line, "MUTED"))
-                cache.muted = true;
-        }
-        pclose(pipe);
-    }
-    *out = cache;
-    return cache_ok;
-}
-
-/* Force the audio caches to refresh on the next read (after a mute toggle /
- * default-sink switch, so the UI reflects the change immediately instead of
- * up to SYS_CACHE_SECONDS later). dc_audio_set_volume() already invalidates
- * audio.c's own sink cache; the statics here need the same treatment. */
-static time_t g_audio_dirty_until = 0;
-
-/* --- output-device (sink) list from `wpctl status`. Parsed read-only; rows
- * switch the default via `wpctl set-default <id>`. The status output frames
- * the Audio section's sink block between "Sinks:" and the next blank-ish
- * header line; entries look like " │  *   50. Name ... [vol: 0.97]". */
-#define SINKS_MAX 6
-
-typedef struct {
-    int id;
-    char name[64];
-    bool is_default;
-} sink_entry;
-
-static int sinks_read(sink_entry *out, int max)
-{
-    static sink_entry cache[SINKS_MAX];
-    static int cache_n = 0;
-    static time_t cache_time = 0;
-    time_t now = time(NULL);
-    if (cache_time && now - cache_time < SYS_CACHE_SECONDS && now >= g_audio_dirty_until) {
-        int n = cache_n < max ? cache_n : max;
-        memcpy(out, cache, (size_t)n * sizeof(*out));
-        return n;
-    }
-    cache_time = now;
-    g_audio_dirty_until = 0;
-    cache_n = 0;
-    FILE *pipe = popen("wpctl status 2>/dev/null", "r");
-    if (pipe) {
-        char line[256];
-        bool in_audio = false, in_sinks = false;
-        while (fgets(line, sizeof(line), pipe)) {
-            if (strncmp(line, "Audio", 5) == 0) {
-                in_audio = true;
-                continue;
-            }
-            if (in_audio && (strncmp(line, "Video", 5) == 0 || strncmp(line, "Settings", 8) == 0))
-                break;
-            if (!in_audio)
-                continue;
-            if (strstr(line, "Sinks:")) {
-                in_sinks = true;
-                continue;
-            }
-            if (!in_sinks)
-                continue;
-            /* Sink entries carry an "id. name"; the section ends at the next
-             * header line ("Sources:", "Filters:", ...) or a blank row. */
-            if (strstr(line, "Sources:") || strstr(line, "Filters:") ||
-                strstr(line, "Streams:") || strstr(line, "Devices:"))
-                break;
-            char *dot = strchr(line, '.');
-            if (!dot)
-                continue;
-            /* Walk back from the dot to find the numeric id start. */
-            char *p = dot;
-            while (p > line && p[-1] >= '0' && p[-1] <= '9')
-                p--;
-            if (p == dot)
-                continue; /* separator row, no id */
-            int id = atoi(p);
-            if (id <= 0 || cache_n >= SINKS_MAX)
-                continue;
-            sink_entry *e = &cache[cache_n];
-            e->id = id;
-            /* A '*' between the tree bars and the id marks the default. */
-            e->is_default = false;
-            for (char *q = line; q < p; q++)
-                if (*q == '*')
-                    e->is_default = true;
-            /* Name: after ". ", trimmed of the trailing "[vol: ...]" tag. */
-            const char *name = dot + 1;
-            while (*name == ' ')
-                name++;
-            snprintf(e->name, sizeof(e->name), "%s", name);
-            char *tag = strstr(e->name, "[vol:");
-            if (tag)
-                *tag = '\0';
-            /* rtrim */
-            size_t len = strlen(e->name);
-            while (len > 0 && (e->name[len - 1] == ' ' || e->name[len - 1] == '\n'))
-                e->name[--len] = '\0';
-            cache_n++;
-        }
-        pclose(pipe);
-    }
-    int n = cache_n < max ? cache_n : max;
-    memcpy(out, cache, (size_t)n * sizeof(*out));
-    return n;
-}
-
-static void sinks_set_default(int id)
-{
-    char cmd[64];
-    snprintf(cmd, sizeof(cmd), "wpctl set-default %d", id);
-    run_detached(cmd);
-    g_audio_dirty_until = time(NULL) + 1; /* re-parse shortly after the switch */
 }
 
 /* --- Wi-Fi radio state via nmcli (`nmcli radio wifi` -> "enabled"). The
@@ -2575,54 +2446,199 @@ static void tab_nightlight(uictx *c)
     }
 }
 
+/* docs/25-AUDIO-PERDEVICE-PLAN.md T4: per-device cards, replacing the old
+ * single-default-sink slider + fragile `wpctl status`-parsed sink list (both
+ * deleted -- services/audio.c now owns enumeration + the max-volume clamp +
+ * alias resolution via the dc_audio_sinks()/sources()/dc_audio_device_*()/
+ * dc_audio_display_name() API, config.c owns persistence via
+ * dc_config_audio_max()/_alias()/_hidden() + setters). Up to
+ * AUDIO_CARD_DEVICES_MAX sinks/sources are listed per category -- generously
+ * above what any real machine reports, matching the service's own
+ * DC_CONFIG_AUDIO_DEVICES_MAX-style headroom rather than the old SINKS_MAX==6
+ * `wpctl status`-parser limit. */
+#define AUDIO_CARD_DEVICES_MAX 16
+
+/* Collapsed-row status text: "Default \xc2\xb7 42%", "Muted", "Default \xc2\xb7 Muted", or
+ * plain "42%" for a non-default, unmuted device. */
+static void audio_card_status(const dc_audio_device *dev, char *out, size_t n)
+{
+    size_t p = 0;
+    if (dev->is_default) {
+        int w = snprintf(out, n, "Default");
+        p = w > 0 ? (size_t)w : 0;
+    }
+    if (p >= n)
+        return;
+    if (dev->muted)
+        snprintf(out + p, n - p, p ? " \xc2\xb7 Muted" : "Muted");
+    else
+        snprintf(out + p, n - p, p ? " \xc2\xb7 %d%%" : "%d%%", dev->volume);
+}
+
+/* One OUTPUT/INPUT card: collapsed row (name + Default badge + vol/mute,
+ * clicking sets default) with a chevron that expands full controls for
+ * exactly one device per category at a time -- `expanded` is the caller's
+ * (static, node.name-keyed) disclosure state, docs/25 T4's "expand ONE device
+ * at a time" (D2: node.name is the stable key, not the session-local id).
+ * `slot` (0 output-category / 1 input-category) selects which half of the
+ * per-category optimistic-state statics below this card uses, so an expanded
+ * output card and an expanded input card never share state. */
+static void audio_device_card(uictx *c, const dc_audio_device *dev, int slot, char *expanded,
+                              size_t expanded_sz)
+{
+    char status[48];
+    audio_card_status(dev, status, sizeof(status));
+    bool expanded_now = expanded[0] && strcmp(expanded, dev->name) == 0;
+    int click = ui_list_row(c, dc_audio_display_name(dev), status,
+                            expanded_now ? IC_EXPAND_LESS : IC_EXPAND_MORE, dev->is_default);
+    if (click == 1) {
+        if (!dev->is_default)
+            dc_audio_set_default(dev->id);
+    } else if (click == 2) {
+        if (expanded_now)
+            expanded[0] = '\0';
+        else
+            copy_trunc(expanded, expanded_sz, dev->name);
+    }
+    if (!expanded_now)
+        return;
+
+    static opt_value vol_pending[2];
+    static opt_flip mute_flip[2];
+    static opt_value max_pending[2];
+
+    int max_vol = dc_config_audio_max(dev->name);
+    float frac = (float)dev->volume / (float)max_vol;
+    float pv;
+    if (opt_value_get(&vol_pending[slot], &pv))
+        frac = pv;
+    if (frac < 0.0f)
+        frac = 0.0f;
+    if (frac > 1.0f)
+        frac = 1.0f;
+    char vv[16];
+    snprintf(vv, sizeof(vv), "%d%%", (int)lroundf(frac * (float)max_vol));
+    if (ui_slider(c, "Volume", &frac, 0.0f, 1.0f, vv)) {
+        int pct = (int)lroundf(frac * (float)max_vol);
+        dc_audio_device_set_volume(dev->id, pct);
+        opt_value_set(&vol_pending[slot], frac);
+    }
+
+    bool muted = flip_get(&mute_flip[slot], dev->muted);
+    if (ui_toggle(c, "Mute", NULL, muted)) {
+        dc_audio_device_toggle_mute(dev->id);
+        flip_set(&mute_flip[slot], !muted);
+    }
+
+    /* Max-volume clamp (D4): 100-200% slider, one entry per device in
+     * config.json (dc_config_audio_set_max()); lowering it below the
+     * device's current live volume corrects that volume immediately instead
+     * of waiting for the service's own parse-time clamp to catch up. */
+    float maxfrac = ((float)max_vol - 100.0f) / 100.0f;
+    float mpv;
+    if (opt_value_get(&max_pending[slot], &mpv))
+        maxfrac = mpv;
+    int curmax = 100 + (int)lroundf(maxfrac * 100.0f);
+    char mv[16];
+    snprintf(mv, sizeof(mv), "%d%%", curmax);
+    if (ui_slider(c, "Max volume", &maxfrac, 0.0f, 1.0f, mv)) {
+        int newmax = 100 + (int)lroundf(maxfrac * 100.0f);
+        dc_config_audio_set_max(dev->name, newmax);
+        c->changed = true;
+        opt_value_set(&max_pending[slot], maxfrac);
+        if (dev->volume > newmax)
+            dc_audio_device_set_volume(dev->id, newmax);
+    }
+
+    /* Rename (D3: dankc-config-only alias, dc_audio_display_name() is what
+     * every surface reads back) -- shares focus_field 15 with every other
+     * device's rename field; s->audio_rename_target records which node.name
+     * the in-progress edit_buf belongs to (set when this field gains focus,
+     * same shape as the hotspot SSID/password drafts above). */
+    bool renaming =
+        c->s->focus_field == 15 && strcmp(c->s->audio_rename_target, dev->name) == 0;
+    const char *alias = dc_config_audio_alias(dev->name);
+    char namebuf[DC_CONFIG_AUDIO_ALIAS_MAX];
+    if (renaming)
+        copy_trunc(namebuf, sizeof(namebuf), c->s->edit_buf);
+    else
+        snprintf(namebuf, sizeof(namebuf), "%s", alias ? alias : "");
+    if (ui_textfield(c, "Rename (blank = default name)", namebuf, renaming)) {
+        c->s->focus_field = 15;
+        copy_trunc(c->s->audio_rename_target, sizeof(c->s->audio_rename_target), dev->name);
+        snprintf(c->s->edit_buf, sizeof(c->s->edit_buf), "%s", alias ? alias : "");
+    }
+
+    /* Hiding the current default would strand playback/capture with no
+     * visible way to switch away from it -- withheld for that one device,
+     * matching docs/25 T4's "skip for current default". */
+    if (!dev->is_default && ui_list_row(c, "Hide device", NULL, 0, false) == 1) {
+        dc_config_audio_set_hidden(dev->name, true);
+        c->changed = true;
+        expanded[0] = '\0'; /* it's leaving this list -- nothing left to show expanded */
+    }
+}
+
 static void tab_audio(uictx *c)
 {
-    ui_section(c, "OUTPUT");
-    dc_audio_info out;
-    bool have_out = dc_audio_read(&out);
-    if (have_out) {
-        static opt_value pending;
-        float frac = (float)out.volume / 100.0f;
-        opt_value_get(&pending, &frac);
-        char v[16];
-        snprintf(v, sizeof(v), "%d%%", (int)lroundf(frac * 100.0f));
-        if (ui_slider(c, "Volume", &frac, 0.0f, 1.0f, v)) {
-            dc_audio_set_volume((int)lroundf(frac * 100.0f));
-            opt_value_set(&pending, frac);
-        }
-        static opt_flip mute_flip;
-        bool muted = flip_get(&mute_flip, out.muted);
-        if (ui_toggle(c, "Mute output", NULL, muted)) {
-            run_detached("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
-            flip_set(&mute_flip, !muted);
-        }
-    } else {
-        ui_hint(c, "Audio unavailable (wpctl/WirePlumber not responding)");
-    }
+    dc_audio_device sinks[AUDIO_CARD_DEVICES_MAX];
+    int sink_n = dc_audio_sinks(sinks, AUDIO_CARD_DEVICES_MAX);
+    dc_audio_device sources[AUDIO_CARD_DEVICES_MAX];
+    int source_n = dc_audio_sources(sources, AUDIO_CARD_DEVICES_MAX);
 
-    ui_section(c, "OUTPUT DEVICE");
-    sink_entry sinks[SINKS_MAX];
-    int n = sinks_read(sinks, SINKS_MAX);
-    for (int i = 0; i < n; i++) {
-        if (ui_list_row(c, sinks[i].name, sinks[i].is_default ? "Default" : NULL, 0,
-                        sinks[i].is_default) == 1 &&
-            !sinks[i].is_default)
-            sinks_set_default(sinks[i].id);
-    }
-    if (n == 0)
-        ui_hint(c, "No output devices found");
+    static char expanded_sink[DC_CONFIG_AUDIO_NAME_MAX] = "";
+    static char expanded_source[DC_CONFIG_AUDIO_NAME_MAX] = "";
 
-    ui_section(c, "INPUT");
-    dc_audio_info in;
-    if (audio_source_read(&in)) {
-        static opt_flip mic_flip;
-        bool muted = flip_get(&mic_flip, in.muted);
-        if (ui_toggle(c, "Mute microphone", NULL, muted)) {
-            run_detached("wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle");
-            flip_set(&mic_flip, !muted);
+    ui_section(c, "OUTPUT DEVICES");
+    int out_shown = 0;
+    for (int i = 0; i < sink_n; i++) {
+        if (dc_config_audio_hidden(sinks[i].name))
+            continue;
+        out_shown++;
+        audio_device_card(c, &sinks[i], 0, expanded_sink, sizeof(expanded_sink));
+    }
+    if (out_shown == 0)
+        ui_hint(c, sink_n == 0 ? "No output devices found"
+                               : "All output devices are hidden -- see Hidden Devices below");
+
+    ui_section(c, "INPUT DEVICES");
+    int in_shown = 0;
+    for (int i = 0; i < source_n; i++) {
+        if (dc_config_audio_hidden(sources[i].name))
+            continue;
+        in_shown++;
+        audio_device_card(c, &sources[i], 1, expanded_source, sizeof(expanded_source));
+    }
+    if (in_shown == 0)
+        ui_hint(c, source_n == 0 ? "No input devices found"
+                                 : "All input devices are hidden -- see Hidden Devices below");
+
+    /* Hidden section (D6: the service enumerates hidden devices too --
+     * filtering only happens here in the UI -- so "Unhide" always has a
+     * live device to act on rather than a name orphaned in config.json). */
+    bool any_hidden = false;
+    for (int i = 0; i < sink_n && !any_hidden; i++)
+        any_hidden = dc_config_audio_hidden(sinks[i].name);
+    for (int i = 0; i < source_n && !any_hidden; i++)
+        any_hidden = dc_config_audio_hidden(sources[i].name);
+    if (any_hidden) {
+        ui_section(c, "HIDDEN DEVICES");
+        for (int i = 0; i < sink_n; i++) {
+            if (!dc_config_audio_hidden(sinks[i].name))
+                continue;
+            if (ui_list_row(c, dc_audio_display_name(&sinks[i]), "Output", IC_ADD, false) == 2) {
+                dc_config_audio_set_hidden(sinks[i].name, false);
+                c->changed = true;
+            }
         }
-    } else {
-        ui_hint(c, "No input device found");
+        for (int i = 0; i < source_n; i++) {
+            if (!dc_config_audio_hidden(sources[i].name))
+                continue;
+            if (ui_list_row(c, dc_audio_display_name(&sources[i]), "Input", IC_ADD, false) == 2) {
+                dc_config_audio_set_hidden(sources[i].name, false);
+                c->changed = true;
+            }
+        }
     }
 }
 
@@ -4830,6 +4846,14 @@ static void commit_edit(dc_settings *s)
     case 14: /* Keybinds tab "add bind" description (hotkey-overlay-title)
               * draft, see dc_settings.kb_title */
         copy_trunc(s->kb_title, sizeof(s->kb_title), s->edit_buf);
+        break;
+    case 15: /* Audio tab device rename (docs/25-AUDIO-PERDEVICE-PLAN.md T4) --
+              * target node.name is s->audio_rename_target, set when the
+              * textfield gained focus; empty clears the alias back to the
+              * device's raw description (dc_config_audio_set_alias() already
+              * treats an empty/NULL alias as "remove the entry"). */
+        dc_config_audio_set_alias(s->audio_rename_target,
+                                  s->edit_buf[0] ? s->edit_buf : NULL);
         break;
     default:
         break;
