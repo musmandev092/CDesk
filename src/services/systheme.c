@@ -42,6 +42,7 @@
 
 #include "services/systheme_apps.h"
 #include "services/systheme_internal.h"
+#include "services/systheme_notify.h"
 #include "services/systheme_term.h"
 
 #include "core/config.h"
@@ -813,4 +814,11 @@ void dc_systheme_apply(const struct dc_config *cfg)
         dc_systheme_apply_qt(light);
     if (cfg->systheme_vscode && dc_systheme_app_detected("vscode"))
         dc_systheme_apply_vscode(light);
+
+    if (cfg->systheme_mako && dc_systheme_app_detected("mako"))
+        dc_systheme_apply_mako(light);
+    if (cfg->systheme_dunst && dc_systheme_app_detected("dunst"))
+        dc_systheme_apply_dunst(light);
+    if (cfg->systheme_swaync && dc_systheme_app_detected("swaync"))
+        dc_systheme_apply_swaync(light);
 }

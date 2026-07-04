@@ -135,6 +135,7 @@ src = files(
   'src/services/nightlight.c', 'src/services/firewall.c',
   'src/services/niri_input.c', 'src/services/timedate.c',
   'src/services/systheme.c', 'src/services/systheme_term.c', 'src/services/systheme_apps.c',
+  'src/services/systheme_notify.c',
   'src/niri/niri.c',
   'src/theme/theme.c',
   'src/ipc/control.c',
