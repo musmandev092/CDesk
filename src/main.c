@@ -140,6 +140,7 @@ struct tick_ctx {
     dc_processes *processes;
     dc_dashboard *dashboard;
     dc_notepad *notepad;
+    dc_notif_center *notif_center;
     int last_volume;
     bool last_muted;
     int last_brightness;
@@ -233,6 +234,13 @@ static void clock_tick(void *data)
 {
     struct tick_ctx *ctx = data;
     dc_notifications_tick(ctx->notifications);
+    /* DND countdown (docs/26-DND-SCHEDULING-PLAN.md T3): the notification
+     * center's DND chip row shows a "resumes HH:MM (Nm)" label while a timed
+     * session is running -- redraw it ~1Hz so that ticks down, but only while
+     * the center is actually open AND a timed session is active, so this
+     * never burns GPU/CPU on a plain idle tick otherwise. */
+    if (dc_notif_center_visible(ctx->notif_center) && dc_notif_dnd_remaining_sec() > 0)
+        dc_notif_center_refresh(ctx->notif_center);
     /* Battery-protection automation (docs/24-BATTERY-POWER-PLAN.md sec.2):
      * self-limits its own sysfs read to ~5s, so calling every tick is cheap. */
     dc_battery_auto_tick(ctx->notifications);
@@ -1340,6 +1348,7 @@ int main(int argc, char **argv)
     dc_dashboard_set_settings_cb(dashboard, dashboard_open_settings, &dash_settings);
     tick.dashboard = dashboard;
     tick.notepad = notepad;
+    tick.notif_center = notif_center;
 
     struct kbd_ctx kbd = {
         .launcher = launcher,

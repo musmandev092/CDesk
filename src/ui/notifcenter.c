@@ -50,6 +50,14 @@
 #define DC_NC_LIST_GAP 12.0f
 #define DC_NC_BOTTOM_PAD 14.0f
 
+/* DND chip row + History time-filter chip row (docs/26-DND-SCHEDULING-
+ * PLAN.md UI/T3): same pill shape as draw_tab()'s tabs, just sized to each
+ * chip's own label instead of a fixed slot. DC_NC_LIST_GAP is reused as the
+ * vertical gap above/below each chip row so spacing stays visually
+ * consistent with the existing tabs->list gap. */
+#define DC_NC_CHIP_ROW_H 24.0f
+#define DC_NC_CHIP_GAP 6.0f
+
 #define DC_NC_CARD_H 120.0f
 #define DC_NC_CARD_GAP 10.0f
 #define DC_NC_MAX_CARDS DC_NOTIF_MAX
@@ -72,6 +80,15 @@ typedef enum {
     DC_NC_TAB_CURRENT = 0,
     DC_NC_TAB_HISTORY = 1,
 } dc_nc_tab;
+
+/* History time-filter chip selection (docs/26-DND-SCHEDULING-PLAN.md T3) --
+ * values double as nc->history_filter and as indices into hist_chip_*[]. */
+typedef enum {
+    NC_HIST_ALL = 0,
+    NC_HIST_TODAY = 1,
+    NC_HIST_YESTERDAY = 2,
+    NC_HIST_WEEK = 3,
+} nc_hist_filter;
 
 /* Hit-test rects for one visible card, captured during nc_render() and
  * consumed by dc_notif_center_handle_click() -- same "record while drawing"
@@ -111,7 +128,24 @@ typedef struct {
 #define NC_HOVER_TAB1 2
 #define NC_HOVER_CLEAR 3
 #define NC_HOVER_SETTINGS 4
-#define NC_HOVER_CARD_BASE 10
+/* DND chip row (docs/26-DND-SCHEDULING-PLAN.md T3): Off|15m|1h|8AM|inf, in
+ * that left-to-right draw order -- contiguous ids so hover/hittest/click can
+ * range-check them as one block (nc->dnd_chip_*[id - NC_HOVER_DND_OFF]). */
+#define NC_HOVER_DND_OFF 5
+#define NC_HOVER_DND_15M 6
+#define NC_HOVER_DND_1H 7
+#define NC_HOVER_DND_8AM 8
+#define NC_HOVER_DND_INF 9
+/* History time-filter chips (History tab only): All|Today|Yesterday|This
+ * week, same contiguous-block convention as the DND chips above
+ * (nc->hist_chip_*[id - NC_HOVER_HIST_ALL]). */
+#define NC_HOVER_HIST_ALL 10
+#define NC_HOVER_HIST_TODAY 11
+#define NC_HOVER_HIST_YESTERDAY 12
+#define NC_HOVER_HIST_WEEK 13
+/* Card ids start at 20 (was 10) to leave room 5-19 for the two chip-id
+ * blocks above without colliding with the packed per-card range below. */
+#define NC_HOVER_CARD_BASE 20
 #define NC_HOVER_CARD_STRIDE (3 + DC_NOTIF_ACTION_MAX)
 /* One hover id per app-group header row (grouping); placed past the entire
  * card-hit id space so the two ranges never collide. */
@@ -144,6 +178,22 @@ struct dc_notif_center {
     float clear_x0, clear_y0, clear_x1, clear_y1;
     float settings_x0, settings_y0, settings_x1, settings_y1;
     float tab_x0[2], tab_y0[2], tab_x1[2], tab_y1[2];
+
+    /* DND chip row (docs/26-DND-SCHEDULING-PLAN.md T3): Off|15m|1h|8AM|inf,
+     * hit rects recomputed every render like the tabs above -- always drawn
+     * regardless of tab. */
+    float dnd_chip_x0[5], dnd_chip_y0[5], dnd_chip_x1[5], dnd_chip_y1[5];
+
+    /* History time-filter chips (History tab only): All|Today|Yesterday/
+     * This week. Zeroed out (x1<=x0) on Current-tab renders so hittest/click
+     * never match a stale rect left over from the last History render --
+     * same convention nc_render() already uses for clear_x0/x1 above. */
+    float hist_chip_x0[4], hist_chip_y0[4], hist_chip_x1[4], hist_chip_y1[4];
+
+    /* Selected History time filter (docs/26-DND-SCHEDULING-PLAN.md T3);
+     * intentionally NOT persisted to config -- resets to "All" (0) every
+     * process start, same lifetime as scroll[]/hover_id below. */
+    int history_filter;
 
     nc_card_hit hits[DC_NC_MAX_CARDS];
     int hit_count;
@@ -629,6 +679,55 @@ static void draw_tab(dc_notif_center *nc, int index, float x, float y, float h,
     *out_x1 = x + w;
 }
 
+/* Draw one pill-style chip (DND presets, History time-filter) at `x` and
+ * report its hit rect via the out params -- same active/inactive styling as
+ * draw_tab() just sized to its own label rather than a fixed slot index, and
+ * returning the next x cursor (x + w, no gap) so callers can chain calls
+ * left-to-right adding their own DC_NC_CHIP_GAP between. */
+static float draw_nc_chip(dc_notif_center *nc, float x, float y, float h, const char *label,
+                          bool active, float *out_x0, float *out_y0, float *out_x1, float *out_y1)
+{
+    NVGcontext *vg = nc->render->vg;
+    const dc_theme *t = dc_theme_current;
+
+    nvgFontFaceId(vg, nc->render->font_ui);
+    nvgFontSize(vg, 11.5f);
+    float b[4];
+    nvgTextBounds(vg, 0, 0, label, NULL, b);
+    float w = (b[2] - b[0]) + 20.0f;
+
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, x, y, w, h, h / 2.0f);
+    nvgFillColor(vg, active ? tc(t->primary) : tc(t->surface_container_high));
+    nvgFill(vg);
+
+    nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+    nvgFillColor(vg, active ? tc(t->primary_text) : tc_alpha(t->surface_text, 170));
+    nvgText(vg, x + w / 2.0f, y + h / 2.0f, label, NULL);
+
+    *out_x0 = x;
+    *out_y0 = y;
+    *out_x1 = x + w;
+    *out_y1 = y + h;
+    return x + w;
+}
+
+/* "8AM" chip label (docs/26-DND-SCHEDULING-PLAN.md UI): dnd_until_hour
+ * formatted per clock_24h, e.g. hour=8 -> "08:00" (24h) or "8 AM" (12h). */
+static void nc_format_hour_label(int hour, bool clock_24h, char *out, size_t outsz)
+{
+    if (hour < 0 || hour > 23)
+        hour = 8;
+    if (clock_24h) {
+        snprintf(out, outsz, "%02d:00", hour);
+    } else {
+        int h12 = hour % 12;
+        if (h12 == 0)
+            h12 = 12;
+        snprintf(out, outsz, "%d %s", h12, hour < 12 ? "AM" : "PM");
+    }
+}
+
 /* Hover bg (docs/13-POPOUTS-SPEC.md sec.3; formula from bar.c's
  * draw_hover_overlay(), shared via hover.h): painted last, on top of
  * whatever's already drawn at that hit rect. Stadium shape (radius = half
@@ -665,6 +764,20 @@ static void draw_nc_hover(dc_notif_center *nc)
         y0 = nc->settings_y0;
         x1 = nc->settings_x1;
         y1 = nc->settings_y1;
+        radius = (y1 - y0) / 2.0f;
+    } else if (nc->hover_id >= NC_HOVER_DND_OFF && nc->hover_id <= NC_HOVER_DND_INF) {
+        int i = nc->hover_id - NC_HOVER_DND_OFF;
+        x0 = nc->dnd_chip_x0[i];
+        y0 = nc->dnd_chip_y0[i];
+        x1 = nc->dnd_chip_x1[i];
+        y1 = nc->dnd_chip_y1[i];
+        radius = (y1 - y0) / 2.0f;
+    } else if (nc->hover_id >= NC_HOVER_HIST_ALL && nc->hover_id <= NC_HOVER_HIST_WEEK) {
+        int i = nc->hover_id - NC_HOVER_HIST_ALL;
+        x0 = nc->hist_chip_x0[i];
+        y0 = nc->hist_chip_y0[i];
+        x1 = nc->hist_chip_x1[i];
+        y1 = nc->hist_chip_y1[i];
         radius = (y1 - y0) / 2.0f;
     } else if (nc->hover_id >= NC_HOVER_GROUP_BASE) {
         int gi = nc->hover_id - NC_HOVER_GROUP_BASE;
@@ -872,6 +985,86 @@ static void nc_render(dc_notif_center *nc)
     draw_tab(nc, 1, next_x, tabs_y, DC_NC_TABS_H, history_label, nc->tab == DC_NC_TAB_HISTORY,
             &tab_x1);
 
+    /* --- DND chip row: Off|15m|1h|8AM|inf (docs/26-DND-SCHEDULING-PLAN.md
+     * UI/T3) -- always shown, between the tabs row and the card list. When a
+     * timed session is running, a right-aligned "resumes HH:MM (Nm)" label
+     * shares the row. "Off"/"inf" double as toggle state (highlighted when
+     * DND is off / on-indefinitely); 15m/1h/8AM are one-shot presets, never
+     * highlighted themselves. */
+    const float dnd_row_y = tabs_y + DC_NC_TABS_H + DC_NC_LIST_GAP;
+    {
+        int64_t remaining = dc_notif_dnd_remaining_sec();
+        bool clock24 = !dc_config_current || dc_config_current->clock_24h;
+        int until_hour = dc_config_current ? dc_config_current->dnd_until_hour : 8;
+        char hour_label[16];
+        nc_format_hour_label(until_hour, clock24, hour_label, sizeof(hour_label));
+
+        float cx = ix;
+        cx = draw_nc_chip(nc, cx, dnd_row_y, DC_NC_CHIP_ROW_H, "Off", remaining == -1,
+                          &nc->dnd_chip_x0[0], &nc->dnd_chip_y0[0], &nc->dnd_chip_x1[0],
+                          &nc->dnd_chip_y1[0]) +
+             DC_NC_CHIP_GAP;
+        cx = draw_nc_chip(nc, cx, dnd_row_y, DC_NC_CHIP_ROW_H, "15m", false, &nc->dnd_chip_x0[1],
+                          &nc->dnd_chip_y0[1], &nc->dnd_chip_x1[1], &nc->dnd_chip_y1[1]) +
+             DC_NC_CHIP_GAP;
+        cx = draw_nc_chip(nc, cx, dnd_row_y, DC_NC_CHIP_ROW_H, "1h", false, &nc->dnd_chip_x0[2],
+                          &nc->dnd_chip_y0[2], &nc->dnd_chip_x1[2], &nc->dnd_chip_y1[2]) +
+             DC_NC_CHIP_GAP;
+        cx = draw_nc_chip(nc, cx, dnd_row_y, DC_NC_CHIP_ROW_H, hour_label, false,
+                          &nc->dnd_chip_x0[3], &nc->dnd_chip_y0[3], &nc->dnd_chip_x1[3],
+                          &nc->dnd_chip_y1[3]) +
+             DC_NC_CHIP_GAP;
+        /* "Indef" rather than the "inf" (infinity) symbol from the plan text
+         * -- verified live (docs/26-DND-SCHEDULING-PLAN.md T3 risk-review):
+         * plain nvgText() (same path draw_tab()'s labels already use, no
+         * HarfBuzz fallback chain) renders U+221E as a tofu box in the
+         * bundled InterVariable face, so an ASCII label is used instead. */
+        draw_nc_chip(nc, cx, dnd_row_y, DC_NC_CHIP_ROW_H, "Indef", remaining == 0,
+                    &nc->dnd_chip_x0[4], &nc->dnd_chip_y0[4], &nc->dnd_chip_x1[4],
+                    &nc->dnd_chip_y1[4]);
+
+        if (remaining > 0) {
+            time_t resume_t = time(NULL) + (time_t)remaining;
+            struct tm tm_r;
+            localtime_r(&resume_t, &tm_r);
+            char time_buf[16];
+            strftime(time_buf, sizeof(time_buf), clock24 ? "%H:%M" : "%I:%M %p", &tm_r);
+            int mins = (int)((remaining + 30) / 60);
+            char countdown_buf[48];
+            snprintf(countdown_buf, sizeof(countdown_buf), "resumes %s (%dm)", time_buf, mins);
+
+            nvgFontFaceId(vg, nc->render->font_ui);
+            nvgFontSize(vg, 11.0f);
+            nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
+            nvgFillColor(vg, tc_alpha(t->surface_text, 160));
+            nvgText(vg, ix + iw, dnd_row_y + DC_NC_CHIP_ROW_H / 2.0f, countdown_buf, NULL);
+        }
+    }
+    const float after_dnd_y = dnd_row_y + DC_NC_CHIP_ROW_H;
+
+    /* --- History time-filter chip row: All|Today|Yesterday|This week
+     * (docs/26-DND-SCHEDULING-PLAN.md UI/T3) -- History tab only, a second
+     * chip row below the DND row. Only shifts list_y0 further down while
+     * that tab is active; zeroed out otherwise so a stale rect from the last
+     * History render can never hit-test true on the Current tab. */
+    float list_y0;
+    if (nc->tab == DC_NC_TAB_HISTORY) {
+        const float hist_row_y = after_dnd_y + DC_NC_LIST_GAP;
+        static const char *const hist_labels[4] = {"All", "Today", "Yesterday", "This week"};
+        float hx = ix;
+        for (int i = 0; i < 4; i++) {
+            hx = draw_nc_chip(nc, hx, hist_row_y, DC_NC_CHIP_ROW_H, hist_labels[i],
+                              nc->history_filter == i, &nc->hist_chip_x0[i], &nc->hist_chip_y0[i],
+                              &nc->hist_chip_x1[i], &nc->hist_chip_y1[i]) +
+                 DC_NC_CHIP_GAP;
+        }
+        list_y0 = hist_row_y + DC_NC_CHIP_ROW_H + DC_NC_LIST_GAP;
+    } else {
+        for (int i = 0; i < 4; i++)
+            nc->hist_chip_x0[i] = nc->hist_chip_x1[i] = 0.0f;
+        list_y0 = after_dnd_y + DC_NC_LIST_GAP;
+    }
+
     /* --- Card list, scrollable, grouped by app ---------------------------
      * Grouping (docs/14-COMPLETION-PLAN.md W1.4): entries sharing the same
      * app_name (case-insensitive) collapse into one header row with a count
@@ -879,7 +1072,6 @@ static void nc_render(dc_notif_center *nc)
      * card, no header. Groups are built in first-seen order over `entries`
      * (already newest-first), so a group's position tracks its most recent
      * member with no separate sort needed. */
-    const float list_y0 = tabs_y + DC_NC_TABS_H + DC_NC_LIST_GAP;
     const float list_y1 = h - pad - DC_NC_BOTTOM_PAD;
     const float list_h = list_y1 - list_y0;
 
@@ -887,6 +1079,54 @@ static void nc_render(dc_notif_center *nc)
     int count = (nc->tab == DC_NC_TAB_CURRENT)
                    ? dc_notifications_current(nc->notifications, entries, DC_NC_MAX_CARDS)
                    : dc_notifications_history(nc->notifications, entries, DC_NC_MAX_CARDS);
+
+    /* History time-filter (docs/26-DND-SCHEDULING-PLAN.md UI/T3): compare
+     * each entry's created_wall_ms against local-midnight boundaries computed
+     * once here per render via localtime_r/mktime (not per-entry) -- cheap
+     * enough at 1 render/interaction and avoids DST edge cases from a flat
+     * +/-N*86400s offset in seconds. */
+    if (nc->tab == DC_NC_TAB_HISTORY && nc->history_filter != NC_HIST_ALL) {
+        time_t now_t = time(NULL);
+        struct tm tm_mid;
+        localtime_r(&now_t, &tm_mid);
+        tm_mid.tm_hour = 0;
+        tm_mid.tm_min = 0;
+        tm_mid.tm_sec = 0;
+        time_t today0 = mktime(&tm_mid);
+        struct tm tm_y = tm_mid;
+        tm_y.tm_mday -= 1;
+        time_t yest0 = mktime(&tm_y);
+        struct tm tm_w = tm_mid;
+        tm_w.tm_mday -= 6;
+        time_t week0 = mktime(&tm_w);
+
+        int64_t today0_ms = (int64_t)today0 * 1000;
+        int64_t yest0_ms = (int64_t)yest0 * 1000;
+        int64_t week0_ms = (int64_t)week0 * 1000;
+
+        int kept = 0;
+        for (int i = 0; i < count; i++) {
+            int64_t wm = entries[i]->created_wall_ms;
+            bool keep;
+            switch (nc->history_filter) {
+            case NC_HIST_TODAY:
+                keep = wm >= today0_ms;
+                break;
+            case NC_HIST_YESTERDAY:
+                keep = wm >= yest0_ms && wm < today0_ms;
+                break;
+            case NC_HIST_WEEK:
+                keep = wm >= week0_ms;
+                break;
+            default:
+                keep = true;
+                break;
+            }
+            if (keep)
+                entries[kept++] = entries[i];
+        }
+        count = kept;
+    }
 
     typedef struct {
         char key[DC_NOTIF_APP];
@@ -1206,6 +1446,15 @@ static int nc_hittest(dc_notif_center *nc, double x, double y)
     if (in_rect(x, y, nc->settings_x0, nc->settings_y0, nc->settings_x1, nc->settings_y1))
         return NC_HOVER_SETTINGS;
 
+    for (int i = 0; i < 5; i++)
+        if (in_rect(x, y, nc->dnd_chip_x0[i], nc->dnd_chip_y0[i], nc->dnd_chip_x1[i],
+                    nc->dnd_chip_y1[i]))
+            return NC_HOVER_DND_OFF + i;
+    for (int i = 0; i < 4; i++)
+        if (in_rect(x, y, nc->hist_chip_x0[i], nc->hist_chip_y0[i], nc->hist_chip_x1[i],
+                    nc->hist_chip_y1[i]))
+            return NC_HOVER_HIST_ALL + i;
+
     for (int g = 0; g < nc->group_hit_count; g++) {
         nc_group_hit *gh = &nc->group_hits[g];
         if (in_rect(x, y, gh->x0, gh->y0, gh->x1, gh->y1))
@@ -1262,6 +1511,53 @@ void dc_notif_center_handle_click(dc_notif_center *nc, double x, double y)
          * here without a main.c dependency beyond this task's touch-scope. */
         dc_debug("notification center: settings gear clicked (no-op)");
         return;
+    }
+
+    /* DND chip row + History time-filter chips (docs/26-DND-SCHEDULING-
+     * PLAN.md UI/T3) -- same rect-check order as nc_hittest() above (header
+     * buttons, then these, then groups/cards) so hover and click can never
+     * disagree about what's under the pointer. */
+    if (in_rect(x, y, nc->dnd_chip_x0[0], nc->dnd_chip_y0[0], nc->dnd_chip_x1[0],
+                nc->dnd_chip_y1[0])) {
+        dc_notif_dnd_stop(nc->notifications);
+        nc_render(nc);
+        return;
+    }
+    if (in_rect(x, y, nc->dnd_chip_x0[1], nc->dnd_chip_y0[1], nc->dnd_chip_x1[1],
+                nc->dnd_chip_y1[1])) {
+        dc_notif_dnd_start(nc->notifications, 900);
+        nc_render(nc);
+        return;
+    }
+    if (in_rect(x, y, nc->dnd_chip_x0[2], nc->dnd_chip_y0[2], nc->dnd_chip_x1[2],
+                nc->dnd_chip_y1[2])) {
+        dc_notif_dnd_start(nc->notifications, 3600);
+        nc_render(nc);
+        return;
+    }
+    if (in_rect(x, y, nc->dnd_chip_x0[3], nc->dnd_chip_y0[3], nc->dnd_chip_x1[3],
+                nc->dnd_chip_y1[3])) {
+        int until_hour = dc_config_current ? dc_config_current->dnd_until_hour : 8;
+        dc_notif_dnd_start_until_hour(nc->notifications, until_hour);
+        nc_render(nc);
+        return;
+    }
+    if (in_rect(x, y, nc->dnd_chip_x0[4], nc->dnd_chip_y0[4], nc->dnd_chip_x1[4],
+                nc->dnd_chip_y1[4])) {
+        dc_notif_dnd_start(nc->notifications, 0);
+        nc_render(nc);
+        return;
+    }
+
+    for (int i = 0; i < 4; i++) {
+        if (in_rect(x, y, nc->hist_chip_x0[i], nc->hist_chip_y0[i], nc->hist_chip_x1[i],
+                    nc->hist_chip_y1[i])) {
+            if (nc->history_filter != i) {
+                nc->history_filter = i;
+                nc_render(nc);
+            }
+            return;
+        }
     }
 
     for (int g = 0; g < nc->group_hit_count; g++) {
