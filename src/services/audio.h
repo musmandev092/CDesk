@@ -100,14 +100,13 @@ int dc_audio_sinks(dc_audio_device *out, int max);
 int dc_audio_sources(dc_audio_device *out, int max);
 
 /* Set device `id`'s volume to `percent`, fire-and-forget (forks
- * `wpctl set-volume <id> <percent>%`, does not wait). Only clamps to a plain
- * non-negative percent here.
- * TODO(T3): enforce the per-device/default max-volume clamp + alias lookup
- * (docs/25-AUDIO-PERDEVICE-PLAN.md D4) -- not implemented yet. Forces the
- * device cache stale and kicks an async pw-dump refresh, same as
- * dc_audio_set_volume() above (this replaces the settings.c
- * g_audio_dirty_until self-invalidate flag -- the service now invalidates its
- * own cache). */
+ * `wpctl set-volume <id> <percent>%`, does not wait). Clamped to
+ * [0, dc_config_audio_max(that device's node.name)] (docs/25-AUDIO-
+ * PERDEVICE-PLAN.md D4, T3) -- falls back to the plain 100 default if `id`
+ * isn't found in the cache. Forces the device cache stale and kicks an
+ * async pw-dump refresh, same as dc_audio_set_volume() above (this replaces
+ * the settings.c g_audio_dirty_until self-invalidate flag -- the service now
+ * invalidates its own cache). */
 void dc_audio_device_set_volume(uint32_t id, int percent);
 
 /* Toggle device `id`'s mute state, fire-and-forget (forks
@@ -119,5 +118,13 @@ void dc_audio_device_toggle_mute(uint32_t id);
  * `wpctl set-default <id>`, does not wait). Same cache self-invalidate as
  * dc_audio_device_set_volume() above. */
 void dc_audio_set_default(uint32_t id);
+
+/* Display name for `dev`: its configured alias (dc_config_audio_alias(),
+ * docs/25-AUDIO-PERDEVICE-PLAN.md D3, dankc-config-only -- no wireplumber
+ * file is touched, so this never audibly interrupts audio) if one is set and
+ * non-empty, else its raw pw-dump `desc`. Every dankc surface (OSD, settings,
+ * control-center) should call this instead of reading `dev->desc` directly.
+ * `dev` may be NULL (returns ""). */
+const char *dc_audio_display_name(const dc_audio_device *dev);
 
 #endif /* DC_SERVICES_AUDIO_H */

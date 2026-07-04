@@ -1,5 +1,6 @@
 #include "services/audio.h"
 
+#include "core/config.h"
 #include "core/log.h"
 #include "core/loop.h"
 #include "dc.h"
@@ -223,6 +224,41 @@ static void parse_pwdump(const char *json_text, dc_audio_devlist *out)
     cJSON_Delete(root);
 }
 
+/* T3 D4: parse-time max-volume clamp. Called on every freshly-parsed device
+ * list (both sinks and sources) before it replaces the cache. Any device
+ * sitting more than 1 percentage point over its configured max
+ * (dc_config_audio_max(), default 100) gets a corrective fire-and-forget
+ * `wpctl set-volume <id> <max>%` fork (same non-blocking fork+setsid+execl
+ * shape as the setters below -- never blocks the event loop) AND its cached
+ * `volume` field is written down to `max` immediately, in the same pass.
+ * That immediate cache write is what prevents a feedback loop: without it,
+ * the *next* pw-dump parse (which can land before the corrective wpctl call
+ * has actually taken effect) would still see the stale over-max volume and
+ * fire another corrective call, repeating every cache refresh. The 1%
+ * tolerance (vs a plain >max check) exists because wpctl's cubic volume
+ * scale means our own corrective write can round-trip back as 1% off from
+ * the exact `max` we asked for -- without the tolerance that rounding alone
+ * would look like "still over max" and re-trigger a correction forever. */
+static void audio_clamp_to_max(dc_audio_device *list, int n)
+{
+    for (int i = 0; i < n; i++) {
+        int max = dc_config_audio_max(list[i].name);
+        if (list[i].volume <= max + 1)
+            continue;
+
+        char cmd[64];
+        snprintf(cmd, sizeof(cmd), "wpctl set-volume %u %d%%", list[i].id, max);
+        pid_t pid = fork();
+        if (pid == 0) {
+            setsid();
+            execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+            _exit(127);
+        }
+
+        list[i].volume = max;
+    }
+}
+
 static void pwdump_finish(bool eof_reached)
 {
     dc_loop_remove_fd(g_pwdump.loop, g_pwdump.fd);
@@ -234,6 +270,8 @@ static void pwdump_finish(bool eof_reached)
     if (eof_reached && g_pwdump.buf && g_pwdump.len > 0) {
         g_pwdump.buf[g_pwdump.len] = '\0';
         parse_pwdump(g_pwdump.buf, &result);
+        audio_clamp_to_max(result.sinks, result.n_sinks);
+        audio_clamp_to_max(result.sources, result.n_sources);
     } else {
         memset(&result, 0, sizeof(result)); /* pw-dump missing/failed/empty: 0 devices */
     }
@@ -383,8 +421,21 @@ void dc_audio_set_volume(int percent)
 {
     if (percent < 0)
         percent = 0;
-    if (percent > 100)
-        percent = 100;
+
+    /* T3 D4: clamp to the CURRENT DEFAULT sink's configured max
+     * (dc_config_audio_max), not a hardcoded 100 -- resolve which cached
+     * device is currently is_default and look up its max by name. Falls
+     * back to the plain 100 default if no default sink is known yet (cache
+     * empty/stale on the very first call). */
+    int max = 100;
+    for (int i = 0; i < g_devices.n_sinks; i++) {
+        if (g_devices.sinks[i].is_default) {
+            max = dc_config_audio_max(g_devices.sinks[i].name);
+            break;
+        }
+    }
+    if (percent > max)
+        percent = max;
 
     char cmd[96];
     snprintf(cmd, sizeof(cmd), "wpctl set-volume @DEFAULT_AUDIO_SINK@ %.2f", percent / 100.0f);
@@ -428,8 +479,13 @@ bool dc_audio_read_sink_name(char *out, size_t out_sz)
     if (g_devices_valid) {
         for (int i = 0; i < g_devices.n_sinks; i++) {
             if (g_devices.sinks[i].is_default) {
-                const char *name =
-                        g_devices.sinks[i].desc[0] ? g_devices.sinks[i].desc : g_devices.sinks[i].name;
+                /* T3 D3: an alias (dankc-config-only, see dc_audio_display_name)
+                 * takes priority over the raw pw-dump description so OSD/
+                 * control-center show the friendly name the user configured. */
+                const char *alias = dc_config_audio_alias(g_devices.sinks[i].name);
+                const char *name = (alias && alias[0])
+                        ? alias
+                        : (g_devices.sinks[i].desc[0] ? g_devices.sinks[i].desc : g_devices.sinks[i].name);
                 snprintf(out, out_sz, "%s", name);
                 return true;
             }
@@ -469,9 +525,29 @@ void dc_audio_device_set_volume(uint32_t id, int percent)
 {
     if (percent < 0)
         percent = 0;
-    /* TODO(T3): clamp to the per-device/default max-volume + alias lookup
-     * (docs/25-AUDIO-PERDEVICE-PLAN.md D4) -- not implemented yet, this is a
-     * plain non-negative clamp only. */
+
+    /* T3 D4: clamp to this device's configured max (dc_config_audio_max, by
+     * node.name). Looks the id up in both cached lists (a sink and a source
+     * id never collide in practice, but the `found` guard makes that
+     * assumption unnecessary); falls back to the plain 100 default if the id
+     * isn't in the cache at all (defensive -- shouldn't happen since a
+     * caller only ever has an id that came from dc_audio_sinks/sources). */
+    int max = 100;
+    bool found = false;
+    for (int i = 0; i < g_devices.n_sinks && !found; i++) {
+        if (g_devices.sinks[i].id == id) {
+            max = dc_config_audio_max(g_devices.sinks[i].name);
+            found = true;
+        }
+    }
+    for (int i = 0; i < g_devices.n_sources && !found; i++) {
+        if (g_devices.sources[i].id == id) {
+            max = dc_config_audio_max(g_devices.sources[i].name);
+            found = true;
+        }
+    }
+    if (percent > max)
+        percent = max;
 
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "wpctl set-volume %u %d%%", id, percent);
@@ -499,6 +575,20 @@ void dc_audio_device_toggle_mute(uint32_t id)
     }
 
     audio_devices_invalidate();
+}
+
+/* T3 D3: alias||desc lookup, the single place every dankc surface (OSD,
+ * settings, control-center) should go through for a device's display name
+ * instead of reading ->desc directly, so a configured alias (dankc-config-
+ * only, no wireplumber file, D3) is picked up everywhere at once. */
+const char *dc_audio_display_name(const dc_audio_device *dev)
+{
+    if (!dev)
+        return "";
+    const char *alias = dc_config_audio_alias(dev->name);
+    if (alias && alias[0])
+        return alias;
+    return dev->desc;
 }
 
 void dc_audio_set_default(uint32_t id)
