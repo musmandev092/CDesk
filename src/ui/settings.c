@@ -10,8 +10,10 @@
 #include "services/audio.h"
 #include "services/bluez.h"
 #include "services/display.h"
+#include "services/firewall.h"
 #include "services/net.h"
 #include "services/nightlight.h"
+#include "services/niri_input.h"
 #include "services/power.h"
 #include "services/printers.h"
 #include "services/weather.h"
@@ -111,6 +113,12 @@
  * tile -- already in the bundled font subset, no scripts/subset-fonts.sh
  * update needed. */
 #define IC_NIGHTLIGHT DC_ICON_NIGHTLIGHT
+/* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.5/7/8/9: Firewall (own glyph),
+ * Mouse/Touchpad/Keyboard (reuses the existing MOUSE glyph, already in the
+ * font subset via the Bluetooth device-type icons). Date & Time and Power
+ * idle/lid extend the existing TAB_TIME/TAB_POWER tabs, no new icon needed. */
+#define IC_SHIELD DC_ICON_SHIELD
+#define IC_MOUSE DC_ICON_MOUSE
 
 typedef enum {
     TAB_PERSONALIZATION = 0,
@@ -138,6 +146,12 @@ typedef enum {
     TAB_MUX,
     TAB_SYSTEM_UPDATER,
     TAB_PRINTER,
+    /* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.5/7/9: Firewall (ufw/
+     * firewalld) and Mouse/Touchpad/Keyboard (niri input fragment). Date &
+     * Time and Power idle/lid extend TAB_TIME/TAB_POWER above instead of
+     * adding new tabs (avoids sidebar bloat -- see those tabs' bodies). */
+    TAB_FIREWALL,
+    TAB_INPUT,
     TAB_USERS,
     TAB_ABOUT,
     TAB_COUNT,
@@ -162,6 +176,7 @@ static const s_tab_def TABS[TAB_COUNT] = {
     {IC_POWER, "Power"},                  {IC_LOCK_SCREEN, "Lock Screen"},
     {IC_WINDOW_RULES, "Window Rules"},    {IC_MUX, "Multiplexer"},
     {IC_SYSTEM_UPDATER, "System Updater"}, {IC_PRINTER, "Printer"},
+    {IC_SHIELD, "Firewall"},               {IC_MOUSE, "Mouse & Keyboard"},
     {IC_USERS, "Users"},                  {IC_INFO, "About"},
 };
 
@@ -3519,6 +3534,166 @@ static void tab_printer(uictx *c)
     ui_hint(c, "the CUPS web UI (http://localhost:631).");
 }
 
+/* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.5: Firewall -- thin view over
+ * services/firewall.c's ufw/firewalld dual backend. Per-service allow/deny is
+ * fire-and-forget (the backend exposes no per-service *query*, only ufw/
+ * firewall-cmd's own mutating verbs), so each common service gets a 2-way
+ * segmented control (Allow/Deny) with no persistent "current" selection
+ * rather than a toggle that would have to lie about its initial state. */
+static void tab_firewall(uictx *c)
+{
+    ui_section(c, "FIREWALL");
+    dc_firewall_info info;
+    bool have = dc_firewall_status(&info);
+    if (!have || !info.available) {
+        ui_hint(c, "No firewall backend detected (install ufw or firewalld).");
+        ui_hint(c, "dankc supports both -- whichever is present is used");
+        ui_hint(c, "automatically, no configuration needed here.");
+        return;
+    }
+
+    ui_value(c, "Backend", dc_firewall_backend_name(info.backend));
+
+    static opt_flip enabled_flip;
+    bool on = flip_get(&enabled_flip, info.enabled_known && info.enabled);
+    if (ui_toggle(c, "Firewall enabled", "Block unsolicited incoming connections", on)) {
+        dc_firewall_set_enabled(!on);
+        flip_set(&enabled_flip, !on);
+    }
+
+    if (info.backend == DC_FIREWALL_BACKEND_UFW && info.default_policy[0])
+        ui_value(c, "Default policy", info.default_policy);
+    if (info.backend == DC_FIREWALL_BACKEND_FIREWALLD && info.active_zone[0])
+        ui_value(c, "Active zone", info.active_zone);
+
+    ui_section(c, "COMMON SERVICES");
+    static const char *const allow_deny[2] = {"Allow", "Deny"};
+    for (int i = 0; i < DC_FIREWALL_COMMON_SERVICE_COUNT; i++) {
+        int clicked = ui_segmented(c, dc_firewall_common_services[i], allow_deny, 2, -1);
+        if (clicked >= 0)
+            dc_firewall_allow(dc_firewall_common_services[i], clicked == 0);
+    }
+    ui_hint(c, "Allow/Deny apply immediately (pkexec authenticates via dankc's");
+    ui_hint(c, "own polkit agent); there's no live per-service query to show a");
+    ui_hint(c, "current state, so these buttons don't reflect existing rules.");
+}
+
+/* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.7: Mouse/Touchpad/Keyboard --
+ * config.json holds the toggle states (so the UI has something to read back
+ * on the next Settings open), and every change immediately rewrites the niri
+ * fragment via services/niri_input.c (dankc-input.kdl, included from the
+ * user's real config.kdl once) so it takes effect the moment niri reloads
+ * its config (niri watches config.kdl and its includes for changes). */
+static void input_persist(const dc_config *cfg)
+{
+    dc_niri_input_config nc = {
+            .touchpad_tap = cfg->input_touchpad_tap,
+            .touchpad_natural_scroll = cfg->input_touchpad_natural_scroll,
+            .touchpad_dwt = cfg->input_touchpad_dwt,
+            .touchpad_disabled_on_external_mouse =
+                    cfg->input_touchpad_disabled_on_external_mouse,
+            .touchpad_accel_enabled = cfg->input_touchpad_accel_enabled,
+            .touchpad_accel_speed = cfg->input_touchpad_accel_speed,
+            .mouse_natural_scroll = cfg->input_mouse_natural_scroll,
+            .mouse_accel_enabled = cfg->input_mouse_accel_enabled,
+            .mouse_accel_speed = cfg->input_mouse_accel_speed,
+            .keyboard_numlock = cfg->input_keyboard_numlock,
+            .keyboard_layout = cfg->input_keyboard_layout[0] ? cfg->input_keyboard_layout : NULL,
+    };
+    dc_niri_input_persist(&nc, NULL);
+}
+
+static void tab_input(uictx *c)
+{
+    ui_section(c, "TOUCHPAD");
+    if (ui_toggle(c, "Tap to click", NULL, c->cfg->input_touchpad_tap)) {
+        c->cfg->input_touchpad_tap = !c->cfg->input_touchpad_tap;
+        c->changed = true;
+        input_persist(c->cfg);
+    }
+    if (ui_toggle(c, "Natural scrolling", "Content follows finger movement",
+                  c->cfg->input_touchpad_natural_scroll)) {
+        c->cfg->input_touchpad_natural_scroll = !c->cfg->input_touchpad_natural_scroll;
+        c->changed = true;
+        input_persist(c->cfg);
+    }
+    if (ui_toggle(c, "Disable while typing", NULL, c->cfg->input_touchpad_dwt)) {
+        c->cfg->input_touchpad_dwt = !c->cfg->input_touchpad_dwt;
+        c->changed = true;
+        input_persist(c->cfg);
+    }
+    if (ui_toggle(c, "Disable when a mouse is plugged in", NULL,
+                  c->cfg->input_touchpad_disabled_on_external_mouse)) {
+        c->cfg->input_touchpad_disabled_on_external_mouse =
+                !c->cfg->input_touchpad_disabled_on_external_mouse;
+        c->changed = true;
+        input_persist(c->cfg);
+    }
+    if (ui_toggle(c, "Custom pointer speed", "Otherwise niri's own default is used",
+                  c->cfg->input_touchpad_accel_enabled)) {
+        c->cfg->input_touchpad_accel_enabled = !c->cfg->input_touchpad_accel_enabled;
+        c->changed = true;
+        input_persist(c->cfg);
+    }
+    if (c->cfg->input_touchpad_accel_enabled) {
+        char v[16];
+        snprintf(v, sizeof(v), "%.2f", (double)c->cfg->input_touchpad_accel_speed);
+        if (ui_slider(c, "Touchpad speed", &c->cfg->input_touchpad_accel_speed, -1.0f, 1.0f, v)) {
+            c->changed = true;
+            input_persist(c->cfg);
+        }
+    }
+
+    ui_section(c, "MOUSE");
+    if (ui_toggle(c, "Natural scrolling", NULL, c->cfg->input_mouse_natural_scroll)) {
+        c->cfg->input_mouse_natural_scroll = !c->cfg->input_mouse_natural_scroll;
+        c->changed = true;
+        input_persist(c->cfg);
+    }
+    if (ui_toggle(c, "Custom pointer speed", "Otherwise niri's own default is used",
+                  c->cfg->input_mouse_accel_enabled)) {
+        c->cfg->input_mouse_accel_enabled = !c->cfg->input_mouse_accel_enabled;
+        c->changed = true;
+        input_persist(c->cfg);
+    }
+    if (c->cfg->input_mouse_accel_enabled) {
+        char v[16];
+        snprintf(v, sizeof(v), "%.2f", (double)c->cfg->input_mouse_accel_speed);
+        if (ui_slider(c, "Mouse speed", &c->cfg->input_mouse_accel_speed, -1.0f, 1.0f, v)) {
+            c->changed = true;
+            input_persist(c->cfg);
+        }
+    }
+
+    ui_section(c, "KEYBOARD");
+    if (ui_toggle(c, "Enable Num Lock at startup", NULL, c->cfg->input_keyboard_numlock)) {
+        c->cfg->input_keyboard_numlock = !c->cfg->input_keyboard_numlock;
+        c->changed = true;
+        input_persist(c->cfg);
+    }
+    bool layout_focus = c->s->focus_field == 11;
+    char layoutbuf[32];
+    if (layout_focus)
+        copy_trunc(layoutbuf, sizeof(layoutbuf), c->s->edit_buf);
+    else
+        snprintf(layoutbuf, sizeof(layoutbuf), "%s", c->cfg->input_keyboard_layout);
+    if (ui_textfield(c, "Keyboard layout (xkb, e.g. \"us\" or \"us,ru\")", layoutbuf,
+                     layout_focus)) {
+        c->s->focus_field = 11;
+        snprintf(c->s->edit_buf, sizeof(c->s->edit_buf), "%s", c->cfg->input_keyboard_layout);
+    }
+    ui_hint(c, "Leave blank to keep niri's own configured/default layout.");
+
+    ui_section(c, "APPLY");
+    dc_niri_input_validate_result vr = dc_niri_input_last_validate();
+    if (vr == DC_NIRI_INPUT_VALIDATE_FAILED)
+        ui_hint(c, "niri validate reported a problem with the written config -- check logs.");
+    else if (vr == DC_NIRI_INPUT_VALIDATE_OK)
+        ui_hint(c, "Written to ~/.config/niri/dankc-input.kdl -- niri validate passed.");
+    else
+        ui_hint(c, "Written to ~/.config/niri/dankc-input.kdl -- applies on niri's next reload.");
+}
+
 /* docs/14-COMPLETION-PLAN.md W5.4: current-user info, read-only (lowest
  * priority in the whole plan -- mostly irrelevant on a single-user desktop,
  * per the task). No user-switching UI: dankc has no greeter/multi-seat
@@ -3675,6 +3850,12 @@ static void build_tab(uictx *c)
     case TAB_PRINTER:
         tab_printer(c);
         break;
+    case TAB_FIREWALL:
+        tab_firewall(c);
+        break;
+    case TAB_INPUT:
+        tab_input(c);
+        break;
     case TAB_USERS:
         tab_users(c);
         break;
@@ -3760,6 +3941,10 @@ static void commit_edit(dc_settings *s)
         break;
     case 10: /* network hotspot password draft */
         copy_trunc(s->net_hotspot_password, sizeof(s->net_hotspot_password), s->edit_buf);
+        break;
+    case 11: /* niri input tab keyboard xkb layout */
+        copy_trunc(cfg->input_keyboard_layout, sizeof(cfg->input_keyboard_layout), s->edit_buf);
+        input_persist(cfg);
         break;
     default:
         break;
