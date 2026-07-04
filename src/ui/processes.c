@@ -8,6 +8,7 @@
 #include "render/nvg.h"
 #include "services/sysmon.h"
 #include "theme/theme.h"
+#include "ui/connected.h"
 #include "ui/popout.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
@@ -44,6 +45,20 @@
 #define DC_PS_RADIUS 14.0f
 #define DC_PS_INSET 16.0f /* left/right content inset inside the card */
 
+/* Logical surface width. DC_PS_WIDTH already bakes in the floating chrome's
+ * flat 6px pad on every side; connected_frame widens the lateral (side) pad
+ * to 12 for the connector fillets (dc_popout_chrome_pads()), so the surface
+ * needs 2*(pad_side-6) more logical px to keep the card CONTENT rect --
+ * inset by pad_side + DC_PS_INSET, see ps_get_layout() -- exactly where it
+ * sits when floating (mirrors controlcenter.c's cc_surface_width()).
+ * connected_frame off: pad_side==6, so this is just DC_PS_WIDTH, unchanged. */
+static int ps_surface_width(void)
+{
+    int pad_side = 6;
+    dc_popout_chrome_pads(dc_config_current, NULL, &pad_side, NULL);
+    return DC_PS_WIDTH + 2 * (pad_side - 6);
+}
+
 #define DC_PS_HEADER_TOP 14.0f
 #define DC_PS_HEADER_H 32.0f
 #define DC_PS_INFO_GAP 14.0f
@@ -70,7 +85,7 @@ typedef enum {
 /* Shared layout so ps_render (draw) and the click/scroll handlers agree --
  * same convention as controlcenter.c's cc_layout / clip_picker.c's cp_layout. */
 typedef struct {
-    float pad, ix, iw;
+    float pad_side, ix, iw;
     float header_y, header_h;
     float info_y, info_h;
     float thead_y, thead_h;
@@ -79,18 +94,30 @@ typedef struct {
 
 static ps_layout ps_get_layout(float w, float h)
 {
+    /* Card-fill padding (docs/27-CONNECTED-FRAME-PLAN.md T5): floating
+     * chrome reserves a flat 6px of shadow room on all four sides;
+     * connected chrome widens the lateral (side) pad to 12 for the
+     * connector fillets and drops the bar-facing (near) pad to 0, leaving
+     * the far pad at 6 -- see dc_popout_chrome_pads(). Which physical edge
+     * is "near" vs "far" swaps with bar_position. */
+    int pad_near, pad_side, pad_far;
+    dc_popout_chrome_pads(dc_config_current, &pad_near, &pad_side, &pad_far);
+    const bool bottom_bar = dc_config_current->bar_position == DC_BAR_POSITION_BOTTOM;
+    const float pad_top = bottom_bar ? (float)pad_far : (float)pad_near;
+    const float pad_bottom = bottom_bar ? (float)pad_near : (float)pad_far;
+
     ps_layout l;
-    l.pad = DC_PS_PAD;
-    l.ix = l.pad + DC_PS_INSET;
+    l.pad_side = (float)pad_side;
+    l.ix = l.pad_side + DC_PS_INSET;
     l.iw = w - 2.0f * l.ix;
-    l.header_y = l.pad + DC_PS_HEADER_TOP;
+    l.header_y = pad_top + DC_PS_HEADER_TOP;
     l.header_h = DC_PS_HEADER_H;
     l.info_y = l.header_y + l.header_h + DC_PS_INFO_GAP;
     l.info_h = DC_PS_INFO_H;
     l.thead_y = l.info_y + l.info_h + DC_PS_THEAD_GAP;
     l.thead_h = DC_PS_THEAD_H;
     l.list_y0 = l.thead_y + l.thead_h + DC_PS_LIST_GAP;
-    l.list_y1 = h - l.pad - DC_PS_BOTTOM_PAD;
+    l.list_y1 = h - pad_bottom - DC_PS_BOTTOM_PAD;
     l.list_h = l.list_y1 - l.list_y0;
     return l;
 }
@@ -596,7 +623,12 @@ static void ps_render(dc_processes *ps)
     NVGcontext *vg = ps->render->vg;
     const dc_theme *t = dc_theme_current;
     const float w = ps->logical_width, h = ps->logical_height;
-    const float pad = DC_PS_PAD;
+    const bool bottom_bar = dc_config_current->bar_position == DC_BAR_POSITION_BOTTOM;
+    int pad_near, pad_side, pad_far;
+    dc_popout_chrome_pads(dc_config_current, &pad_near, &pad_side, &pad_far);
+    const float pad_top = bottom_bar ? (float)pad_far : (float)pad_near;
+    const float pad_bottom = bottom_bar ? (float)pad_near : (float)pad_far;
+    const float pad_side_f = (float)pad_side;
 
     glViewport(0, 0, ps->phys_width, ps->phys_height);
     glClearColor(0, 0, 0, 0);
@@ -608,28 +640,17 @@ static void ps_render(dc_processes *ps)
         pr = 1.0f - (pr > 1.0f ? 1.0f : pr);
     float alpha = pr > 1.0f ? 1.0f : pr;
     float scale = 0.94f + 0.06f * pr;
-    float ox = pad + (w - 2.0f * pad) * ps->anim_ox;
-    float oy = pad + (h - 2.0f * pad) * ps->anim_oy;
+    float ox = pad_side_f + (w - 2.0f * pad_side_f) * ps->anim_ox;
+    float oy = pad_top + (h - pad_top - pad_bottom) * ps->anim_oy;
     nvgGlobalAlpha(vg, alpha);
     nvgTranslate(vg, ox, oy);
     nvgScale(vg, scale, scale);
     nvgTranslate(vg, -ox, -oy);
 
-    NVGpaint shadow = nvgBoxGradient(vg, pad, pad + 2.0f, w - 2 * pad, h - 2 * pad, DC_PS_RADIUS,
-                                     18.0f, nvgRGBA(0, 0, 0, 100), nvgRGBA(0, 0, 0, 0));
-    nvgBeginPath(vg);
-    nvgRect(vg, 0, 0, w, h);
-    nvgRoundedRect(vg, pad, pad, w - 2 * pad, h - 2 * pad, DC_PS_RADIUS);
-    nvgPathWinding(vg, NVG_HOLE);
-    nvgFillPaint(vg, shadow);
-    nvgFill(vg);
-    nvgBeginPath(vg);
-    nvgRoundedRect(vg, pad, pad, w - 2 * pad, h - 2 * pad, DC_PS_RADIUS);
-    nvgFillColor(vg, tc(t->surface_container));
-    nvgFill(vg);
-    nvgStrokeColor(vg, tc_alpha(t->outline, 40));
-    nvgStrokeWidth(vg, 1.0f);
-    nvgStroke(vg);
+    /* Card chrome: shadow + fill + outline, floating or stitched into the
+     * bar depending on connected_frame -- see ui/connected.h. Byte-identical
+     * to the old inline floating-chrome block when the toggle is off. */
+    dc_connected_card_chrome(vg, ps->render, w, h, bottom_bar);
 
     ps_layout l = ps_get_layout(w, h);
 
@@ -890,7 +911,7 @@ static void layer_surface_handle_configure(void *data, struct zwlr_layer_surface
 {
     dc_processes *ps = data;
     zwlr_layer_surface_v1_ack_configure(surface, serial);
-    ps->logical_width = width > 0 ? (int)width : DC_PS_WIDTH;
+    ps->logical_width = width > 0 ? (int)width : ps_surface_width();
     ps->logical_height = height > 0 ? (int)height : DC_PS_HEIGHT;
     ps->configured = true;
     recompute_physical(ps);
@@ -913,7 +934,7 @@ dc_processes *dc_processes_create(dc_wayland *wl, dc_egl *egl, dc_render *render
     ps->wl = wl;
     ps->egl = egl;
     ps->render = render;
-    ps->logical_width = DC_PS_WIDTH;
+    ps->logical_width = ps_surface_width();
     ps->logical_height = DC_PS_HEIGHT;
     ps->scale120 = DC_SCALE_BASE;
     ps->sort = DC_PROCESSES_SORT_CPU;
@@ -959,7 +980,8 @@ static void ps_show(dc_processes *ps, dc_output *output, dc_processes_sort sort)
     ps->anim_ox = pa.origin_x;
     ps->anim_oy = pa.origin_y;
     zwlr_layer_surface_v1_set_anchor(ps->layer_surface, pa.anchor);
-    zwlr_layer_surface_v1_set_size(ps->layer_surface, DC_PS_WIDTH, DC_PS_HEIGHT);
+    ps->logical_width = ps_surface_width();
+    zwlr_layer_surface_v1_set_size(ps->layer_surface, (uint32_t)ps->logical_width, DC_PS_HEIGHT);
     zwlr_layer_surface_v1_set_margin(ps->layer_surface, pa.margin_top, pa.margin_right,
                                      pa.margin_bottom, pa.margin_left);
     zwlr_layer_surface_v1_set_keyboard_interactivity(

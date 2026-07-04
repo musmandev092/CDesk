@@ -8,6 +8,7 @@
 #include "services/dbus.h"
 #include "services/tray.h"
 #include "theme/theme.h"
+#include "ui/connected.h"
 #include "ui/popout.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
@@ -36,6 +37,20 @@
 #define DC_TM_SIDE_MARGIN 12 /* approximation of "near the tray cluster" -- see popout.h */
 
 #define DC_DBUSMENU_IFACE "com.canonical.dbusmenu"
+
+/* Logical surface width. DC_TM_WIDTH already bakes in the floating chrome's
+ * flat 6px pad on every side; connected_frame widens the lateral (side) pad
+ * to 12 for the connector fillets (dc_popout_chrome_pads()), so the surface
+ * needs 2*(pad_side-6) more logical px to keep the card CONTENT rect --
+ * inset by pad_side + DC_TM_MARGIN, see tm_row_rect()/tm_render() -- exactly
+ * where it sits when floating (mirrors controlcenter.c's cc_surface_width()).
+ * connected_frame off: pad_side==6, so this is just DC_TM_WIDTH, unchanged. */
+static int tm_surface_width(void)
+{
+    int pad_side = 6;
+    dc_popout_chrome_pads(dc_config_current, NULL, &pad_side, NULL);
+    return DC_TM_WIDTH + 2 * (pad_side - 6);
+}
 
 typedef struct {
     int32_t id;
@@ -278,9 +293,21 @@ static float tm_content_height(dc_tray_menu *m)
     return h;
 }
 
+/* Bar-facing (near) edge pad (docs/27-CONNECTED-FRAME-PLAN.md T5): 0 in
+ * connected mode, DC_TM_PAD (6) floating -- mirrors dc_popout_chrome_pads(),
+ * self-contained here the same way controlcenter.c's cc_get_layout() reads
+ * dc_config_current directly rather than threading it through callers. */
+static float tm_pad_top(void)
+{
+    int pad_near, pad_far;
+    dc_popout_chrome_pads(dc_config_current, &pad_near, NULL, &pad_far);
+    const bool bottom_bar = dc_config_current->bar_position == DC_BAR_POSITION_BOTTOM;
+    return bottom_bar ? (float)pad_far : (float)pad_near;
+}
+
 static void tm_row_rect(dc_tray_menu *m, int index, float *out_y0, float *out_y1)
 {
-    float y = DC_TM_PAD + DC_TM_MARGIN;
+    float y = tm_pad_top() + DC_TM_MARGIN;
     for (int i = 0; i < index; i++)
         y += m->items[i].is_separator ? DC_TM_SEP_H : DC_TM_ROW_H;
     *out_y0 = y;
@@ -318,7 +345,12 @@ static void tm_render(dc_tray_menu *m)
     const dc_theme *t = dc_theme_current;
     const float w = (float)m->logical_width;
     const float h = (float)m->logical_height;
-    const float pad = DC_TM_PAD;
+    const bool bottom_bar = dc_config_current->bar_position == DC_BAR_POSITION_BOTTOM;
+    int pad_near, pad_side, pad_far;
+    dc_popout_chrome_pads(dc_config_current, &pad_near, &pad_side, &pad_far);
+    const float pad_top = bottom_bar ? (float)pad_far : (float)pad_near;
+    const float pad_bottom = bottom_bar ? (float)pad_near : (float)pad_far;
+    const float pad_side_f = (float)pad_side;
 
     glViewport(0, 0, m->phys_width, m->phys_height);
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
@@ -331,30 +363,17 @@ static void tm_render(dc_tray_menu *m)
         p = 1.0f - (p > 1.0f ? 1.0f : p);
     float alpha = p > 1.0f ? 1.0f : p;
     float scale = 0.94f + 0.06f * p;
-    float ox = pad + (w - 2.0f * pad) * m->anim_ox;
-    float oy = pad + (h - 2.0f * pad) * m->anim_oy;
+    float ox = pad_side_f + (w - 2.0f * pad_side_f) * m->anim_ox;
+    float oy = pad_top + (h - pad_top - pad_bottom) * m->anim_oy;
     nvgGlobalAlpha(vg, alpha);
     nvgTranslate(vg, ox, oy);
     nvgScale(vg, scale, scale);
     nvgTranslate(vg, -ox, -oy);
 
-    NVGpaint shadow = nvgBoxGradient(vg, pad, pad + 2.0f, w - 2 * pad, h - 2 * pad, 12.0f, 18.0f,
-                                     nvgRGBA(0, 0, 0, 90), nvgRGBA(0, 0, 0, 0));
-    nvgBeginPath(vg);
-    nvgRect(vg, 0, 0, w, h);
-    nvgRoundedRect(vg, pad, pad, w - 2 * pad, h - 2 * pad, 12.0f);
-    nvgPathWinding(vg, NVG_HOLE);
-    nvgFillPaint(vg, shadow);
-    nvgFill(vg);
-
-    nvgBeginPath(vg);
-    nvgRoundedRect(vg, pad, pad, w - 2 * pad, h - 2 * pad, 12.0f);
-    nvgFillColor(vg, nvgRGBA(t->surface_container.r, t->surface_container.g, t->surface_container.b,
-                             255));
-    nvgFill(vg);
-    nvgStrokeColor(vg, nvgRGBA(t->outline.r, t->outline.g, t->outline.b, 40));
-    nvgStrokeWidth(vg, 1.0f);
-    nvgStroke(vg);
+    /* Card chrome: shadow + fill + outline, floating or stitched into the
+     * bar depending on connected_frame -- see ui/connected.h. Byte-identical
+     * to the old inline floating-chrome block when the toggle is off. */
+    dc_connected_card_chrome(vg, m->render, w, h, bottom_bar);
 
     for (int i = 0; i < m->count; i++) {
         const dc_tm_item *it = &m->items[i];
@@ -364,19 +383,20 @@ static void tm_render(dc_tray_menu *m)
         if (it->is_separator) {
             float ly = (y0 + y1) / 2.0f;
             nvgBeginPath(vg);
-            nvgMoveTo(vg, pad + DC_TM_MARGIN, ly);
-            nvgLineTo(vg, w - pad - DC_TM_MARGIN, ly);
+            nvgMoveTo(vg, pad_side_f + DC_TM_MARGIN, ly);
+            nvgLineTo(vg, w - pad_side_f - DC_TM_MARGIN, ly);
             nvgStrokeColor(vg, tc_alpha(t->outline, 60));
             nvgStrokeWidth(vg, 1.0f);
             nvgStroke(vg);
             continue;
         }
 
-        float text_x = pad + DC_TM_MARGIN + (float)it->depth * DC_TM_INDENT;
+        float text_x = pad_side_f + DC_TM_MARGIN + (float)it->depth * DC_TM_INDENT;
         float cy = (y0 + y1) / 2.0f;
 
         nvgSave(vg);
-        nvgScissor(vg, pad + DC_TM_MARGIN, y0, w - 2.0f * (pad + DC_TM_MARGIN), y1 - y0);
+        nvgScissor(vg, pad_side_f + DC_TM_MARGIN, y0, w - 2.0f * (pad_side_f + DC_TM_MARGIN),
+                  y1 - y0);
         nvgFontFaceId(vg, m->render->font_ui);
         nvgFontSize(vg, 13.0f);
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
@@ -390,7 +410,8 @@ static void tm_render(dc_tray_menu *m)
         nvgFontSize(vg, 13.0f);
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, tc_alpha(t->surface_text, 140));
-        nvgText(vg, pad + DC_TM_MARGIN, pad + DC_TM_MARGIN + DC_TM_ROW_H / 2.0f, "(empty)", NULL);
+        nvgText(vg, pad_side_f + DC_TM_MARGIN, pad_top + DC_TM_MARGIN + DC_TM_ROW_H / 2.0f,
+               "(empty)", NULL);
     }
 
     nvgEndFrame(vg);
@@ -421,7 +442,7 @@ static void layer_surface_handle_configure(void *data, struct zwlr_layer_surface
 {
     dc_tray_menu *m = data;
     zwlr_layer_surface_v1_ack_configure(surface, serial);
-    m->logical_width = width > 0 ? (int)width : DC_TM_WIDTH;
+    m->logical_width = width > 0 ? (int)width : tm_surface_width();
     m->logical_height = height > 0 ? (int)height : m->logical_height;
     m->configured = true;
     recompute_physical(m);
@@ -449,7 +470,7 @@ dc_tray_menu *dc_tray_menu_create(dc_wayland *wl, dc_egl *egl, dc_render *render
     m->render = render;
     m->dbus = dbus;
     m->tray = tray;
-    m->logical_width = DC_TM_WIDTH;
+    m->logical_width = tm_surface_width();
     m->scale120 = DC_SCALE_BASE;
     return m;
 }
@@ -534,7 +555,7 @@ void dc_tray_menu_open(dc_tray_menu *m, dc_output *output, int tray_index, int x
     m->configured = false;
     m->egl_ready = false;
     m->scale120 = (output && output->scale > 0 ? output->scale : 1) * DC_SCALE_BASE;
-    m->logical_width = DC_TM_WIDTH;
+    m->logical_width = tm_surface_width();
     m->logical_height = (int)tm_content_height(m);
     dc_anim_start(&m->anim, DC_DUR_MEDIUM, DC_EASE_EXPRESSIVE);
 

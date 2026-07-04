@@ -9,8 +9,8 @@
 #include "render/shape.h"
 #include "services/notifications.h"
 #include "theme/theme.h"
+#include "ui/connected.h"
 #include "ui/hover.h"
-#include "ui/material_bg.h"
 #include "ui/notif_image.h"
 #include "ui/popout.h"
 #include "wayland/egl.h"
@@ -42,6 +42,20 @@
 #define DC_NC_PAD 6.0f    /* outer gutter for the drop shadow */
 #define DC_NC_RADIUS 14.0f
 #define DC_NC_INSET 16.0f /* left/right content inset inside the card */
+
+/* Logical surface width. DC_NC_WIDTH already bakes in the floating chrome's
+ * flat 6px pad on every side; connected_frame widens the lateral (side) pad
+ * to 12 for the connector fillets (dc_popout_chrome_pads()), so the surface
+ * needs 2*(pad_side-6) more logical px to keep the card CONTENT rect --
+ * inset by pad_side + DC_NC_INSET, see nc_render() -- exactly where it sits
+ * when floating (mirrors controlcenter.c's cc_surface_width()).
+ * connected_frame off: pad_side==6, so this is just DC_NC_WIDTH, unchanged. */
+static int nc_surface_width(void)
+{
+    int pad_side = 6;
+    dc_popout_chrome_pads(dc_config_current, NULL, &pad_side, NULL);
+    return DC_NC_WIDTH + 2 * (pad_side - 6);
+}
 
 #define DC_NC_HEADER_TOP 14.0f
 #define DC_NC_HEADER_H 28.0f
@@ -865,8 +879,13 @@ static void nc_render(dc_notif_center *nc)
     const dc_theme *t = dc_theme_current;
     const float w = nc->logical_width;
     const float h = nc->logical_height;
-    const float pad = DC_NC_PAD;
-    const float ix = pad + DC_NC_INSET;
+    const bool bottom_bar = dc_config_current->bar_position == DC_BAR_POSITION_BOTTOM;
+    int pad_near, pad_side, pad_far;
+    dc_popout_chrome_pads(dc_config_current, &pad_near, &pad_side, &pad_far);
+    const float pad_top = bottom_bar ? (float)pad_far : (float)pad_near;
+    const float pad_bottom = bottom_bar ? (float)pad_near : (float)pad_far;
+    const float pad_side_f = (float)pad_side;
+    const float ix = pad_side_f + DC_NC_INSET;
     const float iw = w - 2.0f * ix;
 
     glViewport(0, 0, nc->phys_width, nc->phys_height);
@@ -880,32 +899,20 @@ static void nc_render(dc_notif_center *nc)
         p = 1.0f - (p > 1.0f ? 1.0f : p);
     float alpha = p > 1.0f ? 1.0f : p;
     float scale = 0.94f + 0.06f * p;
-    float ox = pad + (w - 2.0f * pad) * nc->anim_ox;
-    float oy = pad + (h - 2.0f * pad) * nc->anim_oy;
+    float ox = pad_side_f + (w - 2.0f * pad_side_f) * nc->anim_ox;
+    float oy = pad_top + (h - pad_top - pad_bottom) * nc->anim_oy;
     nvgGlobalAlpha(vg, alpha);
     nvgTranslate(vg, ox, oy);
     nvgScale(vg, scale, scale);
     nvgTranslate(vg, -ox, -oy);
 
-    /* Shadow + card. */
-    NVGpaint shadow = nvgBoxGradient(vg, pad, pad + 2.0f, w - 2 * pad, h - 2 * pad, DC_NC_RADIUS,
-                                     18.0f, nvgRGBA(0, 0, 0, 100), nvgRGBA(0, 0, 0, 0));
-    nvgBeginPath(vg);
-    nvgRect(vg, 0, 0, w, h);
-    nvgRoundedRect(vg, pad, pad, w - 2 * pad, h - 2 * pad, DC_NC_RADIUS);
-    nvgPathWinding(vg, NVG_HOLE);
-    nvgFillPaint(vg, shadow);
-    nvgFill(vg);
-
-    /* Card: blurred+dimmed wallpaper ("material" bg) when enabled, else the
-     * flat surfaceContainer fill (docs/POLISH.md P2, ui/material_bg.c). */
-    dc_material_bg_fill_card(vg, nc->render, pad, pad, w - 2 * pad, h - 2 * pad, DC_NC_RADIUS);
-    nvgStrokeColor(vg, tc_alpha(t->outline, 40));
-    nvgStrokeWidth(vg, 1.0f);
-    nvgStroke(vg);
+    /* Card chrome: shadow + fill + outline, floating or stitched into the
+     * bar depending on connected_frame -- see ui/connected.h. Byte-identical
+     * to the old inline floating-chrome block when the toggle is off. */
+    dc_connected_card_chrome(vg, nc->render, w, h, bottom_bar);
 
     /* --- Header: "Notifications" + bell (left); gear + Clear (right) --- */
-    const float header_y = pad + DC_NC_HEADER_TOP;
+    const float header_y = pad_top + DC_NC_HEADER_TOP;
     const float header_cy = header_y + DC_NC_HEADER_H / 2.0f;
 
     nvgFontFaceId(vg, nc->render->font_ui);
@@ -1072,7 +1079,7 @@ static void nc_render(dc_notif_center *nc)
      * card, no header. Groups are built in first-seen order over `entries`
      * (already newest-first), so a group's position tracks its most recent
      * member with no separate sort needed. */
-    const float list_y1 = h - pad - DC_NC_BOTTOM_PAD;
+    const float list_y1 = h - pad_bottom - DC_NC_BOTTOM_PAD;
     const float list_h = list_y1 - list_y0;
 
     const dc_notification *entries[DC_NC_MAX_CARDS];
@@ -1283,7 +1290,7 @@ static void layer_surface_handle_configure(void *data, struct zwlr_layer_surface
 {
     dc_notif_center *nc = data;
     zwlr_layer_surface_v1_ack_configure(surface, serial);
-    nc->logical_width = width > 0 ? (int)width : DC_NC_WIDTH;
+    nc->logical_width = width > 0 ? (int)width : nc_surface_width();
     nc->logical_height = height > 0 ? (int)height : DC_NC_HEIGHT;
     nc->configured = true;
     recompute_physical(nc);
@@ -1310,7 +1317,7 @@ dc_notif_center *dc_notif_center_create(dc_wayland *wl, dc_egl *egl, dc_render *
     nc->egl = egl;
     nc->render = render;
     nc->notifications = notifications;
-    nc->logical_width = DC_NC_WIDTH;
+    nc->logical_width = nc_surface_width();
     nc->logical_height = DC_NC_HEIGHT;
     nc->scale120 = DC_SCALE_BASE;
     nc->tab = DC_NC_TAB_CURRENT;
@@ -1344,7 +1351,8 @@ static void nc_show(dc_notif_center *nc, dc_output *output)
     nc->anim_ox = pa.origin_x;
     nc->anim_oy = pa.origin_y;
     zwlr_layer_surface_v1_set_anchor(nc->layer_surface, pa.anchor);
-    zwlr_layer_surface_v1_set_size(nc->layer_surface, DC_NC_WIDTH, DC_NC_HEIGHT);
+    nc->logical_width = nc_surface_width();
+    zwlr_layer_surface_v1_set_size(nc->layer_surface, (uint32_t)nc->logical_width, DC_NC_HEIGHT);
     zwlr_layer_surface_v1_set_margin(nc->layer_surface, pa.margin_top, pa.margin_right,
                                      pa.margin_bottom, pa.margin_left);
     zwlr_layer_surface_v1_add_listener(nc->layer_surface, &layer_surface_listener, nc);
