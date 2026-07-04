@@ -249,6 +249,10 @@ static void clock_tick(void *data)
      * self-limits its own sysfs read to ~5s, so calling every tick is cheap. */
     dc_battery_auto_tick(ctx->notifications);
     dc_lock_tick(ctx->lock);
+    /* Wallpaper cycling (docs/29-SMALL-FEATURES-PLAN.md sec.3, T3): self-
+     * limits to wallpaperCycleIntervalSec and pauses while the session lock
+     * is engaged. */
+    dc_wallpaper_cycle_tick(dc_lock_active(ctx->lock));
     dc_notepad_tick(ctx->notepad); /* autosave debounce check (docs/22-NOTEPAD-PLAN.md NT4) */
     dc_sysmon_poll(); /* self-limits to 3s (docs/12-BAR-SPEC.md sec.4 cpuUsage/memUsage) */
     /* Both self-limit/no-op while the Processes popout is closed (docs/13-
@@ -701,6 +705,11 @@ static void control_dispatch(const char *cmd, void *data)
             dc_config_notify_changed();
         }
     }
+    else if (strcmp(cmd, "wallpaper next") == 0)
+        /* Manual trigger for the same advance dc_wallpaper_cycle_tick() fires
+         * on its own timer (docs/29-SMALL-FEATURES-PLAN.md sec.3, T3) --
+         * useful for a keybind/testing regardless of wallpaperCycleEnabled. */
+        dc_wallpaper_cycle_next();
     else if (strcmp(cmd, "record start") == 0)
         dc_screenrec_start(c->notifications, false);
     else if (strcmp(cmd, "record region") == 0)
@@ -763,7 +772,7 @@ static void print_keybinds(void)
            "    Mod+Shift+T          { spawn \"dankc\" \"ctl\" \"theme\" \"dark\"; }\n"
            "                         // also: \"theme\" \"light\" | \"auto\", \"theme\" \"dynamic\" \"on\"|\"off\"\n"
            "                         // \"profile\" \"performance\"|\"balanced\"|\"powersaver\"\n"
-           "                         // \"wallpaper\" \"set\" \"<path>\", \"volume\"/\"brightness\" \"set\" \"<0-100>\"\n"
+           "                         // \"wallpaper\" \"set\" \"<path>\" | \"next\", \"volume\"/\"brightness\" \"set\" \"<0-100>\"\n"
            "    Mod+Shift+R          { spawn \"dankc\" \"ctl\" \"record\" \"toggle\"; }\n"
            "                         // also: \"record\" \"start\"|\"region\"|\"stop\"\n"
            "                         // \"night\" \"on\"|\"off\" (plain \"night\" still toggles)\n");
