@@ -123,6 +123,17 @@ typedef struct dc_wayland {
     dc_key_cb key_cb;
     void *key_data;
 
+    /* Key-repeat state (docs/22-NOTEPAD-PLAN.md sec.2.6): the currently-held
+     * repeatable key, if any, and a timerfd the event loop drives to
+     * re-invoke key_cb at the compositor's configured repeat rate. `xkb`
+     * keycodes are >=8, so 0 doubles as "no key repeating" sentinel. */
+    int repeat_timerfd;
+    uint32_t repeat_keycode;
+    uint32_t repeat_keysym;
+    char repeat_utf8[64];
+    int32_t repeat_rate;  /* repeats/sec, from wl_keyboard.repeat_info */
+    int32_t repeat_delay; /* ms before the first repeat, from repeat_info */
+
     struct wl_list outputs; /* dc_output.link */
 } dc_wayland;
 
@@ -160,5 +171,18 @@ void dc_wayland_destroy(dc_wayland *wl);
 /* Register the Wayland fd with the event loop (flush on prepare, dispatch on
  * readable). Call once after connecting. */
 void dc_wayland_integrate(dc_wayland *wl, struct dc_loop *loop);
+
+/* Key-repeat plumbing (docs/22-NOTEPAD-PLAN.md sec.2.6). The fd fires at the
+ * compositor's configured repeat delay/rate while a repeatable key is held;
+ * the caller registers it with dc_loop_add_fd() and calls
+ * dc_wayland_repeat_fire() when it's readable, which re-invokes the current
+ * key_cb with the held key's (keysym, utf8) -- the same path a real press
+ * takes, so every panel that already handles dc_key_cb benefits for free. */
+int dc_wayland_repeat_fd(dc_wayland *wl);
+void dc_wayland_repeat_fire(dc_wayland *wl);
+
+/* Modifier state helpers (for the notepad editor's Ctrl/Shift shortcuts). */
+bool dc_wayland_ctrl_down(dc_wayland *wl);
+bool dc_wayland_shift_down(dc_wayland *wl);
 
 #endif /* DC_WAYLAND_WL_H */
