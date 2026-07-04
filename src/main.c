@@ -232,6 +232,26 @@ static int read_brightness_percent(struct tick_ctx *ctx)
     return percent;
 }
 
+/* True if `id` appears in any of the bar's left/center/right widget arrays
+ * (docs/29-SMALL-FEATURES-PLAN.md sec.5 T3: gates the screenRecorder
+ * liveness poll below so it's skipped entirely for users who never opted
+ * into the widget -- mirrors settings.c's file-local widget_in() helper,
+ * which isn't reachable from here). */
+static bool bar_widget_configured(const char *id)
+{
+    const dc_config *cfg = dc_config_current;
+    for (int i = 0; i < cfg->bar_left_widgets_n; i++)
+        if (strcmp(cfg->bar_left_widgets[i], id) == 0)
+            return true;
+    for (int i = 0; i < cfg->bar_center_widgets_n; i++)
+        if (strcmp(cfg->bar_center_widgets[i], id) == 0)
+            return true;
+    for (int i = 0; i < cfg->bar_right_widgets_n; i++)
+        if (strcmp(cfg->bar_right_widgets[i], id) == 0)
+            return true;
+    return false;
+}
+
 /* Called ~once per second by the loop: redraw the bars (clock) and pop the
  * volume/brightness OSD on a change. */
 static void clock_tick(void *data)
@@ -259,6 +279,16 @@ static void clock_tick(void *data)
      * POPOUTS-SPEC.md: "2s poll only while open, no background cost"). */
     dc_sysmon_poll_processes();
     dc_processes_refresh(ctx->processes);
+    /* screenRecorder bar widget (docs/29-SMALL-FEATURES-PLAN.md sec.5 T3):
+     * poll liveness so the pill flips back to idle if the recorder died or
+     * was killed externally, not just via this widget's own toggle click.
+     * dc_screenrec_active() early-returns with no syscall while idle, so
+     * this is only a real kill(pid, 0) cost while actually recording -- the
+     * bar_widget_configured() guard just means we don't even do that for
+     * users who never added the widget. The elapsed "M:SS" text redraws for
+     * free below since render_all() already repaints every tick. */
+    if (bar_widget_configured("screenRecorder"))
+        dc_screenrec_active();
     render_all(ctx->set);
     dc_dashboard_refresh(ctx->dashboard); /* keep clock/meters/media live while open */
 
@@ -900,6 +930,14 @@ static void handle_left_click(struct wl_surface *surface, double x, double y, st
             dc_dashboard_toggle(ctx->dashboard, dc_bar_output(bar), DC_DASH_MEDIA);
         } else if (region == DC_BAR_REGION_WEATHER) {
             dc_dashboard_toggle(ctx->dashboard, dc_bar_output(bar), DC_DASH_WEATHER);
+        } else if (region == DC_BAR_REGION_SCREENREC) {
+            /* Same toggle shape as the `record toggle` IPC verb above:
+             * full-screen start (no region-select from the bar -- that's
+             * what `record region`/a keybind is for), clean SIGINT stop. */
+            if (dc_screenrec_active())
+                dc_screenrec_stop(ctx->notifications);
+            else
+                dc_screenrec_start(ctx->notifications, false);
         } else if (region == DC_BAR_REGION_TRAY) {
             /* Click-to-activate (docs/POLISH.md P4): left click opens the
              * item's primary action (e.g. a player's main window). */

@@ -62,6 +62,12 @@
 #define DC_ICON_EXPAND_LESS 0xe5ce
 #define DC_ICON_EDIT 0xf097
 #define DC_ICON_PERSON 0xf0d3
+/* screenRecorder bar widget idle icon (docs/29-SMALL-FEATURES-PLAN.md sec.5
+ * T3) -- verified present in the bundled font's cmap (name "videocam"), no
+ * suitable existing glyph to reuse. The active/recording state draws a
+ * literal filled circle (see bar.c's layout_screenrec()), not a glyph, so no
+ * second codepoint is needed here. */
+#define DC_ICON_VIDEOCAM 0xe04b
 /* Control Center's nightMode/darkMode toggle tiles use these two, not
  * DARK_MODE/LIGHT_MODE above (docs/13-POPOUTS-SPEC.md sec.1; matches
  * Modules/ControlCenter/Models/WidgetModel.qml's coreWidgetDefinitions). */

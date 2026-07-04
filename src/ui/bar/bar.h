@@ -76,6 +76,9 @@ typedef enum {
     DC_BAR_REGION_DASHBOARD,
     DC_BAR_REGION_MEDIA_BODY,
     DC_BAR_REGION_WEATHER,
+    /* screenRecorder widget (docs/29-SMALL-FEATURES-PLAN.md sec.5 T3):
+     * toggles dc_screenrec_start()/_stop() from main.c's click dispatch. */
+    DC_BAR_REGION_SCREENREC,
 } dc_bar_region;
 
 /* Which region a surface-local logical coordinate falls in, from the last

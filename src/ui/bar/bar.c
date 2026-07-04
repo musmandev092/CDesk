@@ -15,6 +15,7 @@
 #include "services/mpris.h"
 #include "services/net.h"
 #include "services/notifications.h"
+#include "services/screenrec.h"
 #include "services/sysmon.h"
 #include "services/tray.h"
 #include "services/weather.h"
@@ -432,6 +433,71 @@ static void draw_notif_pill(dc_bar *bar, const dc_pill *p)
         nvgFillColor(vg, tc(t->error));
         nvgFill(vg);
     }
+}
+
+/* --- screenRecorder (docs/29-SMALL-FEATURES-PLAN.md sec.5 T3) ------------- */
+
+/* Idle: a single centered record icon, same shape as launcher/clipboard.
+ * Recording: a red dot (an actual filled circle, same technique as
+ * draw_notif_pill's unread dot above -- not a font glyph, so no second icon
+ * codepoint is needed) followed by the elapsed "M:SS", laid out icon-then-
+ * text like layout_sysmon() below so it grows the pill instead of clipping.
+ * Click (main.c's DC_BAR_REGION_SCREENREC case) toggles dc_screenrec_start()/
+ * _stop(); this widget only reads state via dc_screenrec_active()/
+ * _elapsed_sec(), never drives the recorder itself. */
+static float layout_screenrec(dc_bar *bar, float x0, bool draw)
+{
+    const dc_config *cfg = dc_config_current;
+    const dc_theme *t = dc_theme_current;
+    const float cy = bar_cy(bar);
+
+    if (!dc_screenrec_active()) {
+        const float isz = dc_bar_icon_size(cfg, -4);
+        if (draw)
+            dc_render_icon(bar->render, DC_ICON_VIDEOCAM, x0, cy, isz, t->surface_text,
+                           NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        return isz;
+    }
+
+    NVGcontext *vg = bar->render->vg;
+    const float dot_r = DC_BAR_UNREAD_DOT_RADIUS + 1.0f; /* a touch bigger: this
+                                                           * dot IS the widget's
+                                                           * icon, not an overlay */
+    const float dot_gap = 5.0f;
+    float x = x0;
+    if (draw) {
+        nvgBeginPath(vg);
+        nvgCircle(vg, x + dot_r, cy, dot_r);
+        nvgFillColor(vg, tc(t->error));
+        nvgFill(vg);
+    }
+    x += dot_r * 2.0f + dot_gap;
+
+    char label[16];
+    const int sec = dc_screenrec_elapsed_sec();
+    snprintf(label, sizeof(label), "%d:%02d", sec / 60, sec % 60);
+    nvgFontFaceId(vg, bar->render->font_ui);
+    nvgFontSize(vg, DC_BAR_TEXT_SIZE);
+    float bounds[4];
+    nvgTextBounds(vg, 0.0f, 0.0f, label, NULL, bounds);
+    const float text_w = bounds[2] - bounds[0];
+    if (draw) {
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        nvgFillColor(vg, tc(t->error));
+        nvgText(vg, x, cy, label, NULL);
+    }
+    x += text_w;
+    return x - x0;
+}
+
+static float measure_screenrec(dc_bar *bar)
+{
+    return layout_screenrec(bar, 0.0f, false);
+}
+
+static void draw_screenrec_pill(dc_bar *bar, const dc_pill *p)
+{
+    layout_screenrec(bar, p->content_x0, true);
 }
 
 /* --- workspaceSwitcher ---------------------------------------------------- */
@@ -1661,6 +1727,8 @@ static const dc_bar_widget_def *find_widget(const char *id)
         {"clipboard", measure_clipboard, draw_clipboard_pill, true, false,
          DC_BAR_REGION_CLIPBOARD},
         {"notepad", measure_notepad, draw_notepad_pill, true, false, DC_BAR_REGION_NOTEPAD},
+        {"screenRecorder", measure_screenrec, draw_screenrec_pill, true, false,
+         DC_BAR_REGION_SCREENREC},
         {"cpuUsage", measure_cpu, draw_cpu_pill, true, false, DC_BAR_REGION_CPU},
         {"memUsage", measure_mem, draw_mem_pill, true, false, DC_BAR_REGION_MEM},
         {"notificationButton", measure_notif, draw_notif_pill, true, false,
