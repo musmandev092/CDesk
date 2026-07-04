@@ -55,6 +55,17 @@
  * (NM_802_11_MODE_AP -- used by dc_net_hotspot_active()). */
 #define NM_802_11_MODE_AP 3
 
+/* org.freedesktop.NetworkManager.Connection.Active.State (NM_ACTIVE_CONNECTION_STATE
+ * -- used by dc_net_vpn_list() to decide whether an ActiveConnections entry
+ * counts as "active" for a VPN profile: both ACTIVATING and ACTIVATED read as
+ * active so the UI can show "Connecting..."/highlight immediately rather than
+ * waiting for full activation; DEACTIVATING/DEACTIVATED (and the brief
+ * UNKNOWN=0 right after activation starts) do not). */
+#define NM_ACTIVE_CONNECTION_STATE_ACTIVATING 1
+#define NM_ACTIVE_CONNECTION_STATE_ACTIVATED 2
+#define NM_ACTIVE_CONNECTION_STATE_DEACTIVATING 3
+#define NM_ACTIVE_CONNECTION_STATE_DEACTIVATED 4
+
 /* DANKC_NET_DRYRUN (docs/18-WIFI-BT-PLAN.md) -- gates every *new* write path
  * added alongside DANKC_WIFI_DRYRUN (ethernet connect/disconnect, hotspot
  * start/stop, saved-network forget/autoconnect-toggle): instead of issuing
@@ -1928,6 +1939,181 @@ void dc_net_hotspot_stop(void)
     }
 }
 
+/* --- VPN (saved profiles) — docs/29-SMALL-FEATURES-PLAN.md sec.1 ----------
+ *
+ * Enumeration mirrors dc_net_saved_list() above (Settings.ListConnections +
+ * per-connection GetSettings via the same net_conn_read_settings() helper --
+ * it already extracts connection.id/type generically, so no changes needed
+ * there for a different `type` value), just filtered to "vpn"/"wireguard"
+ * instead of "802-11-wireless". Active-state comes from a second source,
+ * NetworkManager's own top-level ActiveConnections property, cross-
+ * referenced by each entry's Connection property (the Settings/Connection
+ * path it was activated from) -- ListConnections has no notion of "is this
+ * one active right now", that only lives on the separate ActiveConnection
+ * objects. */
+
+/* Search org.freedesktop.NetworkManager's ActiveConnections for the entry
+ * (if any) whose Connection property equals `conn_path`. On a match, `ac_out`
+ * is filled with that ActiveConnection's own object path and, if
+ * `state_out` is non-NULL, its State property (NM_ACTIVE_CONNECTION_STATE_*)
+ * -- shared by dc_net_vpn_list() (which only counts ACTIVATING/ACTIVATED as
+ * `active`) and dc_net_vpn_deactivate() (which doesn't care about the exact
+ * state, just needs the ActiveConnection path to deactivate, so passes
+ * state_out NULL). */
+static bool nm_active_connection_for_settings_path(const char *conn_path, char *ac_out,
+                                                   size_t ac_out_sz, uint32_t *state_out)
+{
+    ac_out[0] = '\0';
+    if (!g_net_bus || !conn_path || !conn_path[0])
+        return false;
+
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = NULL;
+    bool found = false;
+    if (sd_bus_get_property(g_net_bus, DC_NM_DEST, DC_NM_PATH, DC_NM_DEST, "ActiveConnections",
+                            &err, &reply, "ao") >= 0 &&
+        sd_bus_message_enter_container(reply, 'a', "o") > 0) {
+        const char *ac = NULL;
+        while (!found && sd_bus_message_read_basic(reply, 'o', &ac) > 0) {
+            sd_bus_error cerr = SD_BUS_ERROR_NULL;
+            sd_bus_message *creply = NULL;
+            if (sd_bus_get_property(g_net_bus, DC_NM_DEST, ac, DC_NM_ACTIVE_CONN_IFACE, "Connection",
+                                    &cerr, &creply, "o") >= 0) {
+                const char *cp = NULL;
+                if (sd_bus_message_read_basic(creply, 'o', &cp) > 0 && cp &&
+                    strcmp(cp, conn_path) == 0) {
+                    snprintf(ac_out, ac_out_sz, "%s", ac);
+                    found = true;
+                    if (state_out) {
+                        uint32_t st = 0;
+                        sd_bus_error serr = SD_BUS_ERROR_NULL;
+                        sd_bus_get_property_trivial(g_net_bus, DC_NM_DEST, ac,
+                                                    DC_NM_ACTIVE_CONN_IFACE, "State", &serr, 'u',
+                                                    &st);
+                        sd_bus_error_free(&serr);
+                        *state_out = st;
+                    }
+                }
+            }
+            sd_bus_error_free(&cerr);
+            sd_bus_message_unref(creply);
+        }
+        sd_bus_message_exit_container(reply);
+    }
+    sd_bus_error_free(&err);
+    sd_bus_message_unref(reply);
+    return found;
+}
+
+static struct {
+    dc_net_vpn items[DC_NET_VPN_MAX];
+    int count;
+} g_vpn;
+
+int dc_net_vpn_list(dc_net_vpn *out, int max)
+{
+    g_vpn.count = 0;
+
+    if (g_net_bus) {
+        sd_bus_error err = SD_BUS_ERROR_NULL;
+        sd_bus_message *reply = NULL;
+        int r = sd_bus_call_method(g_net_bus, DC_NM_DEST, DC_NM_SETTINGS_PATH, DC_NM_SETTINGS_IFACE,
+                                   "ListConnections", &err, &reply, "");
+        sd_bus_error_free(&err);
+
+        if (r >= 0 && sd_bus_message_enter_container(reply, 'a', "o") >= 0) {
+            const char *path = NULL;
+            while (g_vpn.count < DC_NET_VPN_MAX &&
+                  sd_bus_message_read_basic(reply, 'o', &path) > 0) {
+                char id[64], type[32];
+                if (!net_conn_read_settings(path, id, sizeof(id), type, sizeof(type), NULL, NULL, 0))
+                    continue;
+                bool is_vpn = strcmp(type, "vpn") == 0;
+                bool is_wireguard = strcmp(type, "wireguard") == 0;
+                if (!is_vpn && !is_wireguard)
+                    continue;
+
+                dc_net_vpn *v = &g_vpn.items[g_vpn.count++];
+                snprintf(v->path, sizeof(v->path), "%s", path);
+                snprintf(v->id, sizeof(v->id), "%s", id);
+                v->type_is_wireguard = is_wireguard;
+                v->active = false;
+                v->active_conn_path[0] = '\0';
+
+                char ac_path[64];
+                uint32_t state = 0;
+                if (nm_active_connection_for_settings_path(v->path, ac_path, sizeof(ac_path),
+                                                            &state) &&
+                    (state == NM_ACTIVE_CONNECTION_STATE_ACTIVATING ||
+                     state == NM_ACTIVE_CONNECTION_STATE_ACTIVATED)) {
+                    v->active = true;
+                    snprintf(v->active_conn_path, sizeof(v->active_conn_path), "%s", ac_path);
+                }
+            }
+            sd_bus_message_exit_container(reply);
+        }
+        sd_bus_message_unref(reply);
+    }
+
+    int n = g_vpn.count < max ? g_vpn.count : max;
+    if (n > 0 && out)
+        memcpy(out, g_vpn.items, (size_t)n * sizeof(*out));
+    return n;
+}
+
+bool dc_net_vpn_activate(const char *conn_path)
+{
+    if (!conn_path || !conn_path[0] || !g_net_bus)
+        return false;
+
+    if (net_dryrun()) {
+        dc_info("net: [DANKC_NET_DRYRUN] would call %s %s %s.ActivateConnection(\"%s\", \"/\", "
+                "\"/\")",
+                DC_NM_DEST, DC_NM_PATH, DC_NM_DEST, conn_path);
+        return true;
+    }
+
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = NULL;
+    int r = sd_bus_call_method(g_net_bus, DC_NM_DEST, DC_NM_PATH, DC_NM_DEST, "ActivateConnection",
+                               &err, &reply, "ooo", conn_path, "/", "/");
+    if (r < 0)
+        dc_warn("net: ActivateConnection (vpn) failed for %s: %s", conn_path,
+                err.message ? err.message : strerror(-r));
+    sd_bus_error_free(&err);
+    sd_bus_message_unref(reply);
+    return r >= 0;
+}
+
+bool dc_net_vpn_deactivate(const char *conn_path)
+{
+    if (!conn_path || !conn_path[0] || !g_net_bus)
+        return false;
+
+    char ac_path[64];
+    if (!nm_active_connection_for_settings_path(conn_path, ac_path, sizeof(ac_path), NULL)) {
+        dc_info("net: dc_net_vpn_deactivate(%s) -- not currently active", conn_path);
+        return false;
+    }
+
+    if (net_dryrun()) {
+        dc_info("net: [DANKC_NET_DRYRUN] would call %s %s %s.DeactivateConnection(\"%s\")",
+                DC_NM_DEST, DC_NM_PATH, DC_NM_DEST, ac_path);
+        return true;
+    }
+
+    sd_bus_error derr = SD_BUS_ERROR_NULL;
+    sd_bus_message *dreply = NULL;
+    int r = sd_bus_call_method(g_net_bus, DC_NM_DEST, DC_NM_PATH, DC_NM_DEST, "DeactivateConnection",
+                               &derr, &dreply, "o", ac_path);
+    if (r < 0)
+        dc_warn("net: DeactivateConnection (vpn) failed for %s: %s", ac_path,
+                derr.message ? derr.message : strerror(-r));
+    sd_bus_error_free(&derr);
+    sd_bus_message_unref(dreply);
+    return r >= 0;
+}
+
 /* --- DANKC_NETSVC_TEST startup self-check (docs/18-WIFI-BT-PLAN.md) --------
  *
  * controlcenter.c/settings.c don't call any of the functions above yet (that
@@ -1972,6 +2158,16 @@ static void net_run_test_hook(void)
     else
         dc_info("net: [DANKC_NETSVC_TEST] no hotspot active");
 
+    dc_info("net: [DANKC_NETSVC_TEST] === vpn ===");
+    dc_net_vpn vpn[DC_NET_VPN_MAX];
+    int vn = dc_net_vpn_list(vpn, DC_NET_VPN_MAX);
+    dc_info("net: [DANKC_NETSVC_TEST] %d vpn/wireguard profile(s)", vn);
+    for (int i = 0; i < vn; i++)
+        dc_info("net: [DANKC_NETSVC_TEST]   id=\"%s\" type=%s active=%s path=%s%s%s",
+                vpn[i].id, vpn[i].type_is_wireguard ? "wireguard" : "vpn",
+                vpn[i].active ? "yes" : "no", vpn[i].path,
+                vpn[i].active ? " active_conn=" : "", vpn[i].active ? vpn[i].active_conn_path : "");
+
     /* Write-path verification: only when DANKC_NET_DRYRUN is *also* set, so
      * this never issues a real D-Bus write -- dc_net_hotspot_start()/
      * dc_net_saved_forget() see the dry-run gate before doing anything and
@@ -1990,6 +2186,19 @@ static void net_run_test_hook(void)
         } else {
             dc_info("net: [DANKC_NETSVC_TEST] no saved network to exercise "
                     "dc_net_saved_forget() with");
+        }
+
+        if (vn > 0) {
+            bool aok = dc_net_vpn_activate(vpn[0].path);
+            dc_info("net: [DANKC_NETSVC_TEST] dc_net_vpn_activate(\"%s\") -> %s", vpn[0].path,
+                    aok ? "ok" : "failed");
+            bool dok = dc_net_vpn_deactivate(vpn[0].path);
+            dc_info("net: [DANKC_NETSVC_TEST] dc_net_vpn_deactivate(\"%s\") -> %s", vpn[0].path,
+                    dok ? "ok" : "failed (not active, expected under dry-run since the "
+                                 "activate above was only logged, not sent)");
+        } else {
+            dc_info("net: [DANKC_NETSVC_TEST] no vpn profile to exercise "
+                    "dc_net_vpn_activate()/_deactivate() with");
         }
     }
 }
