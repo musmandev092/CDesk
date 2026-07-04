@@ -24,7 +24,6 @@
 #include "wayland/wl.h"
 
 #include <ctype.h>
-#include <dirent.h>
 #include <GLES2/gl2.h>
 #include <math.h>
 #include <stdio.h>
@@ -1329,53 +1328,6 @@ static void draw_mem_pill(dc_bar *bar, const dc_pill *p)
 
 /* --- battery ------------------------------------------------------------ */
 
-/* Any Mains/USB power-supply reporting online=1 (docs/12-BAR-SPEC.md sec.4/6
- * battery item 5). battery.h's `charging` is a strict sysfs status=="Charging"
- * check, but plenty of laptops report "Not charging" once a charge threshold
- * is hit while AC stays connected — DMS's BatteryService shows the green
- * charging glyph for as long as AC is plugged in, not just mid-charge.
- * battery.{c,h} is out of scope for this stage (see AGENTS.md constraints),
- * so this reads the sibling "online" sysfs attribute directly, mirroring
- * battery.c's own read_line() pattern. Best-effort: false if no supply is
- * found (never treated as fatal — the bar just falls back to bat.charging). */
-static bool bar_ac_online(void)
-{
-    DIR *dir = opendir("/sys/class/power_supply");
-    if (!dir)
-        return false;
-
-    bool online = false;
-    struct dirent *entry;
-    char path[512], value[32];
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.')
-            continue;
-
-        snprintf(path, sizeof(path), "/sys/class/power_supply/%s/type", entry->d_name);
-        FILE *f = fopen(path, "r");
-        if (!f)
-            continue;
-        bool got_type = fgets(value, sizeof(value), f) != NULL;
-        fclose(f);
-        if (!got_type)
-            continue;
-        value[strcspn(value, "\n")] = '\0';
-        if (strcmp(value, "Mains") != 0 && strcmp(value, "USB") != 0)
-            continue;
-
-        snprintf(path, sizeof(path), "/sys/class/power_supply/%s/online", entry->d_name);
-        f = fopen(path, "r");
-        if (!f)
-            continue;
-        bool got_online = fgets(value, sizeof(value), f) != NULL;
-        fclose(f);
-        if (got_online && value[0] == '1')
-            online = true;
-    }
-    closedir(dir);
-    return online;
-}
-
 /* Pick the Material Symbols battery glyph for this level/charging state --
  * exact thresholds/codepoints as DMS's Theme.getBatteryIcon() (docs/12-BAR-
  * SPEC.md sec.4 + sec.6). Previously collapsed to 3 tiers (full/0_bar/alert)
@@ -1430,7 +1382,7 @@ static float layout_battery(dc_bar *bar, float x0, bool draw)
     const dc_theme *t = dc_theme_current;
     const dc_config *cfg = dc_config_current;
     const float cy = bar_cy(bar);
-    const bool charging = bat.charging || bar_ac_online();
+    const bool charging = bat.charging || bat.ac_online;
     const bool low = bat.percent < 20 && !charging;
 
     dc_color icon_color = charging ? t->primary : (low ? t->error : t->surface_text);
@@ -2143,7 +2095,7 @@ static uint64_t bar_compute_signature(dc_bar *bar)
         h = sig_u64(h, 1);
         h = sig_u64(h, (uint64_t)bat.percent);
         h = sig_u64(h, bat.charging);
-        h = sig_u64(h, bar_ac_online());
+        h = sig_u64(h, bat.ac_online);
     } else {
         h = sig_u64(h, 0);
     }

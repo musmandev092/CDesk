@@ -35,12 +35,45 @@ static long read_attr(const char *dir_name, const char *attr)
     return (end != value && v >= 0) ? v : -1;
 }
 
+/* Any Mains/USB power-supply reporting online=1 (docs/12-BAR-SPEC.md sec.4/6
+ * battery item 5) -- hoisted from bar.c's former bar_ac_online() so every
+ * caller of dc_battery_read gets a correct ac_online for free. Best-effort:
+ * false if no supply is found or /sys/class/power_supply is unreadable
+ * (never treated as fatal). */
+static bool scan_ac_online(void)
+{
+    DIR *dir = opendir(DC_POWER_SUPPLY_DIR);
+    if (!dir)
+        return false;
+
+    bool online = false;
+    struct dirent *entry;
+    char path[512], value[32];
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.')
+            continue;
+
+        snprintf(path, sizeof(path), DC_POWER_SUPPLY_DIR "/%s/type", entry->d_name);
+        if (!read_line(path, value, sizeof(value)))
+            continue;
+        if (strcmp(value, "Mains") != 0 && strcmp(value, "USB") != 0)
+            continue;
+
+        snprintf(path, sizeof(path), DC_POWER_SUPPLY_DIR "/%s/online", entry->d_name);
+        if (read_line(path, value, sizeof(value)) && value[0] == '1')
+            online = true;
+    }
+    closedir(dir);
+    return online;
+}
+
 bool dc_battery_read(dc_battery_info *out)
 {
     memset(out, 0, sizeof(*out));
     out->energy_full_wh = -1.0;
     out->energy_full_design_wh = -1.0;
     out->health_percent = -1;
+    out->charge_limit = -1;
 
     DIR *dir = opendir(DC_POWER_SUPPLY_DIR);
     if (!dir)
@@ -71,6 +104,20 @@ bool dc_battery_read(dc_battery_info *out)
         }
         out->present = true;
         found = true;
+        snprintf(out->batt_dir, sizeof(out->batt_dir), "%s", entry->d_name);
+
+        /* Charge-limit support (docs/24-BATTERY-POWER-PLAN.md T1): not every
+         * driver exposes charge_control_end_threshold (ThinkPad/ASUS/LG are
+         * EC-dependent); treat anything outside 1-100 as unsupported rather
+         * than trusting a stray 0/garbage value. */
+        long charge_limit = read_attr(entry->d_name, "charge_control_end_threshold");
+        if (charge_limit >= 1 && charge_limit <= 100) {
+            out->charge_limit_supported = true;
+            out->charge_limit = (int)charge_limit;
+        } else {
+            out->charge_limit_supported = false;
+            out->charge_limit = -1;
+        }
 
         /* Battery popout "Health"/"Capacity" cards (docs/13-POPOUTS-SPEC.md
          * sec.2): energy_full[_design] (µWh) preferred, charge_full[_design]
@@ -104,22 +151,59 @@ bool dc_battery_read(dc_battery_info *out)
 
     closedir(dir);
 
+    out->ac_online = scan_ac_online();
+
+    if (found) {
+        /* UI RESCALE (docs/24-BATTERY-POWER-PLAN.md T1 key decisions): keep
+         * the raw sysfs capacity in percent_raw for automation (low/critical
+         * thresholds must fire off the real capacity, not a rescaled one),
+         * but rescale `percent` against the charge limit so "100%" is
+         * reachable under a limit instead of topping out at e.g. 80%. Only
+         * rescale for limits in the sane 50-99 range -- outside that a driver
+         * quirk (e.g. reporting 0 or 100) should not distort the displayed
+         * percent. */
+        out->percent_raw = out->percent;
+        if (out->charge_limit_supported && out->charge_limit >= 50 && out->charge_limit <= 99) {
+            int limit = out->charge_limit;
+            int rescaled = (out->percent_raw * 100 + limit / 2) / limit;
+            out->percent = rescaled > 100 ? 100 : rescaled;
+        }
+
+        /* Once the raw capacity reaches the configured limit, the driver
+         * should have stopped charging there -- treat that as "full" the
+         * same way status=="Full" would at an unlimited 100%, so the UI
+         * shows a full/green glyph instead of a stalled "Discharging" one.
+         * Skip this if sysfs still reports actively "Charging" below 100%
+         * raw (some drivers report one last tick before the status flips to
+         * "Not charging"), so we don't flash full->charging->full. */
+        if (out->charge_limit_supported && out->percent_raw >= out->charge_limit &&
+            !(out->charging && out->percent_raw < 100))
+            out->full = true;
+    }
+
     /* DANKC_FAKE_BATTERY=<percent> (debug-only, env-gated -- same convention
      * as DANKC_MARQUEE_TEST): override the real percent so the bar/popout
      * battery glyph's per-level tiering can be screenshotted at any level
      * without needing to actually run the laptop down. DANKC_FAKE_BATTERY_
-     * CHARGING=1 additionally fakes the charging flag. No-op when unset. */
+     * CHARGING=1 additionally fakes the charging flag. DANKC_FAKE_BATTERY_
+     * AC=0|1 fakes ac_online (so battery_auto.c's AC-edge automation can be
+     * exercised without physically plugging/unplugging). No-op when unset. */
     if (found) {
         const char *fake = getenv("DANKC_FAKE_BATTERY");
         if (fake) {
             int v = atoi(fake);
-            out->percent = v < 0 ? 0 : (v > 100 ? 100 : v);
+            v = v < 0 ? 0 : (v > 100 ? 100 : v);
+            out->percent = v;
+            out->percent_raw = v;
             out->full = out->percent >= 100;
         }
         const char *fake_chg = getenv("DANKC_FAKE_BATTERY_CHARGING");
         if (fake_chg)
             out->charging = atoi(fake_chg) != 0;
     }
+    const char *fake_ac = getenv("DANKC_FAKE_BATTERY_AC");
+    if (fake_ac)
+        out->ac_online = atoi(fake_ac) != 0;
 
     return found;
 }
