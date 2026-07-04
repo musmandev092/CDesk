@@ -5,40 +5,41 @@
  * columns of categorized key-chord chips + descriptions, `Theme.spacingL`
  * inset, per-category header + divider, scrollable if it overflows). This is
  * the read-only cheat-sheet, not DMS's editable keybind-remapping settings UI
- * (Widgets/KeybindItem.qml) -- there is no click-to-edit here.
+ * (Widgets/KeybindItem.qml) -- there is no click-to-edit here (edits happen in
+ * dankc's own Settings > Keybinds tab, see below).
  *
  * Surface/animation/scrim plumbing is copy-pattern from powermenu.c (centered
  * full-output overlay with a dim scrim, fade+scale entrance/exit, Esc /
  * click-outside dismiss); the scrollable-list plumbing (nvgScissor content
  * region + a thumb on the right edge) is copy-pattern from processes.c.
  *
- * DATA SOURCE: unlike DMS (which shells out to its own `dms keybinds show
- * niri` Go/Rust tool), dankc has no separate KDL-parsing binary, so this file
- * parses ~/.config/niri/config.kdl itself -- see kb_parse_config() below.
- * Deliberately distinct from `dankc keybinds` (main.c's print_keybinds()),
- * which only prints a snippet of dankc's OWN control-command binds to paste
- * into the user's config; this overlay reads the user's real, live binds
- * back out of that config (including anything reached via `include "...";`,
- * e.g. a DMS install's dms/binds.kdl) and displays them.
- *
- * PARSER GRAMMAR (tolerant, not a full KDL implementation):
- *   - `//` starts a line comment (stripped before parsing; block comments and
- *     escaped quotes inside strings are NOT specially handled -- acceptable
- *     for the shape of file niri/DMS actually generate).
- *   - Any `binds { ... }` node, anywhere in the file (so both the top-level
- *     bind list and e.g. a `recent-windows { binds { ... } }` override block
- *     are picked up), is scanned for `<key-chord> [props...] { <action>; }`
- *     entries. `props` may include `hotkey-overlay-title="Some Title"` (used
- *     verbatim as the description) plus other `key=value` pairs (ignored).
- *   - `include "path";` pulls in another file (path resolved relative to the
- *     directory of the file containing the include) recursively, depth- and
- *     visited-set-bounded to tolerate cycles/typos without hanging.
+ * DATA SOURCE (KB-T4, docs/23-KEYBIND-EDITING-PLAN.md): this file used to
+ * parse ~/.config/niri/config.kdl itself with a private tolerant KDL parser
+ * (kb_parse_config -> kb_parse_file -> kb_scan_binds_blocks ->
+ * kb_parse_one_bind). That parser has been generalized into a shared backend,
+ * services/keybinds.c/.h, so both this overlay and the Settings > Keybinds
+ * CRUD tab (ui/settings.c) read the same binds the same way. This file now
+ * only calls dc_keybinds_load() (kb_load_config() below) to get every bind
+ * (each tagged with its `source` file and a `managed` bool -- true when the
+ * bind lives in dankc's own dankc-binds.kdl fragment) and keeps the
+ * presentation logic: action -> category/label prettification, per-category
+ * masonry layout, and the "dankc"-managed row badge. Deliberately distinct
+ * from `dankc keybinds` (main.c's print_keybinds()), which only prints a
+ * snippet of dankc's OWN control-command binds to paste into the user's
+ * config; this overlay reads the user's real, live binds back out (including
+ * anything reached via the user's own `include "...";` chain, e.g. a DMS
+ * install's dms/binds.kdl, or dankc's managed dankc-binds.kdl) and displays
+ * them, re-loading fresh from the service every time the overlay is shown so
+ * edits made in Settings > Keybinds appear immediately. A footer hint points
+ * users at Settings > Keybinds to actually edit dankc-managed binds -- this
+ * overlay itself remains strictly read-only.
  */
 #include "ui/keybinds_modal.h"
 
 #include "core/anim.h"
 #include "core/log.h"
 #include "dc.h"
+#include "services/keybinds.h"
 #include "theme/theme.h"
 #include "render/nvg.h"
 #include "wayland/egl.h"
@@ -86,16 +87,19 @@
 
 #define DC_KB_MAX_BINDS 512
 #define DC_KB_MAX_CATS 16
-#define DC_KB_MAX_INCLUDE_FILES 32
-#define DC_KB_MAX_DEPTH 6
 #define DC_KB_KEY_MAX 64
 #define DC_KB_DESC_MAX 160
 #define DC_KB_CAT_MAX 24
+
+#define DC_KB_BADGE_W 42.0f  /* "dankc"-managed row marker pill */
+#define DC_KB_BADGE_H 15.0f
+#define DC_KB_FOOTER_H 22.0f /* reserved strip for the Settings hint line */
 
 typedef struct {
     char cat[DC_KB_CAT_MAX];
     char key[DC_KB_KEY_MAX];
     char desc[DC_KB_DESC_MAX];
+    bool managed; /* true when this bind's source is dankc-binds.kdl */
 } dc_kb_entry;
 
 struct dc_keybinds_modal {
@@ -166,94 +170,11 @@ static const struct wl_callback_listener frame_listener = {.done = frame_done};
  * Action -> category/label prettification (a hand-picked subset of DMS's
  * Common/KeybindActions.js NIRI_ACTIONS/DMS_ACTIONS tables -- not a byte-for-
  * byte port; unrecognized verbs fall back to a generic kebab/camelCase ->
- * Title Case prettifier so any user's config still reads reasonably).
+ * Title Case prettifier so any user's config still reads reasonably). The
+ * niri-verb table itself (verb/label/cat) lives in services/keybinds.c now --
+ * dc_keybinds_niri_actions() below -- shared with the Settings action picker;
+ * this file only prettifies with it.
  * ---------------------------------------------------------------------- */
-
-typedef struct {
-    const char *verb;
-    const char *label;
-    const char *cat;
-} kb_niri_action;
-
-/* Matches DankMaterialShell's Common/KeybindActions.js NIRI_ACTIONS table
- * (Window/Focus/Move/Workspace/Monitor/Screenshot/System/Alt-Tab). */
-static const kb_niri_action KB_NIRI_ACTIONS[] = {
-    {"close-window", "Close Window", "Window"},
-    {"fullscreen-window", "Fullscreen", "Window"},
-    {"maximize-column", "Maximize Column", "Window"},
-    {"center-column", "Center Column", "Window"},
-    {"center-visible-columns", "Center Visible Columns", "Window"},
-    {"toggle-window-floating", "Toggle Floating", "Window"},
-    {"switch-focus-between-floating-and-tiling", "Switch Floating/Tiling Focus", "Window"},
-    {"switch-preset-column-width", "Cycle Column Width", "Window"},
-    {"switch-preset-window-height", "Cycle Window Height", "Window"},
-    {"set-column-width", "Set Column Width", "Window"},
-    {"set-window-height", "Set Window Height", "Window"},
-    {"reset-window-height", "Reset Window Height", "Window"},
-    {"expand-column-to-available-width", "Expand to Available Width", "Window"},
-    {"consume-or-expel-window-left", "Consume/Expel Left", "Window"},
-    {"consume-or-expel-window-right", "Consume/Expel Right", "Window"},
-    {"consume-window-into-column", "Consume Into Column", "Window"},
-    {"expel-window-from-column", "Expel From Column", "Window"},
-    {"toggle-column-tabbed-display", "Toggle Tabbed", "Window"},
-    {"toggle-window-rule-opacity", "Toggle Window Opacity", "Window"},
-    {"toggle-window-urgent", "Toggle Urgent", "Window"},
-
-    {"focus-column-left", "Focus Left", "Focus"},
-    {"focus-column-right", "Focus Right", "Focus"},
-    {"focus-window-down", "Focus Down", "Focus"},
-    {"focus-window-up", "Focus Up", "Focus"},
-    {"focus-column-first", "Focus First Column", "Focus"},
-    {"focus-column-last", "Focus Last Column", "Focus"},
-    {"focus-window-down-or-column-left", "Focus Down or Left", "Focus"},
-    {"focus-window-up-or-column-left", "Focus Up or Left", "Focus"},
-
-    {"move-column-left", "Move Left", "Move"},
-    {"move-column-right", "Move Right", "Move"},
-    {"move-window-down", "Move Down", "Move"},
-    {"move-window-up", "Move Up", "Move"},
-    {"move-column-to-first", "Move to First", "Move"},
-    {"move-column-to-last", "Move to Last", "Move"},
-
-    {"focus-workspace-down", "Focus Workspace Down", "Workspace"},
-    {"focus-workspace-up", "Focus Workspace Up", "Workspace"},
-    {"focus-workspace-previous", "Focus Previous Workspace", "Workspace"},
-    {"focus-workspace", "Focus Workspace", "Workspace"},
-    {"move-column-to-workspace-down", "Move to Workspace Down", "Workspace"},
-    {"move-column-to-workspace-up", "Move to Workspace Up", "Workspace"},
-    {"move-column-to-workspace", "Move to Workspace", "Workspace"},
-    {"move-workspace-down", "Move Workspace Down", "Workspace"},
-    {"move-workspace-up", "Move Workspace Up", "Workspace"},
-
-    {"focus-monitor-left", "Focus Monitor Left", "Monitor"},
-    {"focus-monitor-right", "Focus Monitor Right", "Monitor"},
-    {"focus-monitor-down", "Focus Monitor Down", "Monitor"},
-    {"focus-monitor-up", "Focus Monitor Up", "Monitor"},
-    {"move-column-to-monitor-left", "Move Column to Monitor Left", "Monitor"},
-    {"move-column-to-monitor-right", "Move Column to Monitor Right", "Monitor"},
-    {"move-column-to-monitor-down", "Move Column to Monitor Down", "Monitor"},
-    {"move-column-to-monitor-up", "Move Column to Monitor Up", "Monitor"},
-    {"move-workspace-to-monitor-left", "Move Workspace to Monitor Left", "Monitor"},
-    {"move-workspace-to-monitor-right", "Move Workspace to Monitor Right", "Monitor"},
-    {"move-workspace-to-monitor-down", "Move Workspace to Monitor Down", "Monitor"},
-    {"move-workspace-to-monitor-up", "Move Workspace to Monitor Up", "Monitor"},
-
-    {"screenshot", "Screenshot (Interactive)", "Screenshot"},
-    {"screenshot-screen", "Screenshot Screen", "Screenshot"},
-    {"screenshot-window", "Screenshot Window", "Screenshot"},
-
-    {"toggle-overview", "Toggle Overview", "System"},
-    {"show-hotkey-overlay", "Show Hotkey Overlay", "System"},
-    {"do-screen-transition", "Screen Transition", "System"},
-    {"power-off-monitors", "Power Off Monitors", "System"},
-    {"power-on-monitors", "Power On Monitors", "System"},
-    {"toggle-keyboard-shortcuts-inhibit", "Toggle Shortcuts Inhibit", "System"},
-    {"quit", "Quit Niri", "System"},
-    {"suspend", "Suspend", "System"},
-
-    {"next-window", "Next Window", "Alt-Tab"},
-    {"previous-window", "Previous Window", "Alt-Tab"},
-};
 
 /* Subsystem-name prettification for `spawn dms ipc call <subsystem> ...`. */
 static const char *const KB_DMS_SUBSYS[][2] = {
@@ -464,8 +385,10 @@ static const char *kb_category_and_label(char **argv, int argc, char *label_out,
         return "Applications";
     }
 
-    for (size_t i = 0; i < DC_ARRAY_LEN(KB_NIRI_ACTIONS); i++) {
-        if (strcmp(KB_NIRI_ACTIONS[i].verb, verb) != 0)
+    int niri_count = 0;
+    const dc_keybind_action_preset *niri_actions = dc_keybinds_niri_actions(&niri_count);
+    for (int i = 0; i < niri_count; i++) {
+        if (strcmp(niri_actions[i].verb, verb) != 0)
             continue;
         char extra[80] = {0};
         if (argc > 1) {
@@ -473,8 +396,8 @@ static const char *kb_category_and_label(char **argv, int argc, char *label_out,
             kb_join_args(argv + 1, argc - 1, joined, sizeof(joined));
             snprintf(extra, sizeof(extra), " %s", joined);
         }
-        snprintf(label_out, label_sz, "%s%s", KB_NIRI_ACTIONS[i].label, extra);
-        return KB_NIRI_ACTIONS[i].cat;
+        snprintf(label_out, label_sz, "%s%s", niri_actions[i].label, extra);
+        return niri_actions[i].cat;
     }
 
     /* Unknown verb: generic kebab-case -> Title Case fallback so any action
@@ -508,32 +431,8 @@ static void kb_format_key(const char *raw, char *out, size_t outsz)
 }
 
 /* ---------------------------------------------------------------------- *
- * niri config.kdl parsing.
+ * Sourcing binds from the shared keybind service (services/keybinds.c/.h).
  * ---------------------------------------------------------------------- */
-
-static void kb_add_entry(dc_keybinds_modal *kb, const char *key_raw, size_t key_len,
-                         const char *title, char **argv, int argc)
-{
-    if (kb->entry_count >= DC_KB_MAX_BINDS || key_len == 0)
-        return;
-    dc_kb_entry *e = &kb->entries[kb->entry_count];
-
-    char key_tmp[DC_KB_KEY_MAX];
-    size_t kl = key_len < sizeof(key_tmp) - 1 ? key_len : sizeof(key_tmp) - 1;
-    memcpy(key_tmp, key_raw, kl);
-    key_tmp[kl] = '\0';
-    kb_format_key(key_tmp, e->key, sizeof(e->key));
-
-    char label[DC_KB_DESC_MAX];
-    const char *cat = kb_category_and_label(argv, argc, label, sizeof(label));
-    snprintf(e->cat, sizeof(e->cat), "%s", cat);
-    if (title && title[0])
-        snprintf(e->desc, sizeof(e->desc), "%s", title);
-    else
-        snprintf(e->desc, sizeof(e->desc), "%s", label);
-
-    kb->entry_count++;
-}
 
 /* Tokenize a (already trimmed, `;`-stripped) action body respecting quoted
  * strings, e.g. `spawn "dms" "ipc" "call" "audio" "mute"` -> ["spawn","dms",
@@ -573,275 +472,34 @@ static int kb_tokenize(const char *text, size_t len, char argv[][48], int max)
     return argc;
 }
 
-/* Trim a `hotkey-overlay-title="..."` value out of the header, if present. */
-static void kb_extract_title(const char *header, size_t hlen, char *title_out, size_t title_sz)
+/* Turns one service-provided dc_keybind into a display dc_kb_entry: formats
+ * the chord for display, tokenizes the (already-trimmed, verbatim) action
+ * body for kb_category_and_label()'s prettifier, and carries the `managed`
+ * flag through so the render path can draw its badge. */
+static void kb_add_entry_from_bind(dc_keybinds_modal *kb, const dc_keybind *bind)
 {
-    title_out[0] = '\0';
-    const char *needle = "hotkey-overlay-title=\"";
-    size_t nlen = strlen(needle);
-    for (size_t i = 0; i + nlen <= hlen; i++) {
-        if (memcmp(header + i, needle, nlen) != 0)
-            continue;
-        size_t start = i + nlen;
-        size_t end = start;
-        while (end < hlen && header[end] != '"')
-            end++;
-        size_t n = end - start;
-        if (n >= title_sz)
-            n = title_sz - 1;
-        memcpy(title_out, header + start, n);
-        title_out[n] = '\0';
+    if (kb->entry_count >= DC_KB_MAX_BINDS || bind->chord[0] == '\0')
         return;
-    }
-}
+    dc_kb_entry *e = &kb->entries[kb->entry_count];
 
-/* One `<header> { <action> }` unit inside a binds{} block: the key chord is
- * the header's first whitespace-delimited token; the rest of the header may
- * contain `hotkey-overlay-title="..."` plus other ignored `key=value` props. */
-static void kb_parse_one_bind(dc_keybinds_modal *kb, const char *header, size_t hlen,
-                              const char *action, size_t alen)
-{
-    size_t hi = 0;
-    while (hi < hlen && isspace((unsigned char)header[hi]))
-        hi++;
-    size_t key_start = hi;
-    while (hi < hlen && !isspace((unsigned char)header[hi]))
-        hi++;
-    size_t key_len = hi - key_start;
-    if (key_len == 0)
-        return; /* stray/empty block */
-
-    char title[80];
-    kb_extract_title(header + hi, hlen - hi, title, sizeof(title));
-
-    /* Trim the action body and drop a single trailing ';'. */
-    size_t as = 0, ae = alen;
-    while (as < ae && isspace((unsigned char)action[as]))
-        as++;
-    while (ae > as && isspace((unsigned char)action[ae - 1]))
-        ae--;
-    if (ae > as && action[ae - 1] == ';')
-        ae--;
-    while (ae > as && isspace((unsigned char)action[ae - 1]))
-        ae--;
-    if (ae <= as)
-        return; /* empty action body */
+    kb_format_key(bind->chord, e->key, sizeof(e->key));
 
     char argv[8][48];
-    int argc = kb_tokenize(action + as, ae - as, argv, 8);
-    if (argc == 0)
-        return;
+    int argc = kb_tokenize(bind->action, strlen(bind->action), argv, 8);
     char *argv_ptrs[8];
     for (int i = 0; i < argc; i++)
         argv_ptrs[i] = argv[i];
 
-    kb_add_entry(kb, header + key_start, key_len, title, argv_ptrs, argc);
-}
-
-/* Scan the inner content of one `binds { ... }` node for `<header>{<action>}`
- * units, brace- and quote-aware so nested `{}`/`"` inside an action body
- * (e.g. `set-column-width "+10%";`) don't confuse the split. */
-static void kb_parse_binds_inner(dc_keybinds_modal *kb, const char *inner, size_t inner_len)
-{
-    size_t pos = 0;
-    while (pos < inner_len) {
-        size_t hstart = pos;
-        while (pos < inner_len && inner[pos] != '{') {
-            if (inner[pos] == '"') {
-                pos++;
-                while (pos < inner_len && inner[pos] != '"') {
-                    if (inner[pos] == '\\' && pos + 1 < inner_len)
-                        pos++;
-                    pos++;
-                }
-                if (pos < inner_len)
-                    pos++;
-                continue;
-            }
-            pos++;
-        }
-        if (pos >= inner_len)
-            break;
-        size_t hlen = pos - hstart;
-
-        size_t astart = pos + 1;
-        int depth = 1;
-        size_t apos = astart;
-        while (apos < inner_len && depth > 0) {
-            char c = inner[apos];
-            if (c == '"') {
-                apos++;
-                while (apos < inner_len && inner[apos] != '"') {
-                    if (inner[apos] == '\\' && apos + 1 < inner_len)
-                        apos++;
-                    apos++;
-                }
-                apos++;
-                continue;
-            }
-            if (c == '{') {
-                depth++;
-            } else if (c == '}') {
-                depth--;
-                if (depth == 0)
-                    break;
-            }
-            apos++;
-        }
-        if (depth != 0)
-            break; /* malformed -- bail out of this block */
-        size_t alen = apos - astart;
-
-        kb_parse_one_bind(kb, inner + hstart, hlen, inner + astart, alen);
-        pos = apos + 1;
-    }
-}
-
-/* Find every `binds { ... }` node anywhere in `text` (word-boundary checked)
- * and hand its inner content to kb_parse_binds_inner(). */
-static void kb_scan_binds_blocks(dc_keybinds_modal *kb, const char *text)
-{
-    const char *p = text;
-    while ((p = strstr(p, "binds")) != NULL) {
-        bool left_ok = (p == text) || !(isalnum((unsigned char)p[-1]) || p[-1] == '_' || p[-1] == '-');
-        const char *after = p + 5;
-        bool right_ok = !(isalnum((unsigned char)after[0]) || after[0] == '_' || after[0] == '-');
-        if (left_ok && right_ok) {
-            const char *q = after;
-            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r')
-                q++;
-            if (*q == '{') {
-                const char *inner_start = q + 1;
-                int depth = 1;
-                const char *r = inner_start;
-                while (*r && depth > 0) {
-                    if (*r == '"') {
-                        r++;
-                        while (*r && *r != '"') {
-                            if (*r == '\\' && r[1])
-                                r++;
-                            r++;
-                        }
-                        if (*r)
-                            r++;
-                        continue;
-                    }
-                    if (*r == '{')
-                        depth++;
-                    else if (*r == '}') {
-                        depth--;
-                        if (depth == 0)
-                            break;
-                    }
-                    r++;
-                }
-                if (depth == 0) {
-                    kb_parse_binds_inner(kb, inner_start, (size_t)(r - inner_start));
-                    p = r + 1;
-                    continue;
-                }
-            }
-        }
-        p = after;
-    }
-}
-
-/* Blank out `// ...` line comments in place (leaves the newline so line/col
- * counting elsewhere -- none currently -- would stay correct). Tolerant
- * parser: doesn't special-case `//` inside a quoted string, which niri/DMS
- * configs never actually put there. */
-static void kb_strip_comments(char *text)
-{
-    for (char *p = text; *p; p++) {
-        if (p[0] == '/' && p[1] == '/') {
-            while (*p && *p != '\n')
-                *p++ = ' ';
-            if (!*p)
-                break;
-        }
-    }
-}
-
-static char *kb_read_file(const char *path, size_t *out_len)
-{
-    FILE *f = fopen(path, "rb");
-    if (!f)
-        return NULL;
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        return NULL;
-    }
-    long sz = ftell(f);
-    if (sz < 0 || sz > 4 * 1024 * 1024) { /* sanity cap */
-        fclose(f);
-        return NULL;
-    }
-    rewind(f);
-    char *buf = malloc((size_t)sz + 1);
-    if (!buf) {
-        fclose(f);
-        return NULL;
-    }
-    size_t n = fread(buf, 1, (size_t)sz, f);
-    fclose(f);
-    buf[n] = '\0';
-    if (out_len)
-        *out_len = n;
-    return buf;
-}
-
-static void kb_parse_file(dc_keybinds_modal *kb, const char *path, int depth,
-                          char seen[][512], int *seen_count)
-{
-    if (depth > DC_KB_MAX_DEPTH)
-        return;
-    for (int i = 0; i < *seen_count; i++) {
-        if (strcmp(seen[i], path) == 0)
-            return; /* already parsed (dedupe + cycle guard) */
-    }
-    if (*seen_count < DC_KB_MAX_INCLUDE_FILES)
-        snprintf(seen[(*seen_count)++], 512, "%s", path);
-
-    char *text = kb_read_file(path, NULL);
-    if (!text)
-        return;
-    kb_strip_comments(text);
-
-    kb_scan_binds_blocks(kb, text);
-
-    char dir[700];
-    snprintf(dir, sizeof(dir), "%s", path);
-    char *slash = strrchr(dir, '/');
-    if (slash)
-        *slash = '\0';
+    char label[DC_KB_DESC_MAX];
+    const char *cat = kb_category_and_label(argv_ptrs, argc, label, sizeof(label));
+    snprintf(e->cat, sizeof(e->cat), "%s", cat);
+    if (bind->title[0])
+        snprintf(e->desc, sizeof(e->desc), "%s", bind->title);
     else
-        snprintf(dir, sizeof(dir), ".");
+        snprintf(e->desc, sizeof(e->desc), "%s", label);
+    e->managed = bind->managed;
 
-    const char *p = text;
-    while ((p = strstr(p, "include")) != NULL) {
-        const char *q = p + 7;
-        while (*q == ' ' || *q == '\t')
-            q++;
-        if (*q == '"') {
-            q++;
-            const char *end = strchr(q, '"');
-            if (end && end > q) {
-                char rel[300];
-                size_t rl = (size_t)(end - q);
-                if (rl >= sizeof(rel))
-                    rl = sizeof(rel) - 1;
-                memcpy(rel, q, rl);
-                rel[rl] = '\0';
-                char childpath[sizeof(dir) + sizeof(rel) + 2];
-                snprintf(childpath, sizeof(childpath), "%s/%s", dir, rel);
-                kb_parse_file(kb, childpath, depth + 1, seen, seen_count);
-            }
-            p = end ? end + 1 : q;
-        } else {
-            p = q;
-        }
-    }
-    free(text);
+    kb->entry_count++;
 }
 
 /* Stable-partition `kb->entries` by category, in KB_ORDER's preference order,
@@ -897,24 +555,29 @@ static void kb_group_by_category(dc_keybinds_modal *kb)
     free(taken);
 }
 
-static void kb_parse_config(dc_keybinds_modal *kb)
+/* Loads every bind via dc_keybinds_load() (real ~/.config/niri, following
+ * `include "...";` recursively -- see services/keybinds.h) and rebuilds
+ * `kb->entries`/category grouping from scratch. Called on every kb_show(), so
+ * edits made in Settings > Keybinds are picked up the next time the overlay
+ * opens. */
+static void kb_load_config(dc_keybinds_modal *kb)
 {
     kb->entry_count = 0;
     kb->cat_n = 0;
-    const char *home = getenv("HOME");
-    if (!home || !home[0]) {
-        dc_warn("keybinds-overlay: $HOME unset, cannot locate config.kdl");
+
+    dc_keybind *binds = malloc(sizeof(dc_keybind) * DC_KB_MAX_BINDS);
+    if (!binds) {
+        dc_warn("keybinds-overlay: out of memory loading binds");
         return;
     }
-    char path[512];
-    snprintf(path, sizeof(path), "%s/.config/niri/config.kdl", home);
+    int n = dc_keybinds_load(binds, DC_KB_MAX_BINDS, NULL);
+    for (int i = 0; i < n; i++)
+        kb_add_entry_from_bind(kb, &binds[i]);
+    free(binds);
 
-    char seen[DC_KB_MAX_INCLUDE_FILES][512];
-    int seen_count = 0;
-    kb_parse_file(kb, path, 0, seen, &seen_count);
     kb_group_by_category(kb);
-    dc_info("keybinds-overlay: parsed %d bind(s) in %d categor%s from %d file(s)", kb->entry_count,
-            kb->cat_n, kb->cat_n == 1 ? "y" : "ies", seen_count);
+    dc_info("keybinds-overlay: loaded %d bind(s) in %d categor%s via shared keybind service",
+            kb->entry_count, kb->cat_n, kb->cat_n == 1 ? "y" : "ies");
 }
 
 /* ---------------------------------------------------------------------- *
@@ -976,6 +639,7 @@ static void kb_distribute_columns(dc_keybinds_modal *kb, int cols, int col_cats[
 typedef struct {
     float card_x, card_y, card_w, card_h;
     float content_x, content_y, content_w, content_h;
+    float footer_y; /* baseline for the "Edit ... in Settings" hint */
 } kb_layout;
 
 static kb_layout kb_get_layout(float screen_w, float screen_h)
@@ -992,7 +656,9 @@ static kb_layout kb_get_layout(float screen_w, float screen_h)
     lay.content_x = lay.card_x + DC_KB_PAD + DC_KB_INSET;
     lay.content_y = lay.card_y + DC_KB_PAD + DC_KB_HEADER_H;
     lay.content_w = lay.card_w - 2.0f * DC_KB_PAD - 2.0f * DC_KB_INSET;
-    lay.content_h = lay.card_y + lay.card_h - DC_KB_PAD - DC_KB_BOTTOM_PAD - lay.content_y;
+    lay.content_h =
+        lay.card_y + lay.card_h - DC_KB_PAD - DC_KB_BOTTOM_PAD - DC_KB_FOOTER_H - lay.content_y;
+    lay.footer_y = lay.content_y + lay.content_h + DC_KB_FOOTER_H / 2.0f;
     return lay;
 }
 
@@ -1055,6 +721,26 @@ static void kb_draw_chip(dc_render *r, float x, float y, const char *key)
     nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
     nvgFillColor(vg, tc(t->secondary));
     nvgText(vg, x + w / 2.0f, y + DC_KB_CHIP_H / 2.0f + 0.5f, key_buf, NULL);
+}
+
+/* Subtle pill tag on rows whose bind is managed by dankc's Settings > Keybinds
+ * tab (dc_keybind.managed / dc_kb_entry.managed), so a glance at the cheat
+ * sheet distinguishes dankc-managed binds from user-defined/unmanaged ones. */
+static void kb_draw_managed_badge(dc_render *r, float x, float y)
+{
+    NVGcontext *vg = r->vg;
+    const dc_theme *t = dc_theme_current;
+
+    nvgBeginPath(vg);
+    nvgRoundedRect(vg, x, y, DC_KB_BADGE_W, DC_KB_BADGE_H, DC_KB_BADGE_H / 2.0f);
+    nvgFillColor(vg, tc_alpha(t->primary, 36));
+    nvgFill(vg);
+
+    nvgFontFaceId(vg, r->font_ui);
+    nvgFontSize(vg, 9.0f);
+    nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+    nvgFillColor(vg, tc(t->primary));
+    nvgText(vg, x + DC_KB_BADGE_W / 2.0f, y + DC_KB_BADGE_H / 2.0f + 0.5f, "dankc", NULL);
 }
 
 static void kb_render(dc_keybinds_modal *kb)
@@ -1209,16 +895,21 @@ static void kb_render(dc_keybinds_modal *kb)
                         if (row_y + DC_KB_ROW_H >= lay.content_y && row_y <= lay.content_y + lay.content_h) {
                             kb_draw_chip(kb->render, x, row_y + (DC_KB_ROW_H - DC_KB_CHIP_H) / 2.0f, e->key);
 
+                            float badge_reserve = e->managed ? DC_KB_BADGE_W + 6.0f : 0.0f;
                             char desc_buf[DC_KB_DESC_MAX];
                             snprintf(desc_buf, sizeof(desc_buf), "%s", e->desc);
                             nvgFontFaceId(vg, kb->render->font_ui);
                             nvgFontSize(vg, 12.0f);
-                            float desc_w = col_w - DC_KB_KEY_COL_W;
+                            float desc_w = col_w - DC_KB_KEY_COL_W - badge_reserve;
                             if (desc_w > 8.0f)
                                 kb_ellipsize(vg, desc_buf, sizeof(desc_buf), desc_w);
                             nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
                             nvgFillColor(vg, tc_alpha(t->surface_text, 230));
                             nvgText(vg, x + DC_KB_KEY_COL_W, row_y + DC_KB_ROW_H / 2.0f, desc_buf, NULL);
+
+                            if (e->managed)
+                                kb_draw_managed_badge(kb->render, x + col_w - DC_KB_BADGE_W,
+                                                      row_y + (DC_KB_ROW_H - DC_KB_BADGE_H) / 2.0f);
                         }
                         row_y += DC_KB_ROW_H + DC_KB_ROW_GAP;
                     }
@@ -1241,6 +932,15 @@ static void kb_render(dc_keybinds_modal *kb)
             nvgFill(vg);
         }
     }
+
+    /* --- Footer: points users at Settings > Keybinds for editing dankc-
+     * managed binds (this overlay itself stays strictly read-only). --- */
+    nvgFontFaceId(vg, kb->render->font_ui);
+    nvgFontSize(vg, 11.0f);
+    nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+    nvgFillColor(vg, tc_alpha(t->surface_text, 130));
+    nvgText(vg, lay.card_x + lay.card_w / 2.0f, lay.footer_y,
+            "Edit dankc-managed binds in Settings \xe2\x86\x92 Keybinds", NULL);
 
     nvgEndFrame(vg);
     if ((dc_anim_active(&kb->anim) || kb->closing) && !kb->frame_cb) {
@@ -1313,7 +1013,7 @@ static void kb_show(dc_keybinds_modal *kb, dc_output *output)
     kb->scale120 = (output && output->scale > 0 ? output->scale : 1) * DC_SCALE_BASE;
     kb->scroll = 0.0f;
 
-    kb_parse_config(kb);
+    kb_load_config(kb);
 
     dc_anim_start(&kb->anim, DC_DUR_MEDIUM, DC_EASE_EXPRESSIVE);
 
