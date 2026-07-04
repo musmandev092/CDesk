@@ -418,6 +418,15 @@ typedef struct dc_config {
      * periodic timer into main.c's clock_tick is a later task. */
     char update_terminal_cmd[256];
     int updates_check_interval_min;
+
+    /* Screen recording (docs/29-SMALL-FEATURES-PLAN.md sec.5, services/
+     * screenrec.c): screen_recorder_cmd overrides the auto-probed recorder
+     * binary (wl-screenrec preferred, wf-recorder fallback) -- just the
+     * program name/path, e.g. "wf-recorder"; default "" auto-probes PATH.
+     * screen_recorder_audio, when true, records system audio too (appends the
+     * recorder's audio flag: wl-screenrec --audio / wf-recorder --audio). */
+    char screen_recorder_cmd[256];
+    bool screen_recorder_audio;
 } dc_config;
 
 /* The active config. Read-only for the rest of the app. */

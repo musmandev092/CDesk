@@ -5,6 +5,7 @@
 #include "services/screenrec.h"
 
 #include "core/anim.h"
+#include "core/config.h"
 #include "core/log.h"
 #include "services/notifications.h"
 
@@ -57,10 +58,14 @@ static bool cmd_exists(const char *name)
 }
 
 /* wl-screenrec preferred (lower overhead, GPU-side encode); wf-recorder
- * fallback. A `screenRecorderCmd` config override is planned for a later
- * task (docs/29-SMALL-FEATURES-PLAN.md sec.5) -- this just auto-probes. */
+ * fallback. Honors the `screenRecorderCmd` config override (docs/29 sec.5):
+ * if the user pinned a recorder and it's on PATH, use it verbatim; otherwise
+ * auto-probe. */
 static const char *probe_recorder(void)
 {
+    const char *override = dc_config_current ? dc_config_current->screen_recorder_cmd : NULL;
+    if (override && override[0] && cmd_exists(override))
+        return override;
     if (cmd_exists("wl-screenrec"))
         return "wl-screenrec";
     if (cmd_exists("wf-recorder"))
@@ -165,6 +170,11 @@ bool dc_screenrec_start(struct dc_notifications *n, bool region)
         return false;
     }
 
+    /* Optional system-audio capture: both wl-screenrec and wf-recorder take
+     * `--audio` (docs/29 sec.5, screenRecorderAudio config toggle). */
+    const bool audio = dc_config_current && dc_config_current->screen_recorder_audio;
+    const char *audio_flag = audio ? "--audio" : NULL;
+
     pid_t pid;
     if (region) {
         /* slurp must resolve a geometry before the recorder can start; exec
@@ -174,7 +184,8 @@ bool dc_screenrec_start(struct dc_notifications *n, bool region)
          * with no output file -- dc_screenrec_active() treats that as a
          * clean cancel. */
         char shcmd[900];
-        snprintf(shcmd, sizeof(shcmd), "g=$(slurp) && exec %s -g \"$g\" -f \"%s\"", recorder, path);
+        snprintf(shcmd, sizeof(shcmd), "g=$(slurp) && exec %s %s-g \"$g\" -f \"%s\"",
+                 recorder, audio ? "--audio " : "", path);
         pid = fork();
         if (pid == 0) {
             detach_stdio();
@@ -185,7 +196,10 @@ bool dc_screenrec_start(struct dc_notifications *n, bool region)
         pid = fork();
         if (pid == 0) {
             detach_stdio();
-            execlp(recorder, recorder, "-f", path, (char *)NULL);
+            if (audio_flag)
+                execlp(recorder, recorder, audio_flag, "-f", path, (char *)NULL);
+            else
+                execlp(recorder, recorder, "-f", path, (char *)NULL);
             _exit(127);
         }
     }

@@ -2080,6 +2080,28 @@ static void tab_system(uictx *c)
         c->changed = true;
     }
     ui_hint(c, "Takes effect on the next login (autostart already ran this session)");
+
+    /* Screen recording (services/screenrec.c, docs/29-SMALL-FEATURES-PLAN.md
+     * sec.5): the recorder itself auto-probes wl-screenrec then wf-recorder;
+     * these override the binary and toggle system-audio capture. Driven by the
+     * `screenRecorder` bar widget / IPC record verbs. */
+    ui_section(c, "SCREEN RECORDING");
+    bool rec_focus = c->s->focus_field == 21;
+    char recbuf[256];
+    if (rec_focus)
+        snprintf(recbuf, sizeof(recbuf), "%s", c->s->edit_buf);
+    else
+        copy_trunc(recbuf, sizeof(recbuf), c->cfg->screen_recorder_cmd);
+    if (ui_textfield(c, "Recorder command (optional)", recbuf, rec_focus)) {
+        c->s->focus_field = 21;
+        copy_trunc(c->s->edit_buf, sizeof(c->s->edit_buf), c->cfg->screen_recorder_cmd);
+    }
+    ui_hint(c, "Blank auto-probes wl-screenrec then wf-recorder on PATH");
+    if (ui_toggle(c, "Record system audio", "Capture audio alongside the screen (--audio)",
+                  c->cfg->screen_recorder_audio)) {
+        c->cfg->screen_recorder_audio = !c->cfg->screen_recorder_audio;
+        c->changed = true;
+    }
 }
 
 /* docs/14-COMPLETION-PLAN.md W2.3: OSD position + auto-hide timeout,
@@ -5174,6 +5196,11 @@ static void commit_edit(dc_settings *s)
               * (wallpaper_cycle_dir) -- only consulted by the next
               * dc_wallpaper_cycle_next() tick, nothing to repaint now. */
         copy_trunc(cfg->wallpaper_cycle_dir, sizeof(cfg->wallpaper_cycle_dir), s->edit_buf);
+        break;
+    case 21: /* System tab's screen-recorder binary override
+              * (screen_recorder_cmd) -- consulted at the next
+              * dc_screenrec_start(), nothing to repaint now. */
+        copy_trunc(cfg->screen_recorder_cmd, sizeof(cfg->screen_recorder_cmd), s->edit_buf);
         break;
     default:
         break;

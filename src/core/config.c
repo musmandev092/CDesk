@@ -807,6 +807,8 @@ void dc_config_load(void)
 
     get_string(root, "updateTerminalCmd", config.update_terminal_cmd, sizeof(config.update_terminal_cmd));
     get_int(root, "updatesCheckIntervalMin", &config.updates_check_interval_min, 0, 1440);
+    get_string(root, "screenRecorderCmd", config.screen_recorder_cmd, sizeof(config.screen_recorder_cmd));
+    get_bool(root, "screenRecorderAudio", &config.screen_recorder_audio);
     cJSON_Delete(root);
 
     apply_theme();
@@ -1029,6 +1031,9 @@ void dc_config_save(void)
     if (config.update_terminal_cmd[0])
         cJSON_AddStringToObject(root, "updateTerminalCmd", config.update_terminal_cmd);
     cJSON_AddNumberToObject(root, "updatesCheckIntervalMin", config.updates_check_interval_min);
+    if (config.screen_recorder_cmd[0])
+        cJSON_AddStringToObject(root, "screenRecorderCmd", config.screen_recorder_cmd);
+    cJSON_AddBoolToObject(root, "screenRecorderAudio", config.screen_recorder_audio);
 
     char *text = cJSON_Print(root);
     cJSON_Delete(root);
