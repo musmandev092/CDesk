@@ -17,6 +17,7 @@
 #include "services/net.h"
 #include "services/nightlight.h"
 #include "services/niri_input.h"
+#include "services/notifications.h"
 #include "services/power.h"
 #include "services/printers.h"
 #include "services/systheme.h"
@@ -35,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <pwd.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
@@ -1442,12 +1444,108 @@ static void tab_weather(uictx *c)
     }
 }
 
+/* Format dc_notif_dnd_remaining_sec()'s result as a one-line status for the
+ * DND section hint (docs/26-DND-SCHEDULING-PLAN.md UI). Mirrors notifcenter.
+ * c's countdown label, just spelled out in full since Settings has room. */
+static void dnd_countdown_label(char *out, size_t outsz)
+{
+    int64_t rem = dc_notif_dnd_remaining_sec();
+    if (rem < 0) {
+        snprintf(out, outsz, "Do Not Disturb is off");
+    } else if (rem == 0) {
+        snprintf(out, outsz, "Do Not Disturb is on (no end time)");
+    } else {
+        int h = (int)(rem / 3600);
+        int m = (int)((rem % 3600) / 60);
+        int s = (int)(rem % 60);
+        if (h > 0)
+            snprintf(out, outsz, "Resumes in %dh %dm", h, m);
+        else if (m > 0)
+            snprintf(out, outsz, "Resumes in %dm %ds", m, s);
+        else
+            snprintf(out, outsz, "Resumes in %ds", s);
+    }
+}
+
+/* Per-app rule action/urgency segmented option labels (docs/26-DND-
+ * SCHEDULING-PLAN.md rule-engine section) -- indices match core/config.h's
+ * dc_notif_rule.action (0-3) / .urgency (-1..2, offset by +1 for the array). */
+static const char *const RULE_ACTION_OPTS[4] = {"Mute", "Ignore", "Popup only", "No history"};
+static const char *const RULE_URGENCY_OPTS[4] = {"Keep", "Low", "Normal", "Critical"};
+
+/* Case-insensitive dedup check against existing rules' match strings, same
+ * comparison notifications.c's method_notify() rule evaluator uses. */
+static bool notif_rule_match_exists(const dc_notif_rule *arr, int n, const char *match)
+{
+    for (int i = 0; i < n; i++)
+        if (strcasecmp(arr[i].match, match) == 0)
+            return true;
+    return false;
+}
+
+/* Compact-remove rule `idx`, shifting later entries down (same pattern as
+ * widget_remove_from() above, just for a struct array instead of a char[][]
+ * one). */
+static void notif_rule_remove_at(dc_config *cfg, int idx)
+{
+    for (int i = idx; i + 1 < cfg->notif_rules_n; i++)
+        cfg->notif_rules[i] = cfg->notif_rules[i + 1];
+    cfg->notif_rules_n--;
+}
+
 static void tab_notifications(uictx *c)
 {
     ui_section(c, "DO NOT DISTURB");
     if (ui_toggle(c, "Do not disturb", "Suppress new toast popups (still saved to history)",
                   c->cfg->dnd_enabled)) {
         c->cfg->dnd_enabled = !c->cfg->dnd_enabled;
+        c->changed = true;
+    }
+
+    /* Quick presets (docs/26-DND-SCHEDULING-PLAN.md UI) -- mirrors
+     * notifcenter.c's DND chip row (Off|15m|1h|Until <hour>|Forever). These
+     * call straight into the dc_notif_dnd_* API (notifications.h), which
+     * mutates + saves core/config.h's dnd_enabled/dnd_until_epoch itself, so
+     * no c->changed is strictly required for persistence -- it's still set
+     * so the panel redraws immediately with the new toggle/countdown state. */
+    char hour_label[16];
+    snprintf(hour_label, sizeof(hour_label), "Until %d:00", c->cfg->dnd_until_hour);
+    const char *preset_opts[5] = {"Off", "15m", "1h", hour_label, "Forever"};
+    int64_t remaining = dc_notif_dnd_remaining_sec();
+    int dnd_cur = remaining < 0 ? 0 : (remaining == 0 ? 4 : -1);
+    int dnd_clicked = ui_segmented(c, "Quick presets", preset_opts, 5, dnd_cur);
+    if (dnd_clicked >= 0) {
+        switch (dnd_clicked) {
+        case 0:
+            dc_notif_dnd_stop(NULL);
+            break;
+        case 1:
+            dc_notif_dnd_start(NULL, 15 * 60);
+            break;
+        case 2:
+            dc_notif_dnd_start(NULL, 60 * 60);
+            break;
+        case 3:
+            dc_notif_dnd_start_until_hour(NULL, c->cfg->dnd_until_hour);
+            break;
+        case 4:
+            dc_notif_dnd_start(NULL, 0);
+            break;
+        }
+        c->changed = true;
+    }
+    if (ui_stepper(c, "\"Until\" resume hour", &c->cfg->dnd_until_hour, 0, 23, 1))
+        c->changed = true;
+    char dnd_hint[64];
+    dnd_countdown_label(dnd_hint, sizeof(dnd_hint));
+    ui_hint(c, dnd_hint);
+
+    ui_section(c, "PRIVACY");
+    if (ui_toggle(c, "Hide notification content in popups",
+                  "Toast popups show \"New notification\" instead of the summary/body "
+                  "(the notification center still shows everything)",
+                  c->cfg->notif_privacy_mode)) {
+        c->cfg->notif_privacy_mode = !c->cfg->notif_privacy_mode;
         c->changed = true;
     }
 
@@ -1479,6 +1577,43 @@ static void tab_notifications(uictx *c)
         if (ui_slider(c, "Volume", &c->cfg->sound_volume, 0.0f, 1.0f, vv))
             c->changed = true;
     }
+
+    /* Per-app rules (docs/26-DND-SCHEDULING-PLAN.md rule-engine section):
+     * first-match-wins list evaluated in notifications.c's method_notify()
+     * against app_name/desktop-entry, case-insensitively. Each row is its own
+     * match label + action/urgency segmented pair + a remove-X list row, same
+     * "one row body, shifted removal" shape as tab_dock()'s pinned-apps list
+     * above. */
+    ui_section(c, "PER-APP RULES");
+    for (int i = 0; i < c->cfg->notif_rules_n; i++) {
+        dc_notif_rule *r = &c->cfg->notif_rules[i];
+        if (ui_list_row(c, r->match, RULE_ACTION_OPTS[r->action], IC_REMOVE, false) == 2) {
+            notif_rule_remove_at(c->cfg, i);
+            c->changed = true;
+            break; /* the array compacted under us -- stop iterating this pass */
+        }
+        int action_clicked = ui_segmented(c, "Action", RULE_ACTION_OPTS, 4, r->action);
+        if (action_clicked >= 0 && action_clicked != r->action) {
+            r->action = action_clicked;
+            c->changed = true;
+        }
+        int urgency_clicked = ui_segmented(c, "Urgency override", RULE_URGENCY_OPTS, 4,
+                                           r->urgency + 1);
+        if (urgency_clicked >= 0 && urgency_clicked != r->urgency + 1) {
+            r->urgency = urgency_clicked - 1;
+            c->changed = true;
+        }
+    }
+    if (c->cfg->notif_rules_n == 0)
+        ui_hint(c, "No per-app rules yet");
+    bool rule_focus = c->s->focus_field == 16;
+    if (ui_textfield(c,
+                     "Add a rule (app name or desktop-entry id, e.g. \"discord\" -- Enter to add)",
+                     rule_focus ? c->s->edit_buf : "", rule_focus)) {
+        c->s->focus_field = 16;
+        c->s->edit_buf[0] = '\0';
+    }
+    ui_hint(c, "New rules default to Mute / Keep urgency -- adjust above after adding");
 }
 
 static void tab_launcher(uictx *c)
@@ -4854,6 +4989,19 @@ static void commit_edit(dc_settings *s)
               * treats an empty/NULL alias as "remove the entry"). */
         dc_config_audio_set_alias(s->audio_rename_target,
                                   s->edit_buf[0] ? s->edit_buf : NULL);
+        break;
+    case 16: /* Notifications tab "add rule" draft (docs/26-DND-SCHEDULING-
+              * PLAN.md UI, DND T4) -- dedup'd case-insensitively against
+              * existing rules' match strings, new entries default to
+              * mute/keep (dc_notif_rule's zero-init action + urgency=-1). */
+        if (s->edit_buf[0] && cfg->notif_rules_n < DC_CONFIG_NOTIF_RULES_MAX &&
+            !notif_rule_match_exists(cfg->notif_rules, cfg->notif_rules_n, s->edit_buf)) {
+            dc_notif_rule *r = &cfg->notif_rules[cfg->notif_rules_n];
+            *r = (dc_notif_rule){0};
+            r->urgency = -1;
+            copy_trunc(r->match, sizeof(r->match), s->edit_buf);
+            cfg->notif_rules_n++;
+        }
         break;
     default:
         break;
