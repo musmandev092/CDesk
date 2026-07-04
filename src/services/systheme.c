@@ -41,6 +41,7 @@
 #include "services/systheme.h"
 
 #include "services/systheme_apps.h"
+#include "services/systheme_browser.h"
 #include "services/systheme_editors.h"
 #include "services/systheme_internal.h"
 #include "services/systheme_launchers.h"
@@ -888,4 +889,10 @@ void dc_systheme_apply(const struct dc_config *cfg)
         dc_systheme_apply_sublime(light);
     if (cfg->systheme_emacs && dc_systheme_app_detected("emacs"))
         dc_systheme_apply_emacs(light);
+    if (cfg->systheme_firefox && dc_systheme_app_detected("firefox"))
+        dc_systheme_apply_firefox(light);
+    if (cfg->systheme_qutebrowser && dc_systheme_app_detected("qutebrowser"))
+        dc_systheme_apply_qutebrowser(light);
+    if (cfg->systheme_discord && dc_systheme_app_detected("discord"))
+        dc_systheme_apply_discord(light);
 }
