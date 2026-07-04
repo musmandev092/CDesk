@@ -14,6 +14,7 @@
 #define DC_SERVICES_AUDIO_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 struct dc_loop;
 
@@ -45,5 +46,26 @@ bool dc_audio_read(dc_audio_info *out);
  * async refresh right away, so the change is reflected within about one
  * wpctl round-trip instead of waiting up to DC_AUDIO_CACHE_SECONDS. */
 void dc_audio_set_volume(int percent);
+
+/* Read the default *source* (mic) mute state -- never blocks the caller for
+ * more than one `wpctl get-volume @DEFAULT_AUDIO_SOURCE@` popen() round trip
+ * (~35-40ms), and even that only once every DC_AUDIO_SOURCE_CACHE_SECONDS
+ * (audio.c); every other call just serves the cache. Kept a plain
+ * synchronous popen() (not the async fork+pipe machinery dc_audio_read()
+ * uses for the sink) since it's polled far less often than the sink used to
+ * be before that optimization -- same tradeoff ui/controlcenter.c's and
+ * ui/settings.c's own private `audio_source_read()` copies already make.
+ * `out->volume` is unused by callers that only care about mute (the OSD),
+ * populated anyway since it's free from the same parse. Returns true if the
+ * cached reading is a successful one. */
+bool dc_audio_read_source(dc_audio_info *out);
+
+/* Read the default sink's human-readable device name (e.g. "Built-in Audio
+ * Analog Stereo", from `wpctl inspect @DEFAULT_AUDIO_SINK@`'s
+ * node.description) into `out` (truncated to out_sz). Same synchronous-
+ * popen()-with-cache shape and cadence as dc_audio_read_source() above.
+ * Returns true if a name was found; `out` is always NUL-terminated (empty
+ * string on failure). */
+bool dc_audio_read_sink_name(char *out, size_t out_sz);
 
 #endif /* DC_SERVICES_AUDIO_H */

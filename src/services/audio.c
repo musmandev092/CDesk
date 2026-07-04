@@ -196,3 +196,102 @@ void dc_audio_set_volume(int percent)
     g_cache_time = 0;
     audio_fetch_start();
 }
+
+/* --- default source (mic) mute + default sink device name --------------
+ *
+ * Added for the mic-mute and audio-output-switch OSD variants (main.c's
+ * clock_tick polls these every tick and diffs, exactly like the sink volume/
+ * mute block above). Both are plain synchronous popen() calls, each behind
+ * their own DC_AUDIO_SOURCE_CACHE_SECONDS/DC_AUDIO_SINK_NAME_CACHE_SECONDS
+ * window rather than the async fork+pipe machinery above: that machinery
+ * exists because the sink read used to run every ~1s before the T1.2
+ * optimization widened it to 10s; these two are never polled more often than
+ * once every 10s to begin with, so a single blocking popen() call that rare
+ * is the same tradeoff ui/controlcenter.c's/ui/settings.c's own private
+ * audio_source_read()/read_audio_device_names() copies already make (just
+ * with a longer cache window here, since main.c's poll runs continuously in
+ * the background rather than only while a popout is open). */
+#define DC_AUDIO_SOURCE_CACHE_SECONDS 10
+#define DC_AUDIO_SINK_NAME_CACHE_SECONDS 10
+
+bool dc_audio_read_source(dc_audio_info *out)
+{
+    static dc_audio_info cache;
+    static bool cache_ok;
+    static time_t cache_time;
+
+    time_t now = time(NULL);
+    if (cache_time != 0 && now - cache_time < DC_AUDIO_SOURCE_CACHE_SECONDS) {
+        *out = cache;
+        return cache_ok;
+    }
+    cache_time = now;
+
+    out->available = false;
+    out->volume = 0;
+    out->muted = false;
+
+    FILE *pipe = popen("wpctl get-volume @DEFAULT_AUDIO_SOURCE@ 2>/dev/null", "r");
+    bool ok = false;
+    if (pipe) {
+        char line[128];
+        if (fgets(line, sizeof(line), pipe)) {
+            float volume = 0.0f;
+            if (sscanf(line, "Volume: %f", &volume) == 1) {
+                out->volume = (int)(volume * 100.0f + 0.5f);
+                out->available = true;
+                ok = true;
+            }
+            if (strstr(line, "MUTED"))
+                out->muted = true;
+        }
+        pclose(pipe);
+    }
+
+    cache = *out;
+    cache_ok = ok;
+    return ok;
+}
+
+bool dc_audio_read_sink_name(char *out, size_t out_sz)
+{
+    static char cache[64];
+    static bool cache_ok;
+    static time_t cache_time;
+
+    time_t now = time(NULL);
+    if (cache_time == 0 || now - cache_time >= DC_AUDIO_SINK_NAME_CACHE_SECONDS) {
+        cache_time = now;
+        cache[0] = '\0';
+        cache_ok = false;
+
+        /* `wpctl inspect` prints a property line like
+         * `    node.description = "Built-in Audio Analog Stereo"`; we grep by
+         * key, not by any leading default-marker, so this doesn't care
+         * whether inspect prefixes it with one. */
+        FILE *pipe = popen("wpctl inspect @DEFAULT_AUDIO_SINK@ 2>/dev/null", "r");
+        if (pipe) {
+            char line[256];
+            while (fgets(line, sizeof(line), pipe)) {
+                char *key = strstr(line, "node.description");
+                if (!key)
+                    continue;
+                char *q1 = strchr(key, '"');
+                char *q2 = q1 ? strchr(q1 + 1, '"') : NULL;
+                if (!q1 || !q2)
+                    continue;
+                size_t len = (size_t)(q2 - (q1 + 1));
+                if (len >= sizeof(cache))
+                    len = sizeof(cache) - 1;
+                memcpy(cache, q1 + 1, len);
+                cache[len] = '\0';
+                cache_ok = true;
+                break;
+            }
+            pclose(pipe);
+        }
+    }
+
+    snprintf(out, out_sz, "%s", cache);
+    return cache_ok;
+}

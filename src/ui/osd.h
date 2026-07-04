@@ -39,4 +39,25 @@ void dc_osd_show_volume(dc_osd *osd, struct dc_output *output, int volume, bool 
  * and (re)start the auto-hide timer. */
 void dc_osd_show_brightness(dc_osd *osd, struct dc_output *output, int brightness);
 
+/* The variants below reuse the exact same layer-surface/positioning/timeout/
+ * animation infra as volume and brightness above, just with an icon + short
+ * text label instead of a progress bar + percent (docs task: "extend OSD for
+ * mic mute / media / power profile / output switch"). */
+
+/* Mic (default source) mute toggled. */
+void dc_osd_show_mic_mute(dc_osd *osd, struct dc_output *output, bool muted);
+
+/* Media playback status transitioned (playing<->paused). `title` may be NULL
+ * or empty (falls back to a generic "Playing"/"Paused" label); long titles
+ * are ellipsized to fit, same as elsewhere in the codebase. */
+void dc_osd_show_media(dc_osd *osd, struct dc_output *output, bool playing, const char *title);
+
+/* Power profile switched to a new mode. `label` is a human string, e.g. from
+ * services/power.h's dc_power_mode_label(). */
+void dc_osd_show_power_profile(dc_osd *osd, struct dc_output *output, const char *label);
+
+/* Default audio output device changed. `device_name` is the human-readable
+ * sink name (e.g. from `wpctl inspect`'s node.description). */
+void dc_osd_show_output_switch(dc_osd *osd, struct dc_output *output, const char *device_name);
+
 #endif /* DC_UI_OSD_H */
