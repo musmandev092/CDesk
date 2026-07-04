@@ -41,6 +41,7 @@
 #include "services/systheme.h"
 
 #include "services/systheme_internal.h"
+#include "services/systheme_term.h"
 
 #include "core/config.h"
 #include "core/log.h"
@@ -549,8 +550,15 @@ void dc_systheme_apply(const struct dc_config *cfg)
     if (cfg->systheme_gtk && dc_systheme_app_detected("gtk"))
         apply_gtk(light);
 
-    /* Qt/Alacritty/VS Code/kitty/foot emitters land in later tasks; the
-     * config toggles + detection ids already exist (see config.h) so this
-     * function only needs new `if (cfg->systheme_X && ...) apply_X(...);`
-     * lines added here, no other wiring changes. */
+    if (cfg->systheme_alacritty && dc_systheme_app_detected("alacritty"))
+        dc_systheme_apply_alacritty(light);
+    if (cfg->systheme_kitty && dc_systheme_app_detected("kitty"))
+        dc_systheme_apply_kitty(light);
+    if (cfg->systheme_foot && dc_systheme_app_detected("foot"))
+        dc_systheme_apply_foot(light);
+
+    /* Qt/VS Code emitters land in later tasks; the config toggles +
+     * detection ids already exist (see config.h) so this function only
+     * needs a new `if (cfg->systheme_X && ...) apply_X(...);` line added
+     * here, no other wiring changes. */
 }

@@ -246,3 +246,100 @@ extern "C" bool dc_dynamic_from_image(const char *image_path, bool light, dc_the
     *out = build_scheme(seed, light);
     return true;
 }
+
+// --- ANSI-16 terminal palette (see dynamic.h's dc_dynamic_ansi16 comment) --
+//
+// Six chromatic slots (red/yellow/green/cyan/blue/magenta) anchored to a
+// clean 60-degree hue wheel, harmonized *slightly* toward the theme's
+// primary hue via MCU's real Blend.harmonize formula (rotate by half the
+// hue gap to the target, capped at 15 degrees -- material-color-utilities'
+// Blend.java), then rendered at a per-role target chroma/tone chosen to
+// match DankMaterialShell's own matugen-generated reference terminal
+// palette (~/.config/alacritty/dank-theme.toml, stock "green" theme):
+// verified within a handful of 8-bit codes for red/yellow/green, whose
+// harmonized hue stays close to its canonical anchor. cyan/blue/magenta
+// keep the reference's brightness/chroma level but NOT its hue -- the real
+// DMS/matugen output fully collapses those three onto the primary hue for
+// this particular (green) theme, which a genuinely *slight* (<=15 degree)
+// harmonize can't reproduce and, more importantly, shouldn't: a different
+// stock primary must not turn "blue" into the same colour as "red".
+namespace {
+
+struct AnsiRole {
+    double hue;
+    double normal_chroma, normal_tone;
+    double bright_chroma, bright_tone;
+};
+
+// clang-format off
+const AnsiRole kAnsiRoles[6] = {
+    /* red     */ {25.0,  45.88, 55.33, 31.78, 72.73},
+    /* yellow  */ {85.0,  47.82, 80.87, 34.98, 95.03},
+    /* green   */ {145.0, 62.15, 63.96, 52.24, 77.39},
+    /* cyan    */ {205.0, 60.98, 63.98, 38.23, 90.85},
+    /* blue    */ {265.0, 67.91, 60.18, 57.08, 70.41},
+    /* magenta */ {325.0, 52.34, 29.14, 53.81, 83.01},
+};
+// clang-format on
+
+// ANSI slot index (0=black..7=white) that each kAnsiRoles entry (authored in
+// colour-wheel order: red,yellow,green,cyan,blue,magenta) maps to; +8 for
+// the bright variant. Standard ANSI-16 order is
+// black,red,green,yellow,blue,magenta,cyan,white.
+const int kAnsiSlot[6] = {1, 3, 2, 6, 4, 5};
+
+inline double angular_diff(double a, double b)
+{
+    double d = std::fmod(std::fabs(a - b), 360.0);
+    return d > 180.0 ? 360.0 - d : d;
+}
+
+// MCU Blend.harmonize(): rotate `hue` toward `target` by half their angular
+// gap, capped at 15 degrees -- a slight nudge, never a full snap.
+inline double harmonize_hue(double hue, double target)
+{
+    double diff = angular_diff(hue, target);
+    double rotation = std::min(diff * 0.5, 15.0);
+    double forward = std::fmod(target - hue + 360.0, 360.0);
+    double dir = forward <= 180.0 ? 1.0 : -1.0;
+    return std::fmod(hue + dir * rotation + 360.0, 360.0);
+}
+
+} // namespace
+
+extern "C" void dc_dynamic_ansi16(const dc_theme *t, bool light, dc_color out[16])
+{
+    Hct primary = dc_hct::hct_from_argb(Argb{t->primary.r, t->primary.g, t->primary.b});
+    Hct hs = dc_hct::hct_from_argb(Argb{t->surface.r, t->surface.g, t->surface.b});
+    Hct ht = dc_hct::hct_from_argb(Argb{t->surface_text.r, t->surface_text.g, t->surface_text.b});
+
+    // black/white basis: whichever of surface/surface_text is darker is the
+    // "ink" swatch (black derives from it), the lighter one is the "paper"
+    // swatch (white derives from it) -- correct in both dark and light mode
+    // without needing the `light` flag here.
+    bool surface_is_darker = hs.tone <= ht.tone;
+    const Hct &dark_sw = surface_is_darker ? hs : ht;
+    const Hct &light_sw = surface_is_darker ? ht : hs;
+
+    Argb black = dc_hct::hct_solve(dark_sw.hue, dark_sw.chroma, dark_sw.tone);
+    Argb white = dc_hct::hct_solve(light_sw.hue, (dark_sw.chroma + light_sw.chroma) / 2.0 + 3.0,
+            light_sw.tone * 0.81);
+    Argb bright_black = dc_hct::hct_solve(dark_sw.hue, dark_sw.chroma + 3.5,
+            dark_sw.tone + 0.478 * (100.0 - dark_sw.tone));
+    Argb bright_white = dc_hct::hct_solve(light_sw.hue, light_sw.chroma * 1.1,
+            light_sw.tone + 0.85 * (100.0 - light_sw.tone));
+
+    out[0] = to_dc(black);
+    out[7] = to_dc(white);
+    out[8] = to_dc(bright_black);
+    out[15] = to_dc(bright_white);
+
+    for (int i = 0; i < 6; i++) {
+        const AnsiRole &role = kAnsiRoles[i];
+        double hue = harmonize_hue(role.hue, primary.hue);
+        double normal_tone = light ? 100.0 - role.normal_tone : role.normal_tone;
+        double bright_tone = light ? 100.0 - role.bright_tone : role.bright_tone;
+        out[kAnsiSlot[i]] = to_dc(dc_hct::hct_solve(hue, role.normal_chroma, normal_tone));
+        out[kAnsiSlot[i] + 8] = to_dc(dc_hct::hct_solve(hue, role.bright_chroma, bright_tone));
+    }
+}
