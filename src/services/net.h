@@ -265,4 +265,64 @@ void dc_net_hotspot_stop(void);
  * non-NULL) is filled with the active connection's SSID. */
 bool dc_net_hotspot_active(char *ssid_out, size_t len);
 
+/* --- VPN (saved profiles) --------------------------------------------------
+ * docs/29-SMALL-FEATURES-PLAN.md sec.1 -- same
+ * org.freedesktop.NetworkManager.Settings enumeration as the saved-Wi-Fi list
+ * above (Settings.ListConnections + per-connection GetSettings), just
+ * filtered to connection.type == "vpn" (openvpn/openconnect/etc. via
+ * NetworkManager's plugin connections) or "wireguard" (NM's native WireGuard
+ * support) instead of "802-11-wireless". v1 is saved profiles only -- no
+ * secret-agent, so a profile whose secrets NM doesn't already have cached
+ * (flagged not-saved in its own config) will simply fail to activate; the
+ * caller surfaces whatever error text NetworkManager returns (dc_warn() logs
+ * it here same as every other write path in this file; there is no
+ * dedicated error-out parameter, following dc_net_saved_forget()'s
+ * bool-return convention rather than dc_net_wifi_connect_poll()'s async
+ * job/err-buffer one, since activate/deactivate here are plain synchronous
+ * D-Bus calls, not a polled multi-step job). */
+#define DC_NET_VPN_MAX 16
+
+typedef struct dc_net_vpn {
+    char path[64];             /* Settings/Connection object path -- stable id to
+                                 * pass to dc_net_vpn_activate()/_deactivate() */
+    char id[64];                /* connection.id, e.g. "Work VPN" -- display name */
+    bool type_is_wireguard;     /* connection.type == "wireguard" (vs plain "vpn") */
+    bool active;                /* a NetworkManager.ActiveConnections entry currently
+                                  * points its Connection property at this profile */
+    char active_conn_path[64]; /* that ActiveConnection's object path when `active`,
+                                 * else empty -- pass-through convenience, not needed
+                                 * by dc_net_vpn_deactivate() (which re-resolves it
+                                 * itself so callers can pass a stale/cached `path`) */
+} dc_net_vpn;
+
+/* List all saved vpn/wireguard connections (Settings.ListConnections +
+ * per-connection GetSettings, filtered to connection.type == "vpn" or
+ * "wireguard"). Synchronous, same cost class as dc_net_saved_list() -- cheap
+ * enough to call each render frame a VPN settings section is visible.
+ * Cross-references org.freedesktop.NetworkManager's own ActiveConnections
+ * property (one Get + one "Connection" property Get per active connection)
+ * to fill `active`/`active_conn_path`. Returns the number of entries written
+ * to `out` (capped at `max`); 0 (not an error) if NetworkManager has no vpn/
+ * wireguard profiles saved, or the system bus/NetworkManager is unavailable. */
+int dc_net_vpn_list(dc_net_vpn *out, int max);
+
+/* Activate a saved VPN/WireGuard profile: NetworkManager.ActivateConnection
+ * (conn_path, "/", "/") -- no specific device or specific-object, matching
+ * NM's own `nmcli connection up` behavior for VPN connections (NM picks the
+ * device/base connection itself). Returns true on success (or under
+ * DANKC_NET_DRYRUN, logged instead of sent -- see dc_net_hotspot_stop()'s
+ * header comment for the shared convention). On failure, NetworkManager's
+ * error text is logged via dc_warn() (v1 has no secret-agent, so a profile
+ * needing fresh credentials NM doesn't already have cached will fail here --
+ * expected, not a bug). */
+bool dc_net_vpn_activate(const char *conn_path);
+
+/* Deactivate a VPN/WireGuard profile: resolves the matching
+ * NetworkManager.ActiveConnections entry (by its Connection property) and
+ * calls DeactivateConnection() on that, mirroring dc_net_eth_disconnect()/
+ * dc_net_hotspot_stop()'s pattern. Returns true on success (or under
+ * DANKC_NET_DRYRUN). Returns false (no D-Bus call made) if `conn_path` isn't
+ * currently active -- nothing to deactivate. */
+bool dc_net_vpn_deactivate(const char *conn_path);
+
 #endif /* DC_SERVICES_NET_H */
