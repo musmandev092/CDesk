@@ -44,6 +44,7 @@
 #include "services/systheme_editors.h"
 #include "services/systheme_internal.h"
 #include "services/systheme_launchers.h"
+#include "services/systheme_misc.h"
 #include "services/systheme_notify.h"
 #include "services/systheme_qtkde.h"
 #include "services/systheme_term.h"
@@ -888,4 +889,13 @@ void dc_systheme_apply(const struct dc_config *cfg)
         dc_systheme_apply_sublime(light);
     if (cfg->systheme_emacs && dc_systheme_app_detected("emacs"))
         dc_systheme_apply_emacs(light);
+
+    if (cfg->systheme_btop && dc_systheme_app_detected("btop"))
+        dc_systheme_apply_btop(light);
+    if (cfg->systheme_cava && dc_systheme_app_detected("cava"))
+        dc_systheme_apply_cava(light);
+    if (cfg->systheme_zathura && dc_systheme_app_detected("zathura"))
+        dc_systheme_apply_zathura(light);
+    if (cfg->systheme_spicetify && dc_systheme_app_detected("spicetify"))
+        dc_systheme_apply_spicetify(light);
 }
