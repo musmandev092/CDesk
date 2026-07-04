@@ -11,6 +11,7 @@
 #include "services/bluez.h"
 #include "services/display.h"
 #include "services/firewall.h"
+#include "services/keybinds.h"
 #include "services/logind.h"
 #include "services/net.h"
 #include "services/nightlight.h"
@@ -122,6 +123,10 @@
  * idle/lid extend the existing TAB_TIME/TAB_POWER tabs, no new icon needed. */
 #define IC_SHIELD DC_ICON_SHIELD
 #define IC_MOUSE DC_ICON_MOUSE
+/* docs/23-KEYBIND-EDITING-PLAN.md sec.1/KB-T3: Keybinds tab. Reuses
+ * DC_ICON_KEYBOARD, already in the font subset via controlcenter.c's device
+ * icon for keyboard input sources. */
+#define IC_KEYBOARD DC_ICON_KEYBOARD
 
 typedef enum {
     TAB_PERSONALIZATION = 0,
@@ -146,6 +151,7 @@ typedef enum {
     TAB_POWER,
     TAB_LOCKSCREEN,
     TAB_WINDOW_RULES,
+    TAB_KEYBINDS,
     TAB_MUX,
     TAB_SYSTEM_UPDATER,
     TAB_PRINTER,
@@ -177,7 +183,8 @@ static const s_tab_def TABS[TAB_COUNT] = {
     {IC_LANGUAGE, "Locale"},              {IC_COMPUTER, "System"},
     {IC_TUNE, "OSD"},                     {IC_COLOR_LENS, "Theme & Colors"},
     {IC_POWER, "Power"},                  {IC_LOCK_SCREEN, "Lock Screen"},
-    {IC_WINDOW_RULES, "Window Rules"},    {IC_MUX, "Multiplexer"},
+    {IC_WINDOW_RULES, "Window Rules"},    {IC_KEYBOARD, "Keybinds"},
+    {IC_MUX, "Multiplexer"},
     {IC_SYSTEM_UPDATER, "System Updater"}, {IC_PRINTER, "Printer"},
     {IC_SHIELD, "Firewall"},               {IC_MOUSE, "Mouse & Keyboard"},
     {IC_USERS, "Users"},                  {IC_INFO, "About"},
@@ -228,6 +235,23 @@ struct dc_settings {
     bool wr_new_maximized;
     bool wr_new_opacity_enabled;
     float wr_new_opacity;
+
+    /* Keybinds tab (docs/23-KEYBIND-EDITING-PLAN.md sec.1/3, KB-T3): the
+     * in-progress "add a bind" form + chord-capture state. Not dc_config/
+     * config.json state -- dc_keybinds_load()/persist() (services/keybinds.h,
+     * KB-T1) own the actual ~/.config/niri/dankc-binds.kdl fragment, this is
+     * purely the draft the UI is building before it calls persist(). */
+    bool kb_capture;              /* true while a zwp_keyboard_shortcuts_inhibitor
+                                    * is active and dc_settings_handle_key() is
+                                    * consuming every key as chord capture */
+    char kb_new_chord[64];        /* DC_KEYBIND_CHORD_MAX, captured chord, "" if
+                                    * none recorded yet this add-form session */
+    int kb_mode;                  /* 0 niri action, 1 dankc action, 2 custom cmd */
+    int kb_niri_idx;               /* selected index into dc_keybinds_niri_actions(),
+                                    * -1 none chosen */
+    int kb_dankc_idx;             /* selected index into dc_keybinds_dankc_actions() */
+    char kb_custom_cmd[160];      /* mode 2: free shell command, spawned via sh -c */
+    char kb_title[96];            /* DC_KEYBIND_TITLE_MAX: optional hotkey-overlay-title */
 
     /* Displays tab (docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.3): which
      * monitor card's detail section is expanded, and whether that monitor's
@@ -3556,6 +3580,390 @@ static void tab_window_rules(uictx *c)
     }
 }
 
+/* ====================== Keybinds tab (docs/23-KEYBIND-EDITING-PLAN.md,
+ * KB-T3) ======================
+ *
+ * Cloned from tab_window_rules()/wr_* above (managed-vs-read-only CRUD
+ * shape: STATUS -> YOUR BINDS (managed, removable) -> EXISTING BINDS
+ * (read-only) -> RESET -> ADD form), but unlike wr_* -- which is its own
+ * hand-rolled KDL parser/writer because it predates services/keybinds.h --
+ * this tab is a thin view over the KB-T1 service: dc_keybinds_load()/
+ * dc_keybinds_persist() own all the parsing, serialization, include-wiring,
+ * backup and rollback; kb_* here only tracks which of the loaded binds are
+ * "ours" and builds the in-progress add-form draft (dc_settings.kb_*
+ * fields).
+ */
+
+#define DC_KB_TAB_MAX 512
+
+static dc_keybind g_kb_all[DC_KB_TAB_MAX];
+static int g_kb_n = 0;
+static bool g_kb_dirty = true; /* reload from disk (via the service) next render */
+
+static void kb_ensure_loaded(void)
+{
+    if (!g_kb_dirty)
+        return;
+    g_kb_n = dc_keybinds_load(g_kb_all, DC_KB_TAB_MAX, NULL);
+    g_kb_dirty = false;
+}
+
+/* Rebuilds the managed subset of g_kb_all[] (optionally skipping
+ * `drop_idx`, for a "replace" -- pass -1 for a plain resync) and hands it to
+ * dc_keybinds_persist(), which owns the actual
+ * ~/.config/niri/dankc-binds.kdl rewrite + include-wiring + validate/
+ * rollback (all gated by $DANKC_BINDS_DRYRUN, same as every other write
+ * this service performs). Always marks the cache dirty afterward so the
+ * next render reflects whatever actually landed on disk (including a
+ * rolled-back fragment, in the DC_KEYBINDS_VALIDATE_FAILED_ROLLED_BACK
+ * case). */
+static void kb_persist_managed(int drop_idx)
+{
+    dc_keybind managed[DC_KB_TAB_MAX];
+    int mn = 0;
+    for (int i = 0; i < g_kb_n && mn < DC_KB_TAB_MAX; i++) {
+        if (!g_kb_all[i].managed || i == drop_idx)
+            continue;
+        managed[mn++] = g_kb_all[i];
+    }
+    dc_keybinds_persist(managed, mn, NULL);
+    g_kb_dirty = true;
+}
+
+static void kb_remove(int idx)
+{
+    if (idx < 0 || idx >= g_kb_n || !g_kb_all[idx].managed)
+        return;
+    kb_persist_managed(idx);
+}
+
+/* RESET: an empty managed fragment. Never touches config.kdl or any
+ * unmanaged bind -- dc_keybinds_persist() only ever rewrites dankc-binds.kdl
+ * itself (see keybinds.h's file header). */
+static void kb_reset(void)
+{
+    dc_keybinds_persist(NULL, 0, NULL);
+    g_kb_dirty = true;
+}
+
+static void kb_capture_end(dc_settings *s)
+{
+    s->kb_capture = false;
+    dc_wayland_shortcuts_uninhibit(s->wl);
+}
+
+static bool kb_is_modifier_keysym(uint32_t sym)
+{
+    switch (sym) {
+    case XKB_KEY_Shift_L:
+    case XKB_KEY_Shift_R:
+    case XKB_KEY_Control_L:
+    case XKB_KEY_Control_R:
+    case XKB_KEY_Alt_L:
+    case XKB_KEY_Alt_R:
+    case XKB_KEY_Super_L:
+    case XKB_KEY_Super_R:
+    case XKB_KEY_Meta_L:
+    case XKB_KEY_Meta_R:
+    case XKB_KEY_Hyper_L:
+    case XKB_KEY_Hyper_R:
+    case XKB_KEY_Caps_Lock:
+    case XKB_KEY_Num_Lock:
+    case XKB_KEY_ISO_Level3_Shift:
+    case XKB_KEY_ISO_Level5_Shift:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* dc_settings_handle_key()'s capture branch (below): Esc cancels, a bare
+ * modifier keysym is ignored (just triggers a redraw so the "Mod+Ctrl+..."
+ * live display tracks the held modifiers), anything else ends capture and,
+ * if dc_keybinds_chord_from_capture() can resolve it (it refuses a base key
+ * that is itself a modifier), stores the chord into kb_new_chord. */
+static void kb_capture_key(dc_settings *s, uint32_t keysym)
+{
+    if (keysym == XKB_KEY_Escape) {
+        kb_capture_end(s);
+        s_render(s);
+        return;
+    }
+    if (kb_is_modifier_keysym(keysym)) {
+        s_render(s);
+        return;
+    }
+    uint32_t base = dc_wayland_base_keysym(s->wl);
+    bool super = dc_wayland_super_down(s->wl);
+    bool ctrl = dc_wayland_ctrl_down(s->wl);
+    bool alt = dc_wayland_alt_down(s->wl);
+    bool shift = dc_wayland_shift_down(s->wl);
+    char chord[64];
+    if (dc_keybinds_chord_from_capture(base, super, ctrl, alt, shift, chord, sizeof(chord)))
+        copy_trunc(s->kb_new_chord, sizeof(s->kb_new_chord), chord);
+    kb_capture_end(s);
+    s_render(s);
+}
+
+/* Builds `prefix + (escaped, if requested) body + suffix`, bounded-truncating
+ * into `out`. Deliberately hand-copied (memcpy + manual index bounds) rather
+ * than snprintf(..., "%s", body): body's declared size (kb_custom_cmd/preset
+ * verb) can exceed out's DC_KEYBIND_ACTION_MAX budget once the literal
+ * prefix/suffix are accounted for, which is exactly the
+ * -Wformat-truncation shape copy_trunc()'s own comment (top of this file)
+ * warns about -- same fix, applied here for a wrapped-not-identity copy. */
+static void kb_build_spawn_action(const char *prefix, const char *body, bool escape_body,
+                                  const char *suffix, char *out, size_t outsz)
+{
+    size_t oi = 0;
+    size_t plen = strlen(prefix);
+    if (plen >= outsz)
+        plen = outsz > 0 ? outsz - 1 : 0;
+    memcpy(out, prefix, plen);
+    oi = plen;
+    size_t slen = strlen(suffix);
+    for (const char *p = body; *p && oi + slen + 1 < outsz; p++) {
+        if (escape_body && (*p == '"' || *p == '\\')) {
+            if (oi + slen + 1 >= outsz)
+                break;
+            out[oi++] = '\\';
+        }
+        if (oi + slen + 1 < outsz)
+            out[oi++] = *p;
+    }
+    if (oi + slen < outsz) {
+        memcpy(out + oi, suffix, slen);
+        oi += slen;
+    }
+    out[oi] = '\0';
+}
+
+/* Resets the add-form draft after a successful add (or a Replace). */
+static void kb_add_form_reset(dc_settings *s)
+{
+    s->kb_new_chord[0] = '\0';
+    s->kb_mode = 0;
+    s->kb_niri_idx = -1;
+    s->kb_dankc_idx = -1;
+    s->kb_custom_cmd[0] = '\0';
+    s->kb_title[0] = '\0';
+}
+
+/* Builds the dc_keybind from the current add-form draft and persists it,
+ * replacing `replace_idx`'s managed bind if >= 0 (the "Replace conflicting
+ * bind" path -- see tab_keybinds()'s conflict line), else appending. */
+static void kb_add(dc_settings *s, int replace_idx)
+{
+    if (!s->kb_new_chord[0])
+        return;
+
+    dc_keybind nb;
+    memset(&nb, 0, sizeof(nb));
+    copy_trunc(nb.chord, sizeof(nb.chord), s->kb_new_chord);
+    copy_trunc(nb.title, sizeof(nb.title), s->kb_title);
+    copy_trunc(nb.source, sizeof(nb.source), "dankc-binds.kdl");
+    nb.managed = true;
+
+    if (s->kb_mode == 0) {
+        int count = 0;
+        const dc_keybind_action_preset *p = dc_keybinds_niri_actions(&count);
+        if (s->kb_niri_idx < 0 || s->kb_niri_idx >= count)
+            return;
+        copy_trunc(nb.action, sizeof(nb.action), p[s->kb_niri_idx].verb);
+    } else if (s->kb_mode == 1) {
+        int count = 0;
+        const dc_keybind_action_preset *p = dc_keybinds_dankc_actions(&count);
+        if (s->kb_dankc_idx < 0 || s->kb_dankc_idx >= count)
+            return;
+        kb_build_spawn_action("spawn \"dankc\" \"ctl\" \"", p[s->kb_dankc_idx].verb, false, "\"",
+                              nb.action, sizeof(nb.action));
+    } else {
+        if (!s->kb_custom_cmd[0])
+            return;
+        kb_build_spawn_action("spawn \"sh\" \"-c\" \"", s->kb_custom_cmd, true, "\"", nb.action,
+                              sizeof(nb.action));
+    }
+    if (!nb.action[0])
+        return;
+
+    dc_keybind managed[DC_KB_TAB_MAX];
+    int mn = 0;
+    for (int i = 0; i < g_kb_n && mn < DC_KB_TAB_MAX; i++) {
+        if (!g_kb_all[i].managed || i == replace_idx)
+            continue;
+        managed[mn++] = g_kb_all[i];
+    }
+    if (mn < DC_KB_TAB_MAX)
+        managed[mn++] = nb;
+
+    dc_keybinds_persist(managed, mn, NULL);
+    g_kb_dirty = true;
+    kb_add_form_reset(s);
+}
+
+static void tab_keybinds(uictx *c)
+{
+    dc_settings *s = c->s;
+    kb_ensure_loaded();
+
+    ui_section(c, "STATUS");
+    int managed_n = 0, unmanaged_n = 0;
+    for (int i = 0; i < g_kb_n; i++) {
+        if (g_kb_all[i].managed)
+            managed_n++;
+        else
+            unmanaged_n++;
+    }
+    char status[96];
+    snprintf(status, sizeof(status), "%d total, %d dankc-managed, %d read-only", g_kb_n, managed_n,
+             unmanaged_n);
+    ui_value(c, "Binds found", status);
+
+    switch (dc_keybinds_last_validate()) {
+    case DC_KEYBINDS_VALIDATE_OK:
+        ui_value(c, "Last niri validate", "OK");
+        break;
+    case DC_KEYBINDS_VALIDATE_FAILED:
+        ui_hint(c, "Last save was rejected by `niri validate` (fragment left as written --");
+        ui_hint(c, "see the log for detail; the write/rollback I/O itself failed).");
+        break;
+    case DC_KEYBINDS_VALIDATE_FAILED_ROLLED_BACK:
+        ui_hint(c, "\xe2\x9a\xa0 change rejected by niri validate -- previous binds restored");
+        break;
+    case DC_KEYBINDS_VALIDATE_UNKNOWN:
+    default:
+        break; /* nothing saved yet this session, or niri/validate unavailable */
+    }
+
+    if (managed_n > 0) {
+        ui_section(c, "YOUR BINDS");
+        for (int i = 0; i < g_kb_n; i++) {
+            if (!g_kb_all[i].managed)
+                continue;
+            const char *label = g_kb_all[i].title[0] ? g_kb_all[i].title : g_kb_all[i].action;
+            if (ui_list_row(c, g_kb_all[i].chord, label, IC_REMOVE, false) == 2) {
+                kb_remove(i);
+                break; /* array reloaded from disk -- stop iterating this pass */
+            }
+        }
+    }
+
+    if (unmanaged_n > 0) {
+        ui_section(c, "EXISTING BINDS (read-only, from your niri config)");
+        for (int i = 0; i < g_kb_n; i++) {
+            if (g_kb_all[i].managed)
+                continue;
+            char summary[DC_KEYBIND_ACTION_MAX + DC_KEYBIND_SOURCE_MAX];
+            snprintf(summary, sizeof(summary), "%s \xc2\xb7 %s", g_kb_all[i].action,
+                     g_kb_all[i].source);
+            ui_list_row(c, g_kb_all[i].chord, summary, 0, false);
+        }
+    }
+    if (g_kb_n == 0)
+        ui_hint(c, "No keybinds found in ~/.config/niri/config.kdl");
+
+    ui_section(c, "RESET");
+    if (managed_n > 0) {
+        if (ui_list_row(c, "Remove all dankc-managed binds", NULL, IC_REMOVE, false) == 1)
+            kb_reset();
+    } else {
+        ui_hint(c, "No dankc-managed binds to reset");
+    }
+
+    ui_section(c, "ADD BIND");
+    if (!s->kb_capture) {
+        const char *row_title = s->kb_new_chord[0] ? s->kb_new_chord : "Record shortcut";
+        const char *row_status = s->kb_new_chord[0] ? "click to re-record" : NULL;
+        if (ui_list_row(c, row_title, row_status, IC_KEYBOARD, s->kb_new_chord[0] != 0) == 1) {
+            s->kb_new_chord[0] = '\0';
+            s->kb_capture = true;
+            dc_wayland_shortcuts_inhibit(s->wl, s->surface);
+        }
+    } else {
+        char live[64];
+        snprintf(live, sizeof(live), "%s%s%s%s\xe2\x80\xa6", dc_wayland_super_down(s->wl) ? "Mod+" : "",
+                 dc_wayland_ctrl_down(s->wl) ? "Ctrl+" : "", dc_wayland_alt_down(s->wl) ? "Alt+" : "",
+                 dc_wayland_shift_down(s->wl) ? "Shift+" : "");
+        ui_value(c, "Press the shortcut now\xe2\x80\xa6 (Esc cancels)", live);
+    }
+
+    static const char *const kb_mode_opts[3] = {"niri action", "dankc action", "custom command"};
+    int seg = ui_segmented(c, "Action type", kb_mode_opts, 3, s->kb_mode);
+    if (seg >= 0 && seg != s->kb_mode) {
+        s->kb_mode = seg;
+        s->kb_niri_idx = -1;
+        s->kb_dankc_idx = -1;
+    }
+
+    if (s->kb_mode == 0) {
+        int count = 0;
+        const dc_keybind_action_preset *presets = dc_keybinds_niri_actions(&count);
+        for (int i = 0; i < count; i++) {
+            if (ui_list_row(c, presets[i].label, presets[i].cat, 0, s->kb_niri_idx == i) == 1)
+                s->kb_niri_idx = i;
+        }
+    } else if (s->kb_mode == 1) {
+        int count = 0;
+        const dc_keybind_action_preset *presets = dc_keybinds_dankc_actions(&count);
+        for (int i = 0; i < count; i++) {
+            if (ui_list_row(c, presets[i].label, presets[i].cat, 0, s->kb_dankc_idx == i) == 1)
+                s->kb_dankc_idx = i;
+        }
+    } else {
+        bool cmd_focus = s->focus_field == 13;
+        char cmdbuf[160];
+        if (cmd_focus)
+            copy_trunc(cmdbuf, sizeof(cmdbuf), s->edit_buf);
+        else
+            copy_trunc(cmdbuf, sizeof(cmdbuf), s->kb_custom_cmd);
+        if (ui_textfield(c, "Custom command (spawned via sh -c)", cmdbuf, cmd_focus)) {
+            s->focus_field = 13;
+            copy_trunc(s->edit_buf, sizeof(s->edit_buf), s->kb_custom_cmd);
+        }
+    }
+
+    bool title_focus = s->focus_field == 14;
+    char titlebuf[DC_KEYBIND_TITLE_MAX];
+    if (title_focus)
+        copy_trunc(titlebuf, sizeof(titlebuf), s->edit_buf);
+    else
+        copy_trunc(titlebuf, sizeof(titlebuf), s->kb_title);
+    if (ui_textfield(c, "Description (hotkey-overlay title, optional)", titlebuf, title_focus)) {
+        s->focus_field = 14;
+        copy_trunc(s->edit_buf, sizeof(s->edit_buf), s->kb_title);
+    }
+
+    int conflict_idx = -1;
+    if (s->kb_new_chord[0])
+        conflict_idx = dc_keybinds_find_conflict(g_kb_all, g_kb_n, s->kb_new_chord, -1);
+    bool conflict_managed = conflict_idx >= 0 && g_kb_all[conflict_idx].managed;
+    if (conflict_idx >= 0) {
+        char cmsg[128];
+        snprintf(cmsg, sizeof(cmsg), "Conflicts with %s bind on %s", g_kb_all[conflict_idx].chord,
+                 conflict_managed ? "this same chord (yours)" : "a read-only chord");
+        ui_hint(c, cmsg);
+    }
+
+    bool action_chosen = (s->kb_mode == 0 && s->kb_niri_idx >= 0) ||
+                         (s->kb_mode == 1 && s->kb_dankc_idx >= 0) ||
+                         (s->kb_mode == 2 && s->kb_custom_cmd[0] != '\0');
+    bool can_add = s->kb_new_chord[0] && action_chosen && (conflict_idx < 0 || conflict_managed);
+    const char *add_label;
+    if (!s->kb_new_chord[0])
+        add_label = "Add bind (record a shortcut first)";
+    else if (!action_chosen)
+        add_label = "Add bind (choose an action first)";
+    else if (conflict_idx >= 0 && !conflict_managed)
+        add_label = "Add bind (conflicts with a read-only bind)";
+    else if (conflict_managed)
+        add_label = "Replace conflicting bind";
+    else
+        add_label = "Add bind";
+
+    if (ui_list_row(c, add_label, NULL, IC_ADD, false) == 1 && can_add)
+        kb_add(s, conflict_managed ? conflict_idx : -1);
+}
+
 /* docs/14-COMPLETION-PLAN.md W3.2: a pragmatic subset of DMS's 23-setting
  * LockScreenTab.qml -- only the options ui/lock.c can actually honor (no
  * fingerprint/U2F/video-screensaver/per-monitor backend exists in dankc's
@@ -4169,6 +4577,9 @@ static void build_tab(uictx *c)
     case TAB_WINDOW_RULES:
         tab_window_rules(c);
         break;
+    case TAB_KEYBINDS:
+        tab_keybinds(c);
+        break;
     case TAB_MUX:
         tab_mux(c);
         break;
@@ -4277,6 +4688,15 @@ static void commit_edit(dc_settings *s)
     case 12: /* Time & Date tab timezone-picker filter draft -- not config.json
               * state, see dc_settings.tz_filter */
         copy_trunc(s->tz_filter, sizeof(s->tz_filter), s->edit_buf);
+        break;
+    case 13: /* Keybinds tab "add bind" custom-command draft -- not config.json
+              * state, see dc_settings.kb_custom_cmd (docs/23-KEYBIND-EDITING-
+              * PLAN.md, KB-T3) */
+        copy_trunc(s->kb_custom_cmd, sizeof(s->kb_custom_cmd), s->edit_buf);
+        break;
+    case 14: /* Keybinds tab "add bind" description (hotkey-overlay-title)
+              * draft, see dc_settings.kb_title */
+        copy_trunc(s->kb_title, sizeof(s->kb_title), s->edit_buf);
         break;
     default:
         break;
@@ -4539,6 +4959,8 @@ dc_settings *dc_settings_create(dc_wayland *wl, dc_egl *egl, dc_render *render)
     s->logical_height = DC_SET_HEIGHT;
     s->scale120 = DC_SCALE_BASE;
     s->wr_new_opacity = 1.0f;
+    s->kb_niri_idx = -1;
+    s->kb_dankc_idx = -1;
     return s;
 }
 
@@ -4617,6 +5039,15 @@ static void s_show(dc_settings *s, dc_output *output)
 
 static void s_teardown(dc_settings *s)
 {
+    /* A half-finished keybind chord-capture (docs/23-KEYBIND-EDITING-PLAN.md
+     * sec.3, KB-T3) must not leak its zwp_keyboard_shortcuts_inhibitor_v1 if
+     * the settings surface is closed/torn down mid-capture (e.g. an
+     * external "toggle settings" request while "Record shortcut" is
+     * active). */
+    if (s->kb_capture) {
+        s->kb_capture = false;
+        dc_wayland_shortcuts_uninhibit(s->wl);
+    }
     if (s->frame_cb) {
         wl_callback_destroy(s->frame_cb);
         s->frame_cb = NULL;
@@ -4647,6 +5078,10 @@ static void s_begin_close(dc_settings *s)
     if (!s->visible || s->closing)
         return;
     commit_edit(s);
+    if (s->kb_capture) { /* don't keep grabbing all keyboard input through the close animation */
+        s->kb_capture = false;
+        dc_wayland_shortcuts_uninhibit(s->wl);
+    }
     dc_anim_start(&s->anim, DC_DUR_SHORT, DC_EASE_EMPHASIZED_ACCEL);
     s->closing = true;
     if (!dc_anim_active(&s->anim)) {
@@ -4713,6 +5148,16 @@ void dc_settings_handle_click(dc_settings *s, double x, double y)
     if (!s->visible || s->closing)
         return;
 
+    /* A stray click while a keybind chord-capture is in flight (docs/23-
+     * KEYBIND-EDITING-PLAN.md sec.3, KB-T3) isn't the expected "press the
+     * shortcut" input -- treat it as an implicit cancel (uninhibit +
+     * re-render) rather than let the click fall through to whatever's
+     * underneath while the inhibitor is still grabbing all keyboard input. */
+    if (s->kb_capture) {
+        s->kb_capture = false;
+        dc_wayland_shortcuts_uninhibit(s->wl);
+    }
+
     /* Sidebar tab switch. */
     if (x >= DC_SET_PAD && x <= DC_SET_PAD + DC_SIDEBAR_W) {
         const float item_h = DC_SIDEBAR_ITEM_H, top = DC_SIDEBAR_ITEMS_TOP;
@@ -4776,11 +5221,19 @@ void dc_settings_handle_click(dc_settings *s, double x, double y)
 
 bool dc_settings_wants_keyboard(dc_settings *s)
 {
-    return s->visible && !s->closing && s->focus_field != 0;
+    return s->visible && !s->closing && (s->focus_field != 0 || s->kb_capture);
 }
 
 void dc_settings_handle_key(dc_settings *s, uint32_t keysym, const char *utf8)
 {
+    /* Keybind chord capture (docs/23-KEYBIND-EDITING-PLAN.md sec.3, KB-T3)
+     * consumes every key while active -- it must run before the
+     * focus_field-based text editing below (they're mutually exclusive:
+     * kb_capture_key() never leaves focus_field set). */
+    if (s->kb_capture) {
+        kb_capture_key(s, keysym);
+        return;
+    }
     if (!s->focus_field)
         return;
     switch (keysym) {
