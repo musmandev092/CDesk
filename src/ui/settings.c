@@ -11,11 +11,13 @@
 #include "services/bluez.h"
 #include "services/display.h"
 #include "services/firewall.h"
+#include "services/logind.h"
 #include "services/net.h"
 #include "services/nightlight.h"
 #include "services/niri_input.h"
 #include "services/power.h"
 #include "services/printers.h"
+#include "services/timedate.h"
 #include "services/weather.h"
 #include "theme/theme.h"
 #include "ui/material_bg.h"
@@ -240,6 +242,13 @@ struct dc_settings {
      * NetworkManager connection, this is just the in-progress form state. */
     char net_hotspot_ssid[64];
     char net_hotspot_password[64];
+
+    /* Time & Date tab (docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.8): timezone
+     * picker disclosure + filter draft. Not config.json state --
+     * dc_timedate_status()/dc_timedate_set_timezone() are the live source of
+     * truth, same shape as the Displays tab's disp_selected/disp_res_open. */
+    bool tz_picker_open;
+    char tz_filter[64];
 };
 
 /* Bounded string copy without gcc's -Wformat-truncation firing: several text
@@ -1274,6 +1283,42 @@ static void tab_personalization(uictx *c)
      * tab_typography() below. */
 }
 
+/* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.8: timezone list is fetched once
+ * per process (~600 entries, doesn't change at runtime) and cached here --
+ * build_tab() runs on every render AND every hit-test pass, so re-popen()ing
+ * `timedatectl list-timezones` per call would be wasteful. */
+#define DC_TZ_CACHE_MAX 700
+static char g_tz_cache[DC_TZ_CACHE_MAX][DC_TIMEDATE_TZ_MAX];
+static int g_tz_cache_n = -1;
+
+static void tz_ensure_cache(void)
+{
+    if (g_tz_cache_n < 0)
+        g_tz_cache_n = dc_timedate_list_timezones(g_tz_cache, DC_TZ_CACHE_MAX);
+}
+
+static bool str_ci_contains(const char *hay, const char *needle)
+{
+    if (!needle || !needle[0])
+        return true;
+    size_t hn = strlen(hay), nn = strlen(needle);
+    if (nn > hn)
+        return false;
+    for (size_t i = 0; i + nn <= hn; i++) {
+        size_t j = 0;
+        for (; j < nn; j++)
+            if (tolower((unsigned char)hay[i + j]) != tolower((unsigned char)needle[j]))
+                break;
+        if (j == nn)
+            return true;
+    }
+    return false;
+}
+
+/* Timezone picker's max rendered matches -- bounds draw/hit-test cost when
+ * the filter is broad (e.g. empty, which would otherwise list all ~600). */
+#define DC_TZ_MAX_SHOWN 30
+
 static void tab_time(uictx *c)
 {
     ui_section(c, "CLOCK");
@@ -1292,6 +1337,70 @@ static void tab_time(uictx *c)
         c->cfg->show_seconds = !c->cfg->show_seconds;
         c->changed = true;
         c->bars = true;
+    }
+
+    ui_section(c, "SYSTEM DATE & TIME");
+    dc_timedate_info td;
+    if (!dc_timedate_status(&td)) {
+        ui_hint(c, "timedatectl not found -- system clock/timezone management");
+        ui_hint(c, "is unavailable (needs systemd).");
+        return;
+    }
+
+    if (td.now_local[0])
+        ui_value(c, "Local time", td.now_local);
+    ui_value(c, "Time zone", td.timezone[0] ? td.timezone : "(unknown)");
+    ui_value(c, "Clock synchronized", td.ntp_synchronized ? "Yes" : "No");
+
+    if (td.can_ntp) {
+        static opt_flip ntp_flip;
+        bool ntp_on = flip_get(&ntp_flip, td.ntp_enabled);
+        if (ui_toggle(c, "Automatic time sync (NTP)", "Keep the clock synced over the network",
+                      ntp_on)) {
+            dc_timedate_set_ntp(!ntp_on);
+            flip_set(&ntp_flip, !ntp_on);
+        }
+    } else {
+        ui_hint(c, "No NTP service available to timedatectl on this system.");
+    }
+
+    if (ui_list_row(c, c->s->tz_picker_open ? "Cancel changing time zone" : "Change time zone",
+                    NULL, 0, c->s->tz_picker_open) == 1)
+        c->s->tz_picker_open = !c->s->tz_picker_open;
+
+    if (c->s->tz_picker_open) {
+        tz_ensure_cache();
+
+        bool filt_focus = c->s->focus_field == 12;
+        char filtbuf[64];
+        if (filt_focus)
+            copy_trunc(filtbuf, sizeof(filtbuf), c->s->edit_buf);
+        else
+            snprintf(filtbuf, sizeof(filtbuf), "%s", c->s->tz_filter);
+        if (ui_textfield(c, "Filter (e.g. \"Asia\" or \"Karachi\")", filtbuf, filt_focus)) {
+            c->s->focus_field = 12;
+            snprintf(c->s->edit_buf, sizeof(c->s->edit_buf), "%s", c->s->tz_filter);
+        }
+
+        if (g_tz_cache_n <= 0) {
+            ui_hint(c, "`timedatectl list-timezones` returned nothing.");
+        } else {
+            int shown = 0;
+            for (int i = 0; i < g_tz_cache_n && shown < DC_TZ_MAX_SHOWN; i++) {
+                if (!str_ci_contains(g_tz_cache[i], c->s->tz_filter))
+                    continue;
+                bool active = strcmp(g_tz_cache[i], td.timezone) == 0;
+                if (ui_list_row(c, g_tz_cache[i], NULL, 0, active) == 1 && !active) {
+                    dc_timedate_set_timezone(g_tz_cache[i]);
+                    c->s->tz_picker_open = false;
+                }
+                shown++;
+            }
+            if (shown == DC_TZ_MAX_SHOWN)
+                ui_hint(c, "More matches exist -- narrow the filter to see them.");
+            else if (shown == 0)
+                ui_hint(c, "No time zones match that filter.");
+        }
     }
 }
 
@@ -2510,18 +2619,62 @@ static void tab_power(uictx *c)
     dc_power_info pw;
     if (!dc_power_read(&pw)) {
         ui_hint(c, "No power-profile backend (power-profiles-daemon or tuned) detected");
-        return;
+    } else {
+        static const char *const opts[3] = {"Power Saver", "Balanced", "Performance"};
+        int cur = (int)pw.active_mode; /* -1 (unknown) selects nothing */
+        int clicked = ui_segmented(c, "Profile", opts, 3, cur);
+        if (clicked >= 0 && clicked != cur)
+            dc_power_set_mode((dc_power_mode)clicked);
+        /* Raw backend profile as a caption when it isn't literally one of the
+         * 3 mode slugs (same rule as the battery popout's caption). */
+        if (pw.active_profile[0])
+            ui_value(c, "Active profile", pw.active_profile);
+        ui_hint(c, "Lock, suspend and power-off live in the power menu (bar \xc2\xb7 power button)");
     }
-    static const char *const opts[3] = {"Power Saver", "Balanced", "Performance"};
-    int cur = (int)pw.active_mode; /* -1 (unknown) selects nothing */
-    int clicked = ui_segmented(c, "Profile", opts, 3, cur);
-    if (clicked >= 0 && clicked != cur)
-        dc_power_set_mode((dc_power_mode)clicked);
-    /* Raw backend profile as a caption when it isn't literally one of the 3
-     * mode slugs (same rule as the battery popout's caption). */
-    if (pw.active_profile[0])
-        ui_value(c, "Active profile", pw.active_profile);
-    ui_hint(c, "Lock, suspend and power-off live in the power menu (bar \xc2\xb7 power button)");
+
+    /* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.9: Idle & Lid, a thin view
+     * over services/logind.c's /etc/systemd/logind.conf (+ drop-ins) reader/
+     * writer. Editing writes a dankc-owned drop-in via pkexec (never the
+     * main logind.conf); dankc never restarts systemd-logind itself, so the
+     * hint below tells the user a re-login is needed. */
+    ui_section(c, "IDLE & LID");
+    dc_logind_conf_info lc;
+    dc_logind_conf_read(&lc, NULL);
+    if (lc.from_dropin)
+        ui_hint(c, "Some of these are overridden by an existing logind.conf.d drop-in.");
+
+    static const char *const idle_opts[4] = {"Ignore", "Lock", "Suspend", "Poweroff"};
+    static const char *const idle_vals[4] = {"ignore", "lock", "suspend", "poweroff"};
+    int idle_cur = -1;
+    for (int i = 0; i < 4; i++)
+        if (strcmp(lc.idle_action, idle_vals[i]) == 0)
+            idle_cur = i;
+    int idle_clicked = ui_segmented(c, "When idle", idle_opts, 4, idle_cur);
+    if (idle_clicked >= 0 && idle_clicked != idle_cur) {
+        snprintf(lc.idle_action, sizeof(lc.idle_action), "%s", idle_vals[idle_clicked]);
+        dc_logind_conf_write_dropin(&lc);
+    }
+
+    int idle_min = (lc.idle_action_sec + 59) / 60;
+    if (ui_stepper(c, "Idle timeout (minutes)", &idle_min, 1, 180, 1)) {
+        lc.idle_action_sec = idle_min * 60;
+        dc_logind_conf_write_dropin(&lc);
+    }
+
+    static const char *const lid_opts[4] = {"Ignore", "Lock", "Suspend", "Poweroff"};
+    static const char *const lid_vals[4] = {"ignore", "lock", "suspend", "poweroff"};
+    int lid_cur = -1;
+    for (int i = 0; i < 4; i++)
+        if (strcmp(lc.handle_lid_switch, lid_vals[i]) == 0)
+            lid_cur = i;
+    int lid_clicked = ui_segmented(c, "Lid close action", lid_opts, 4, lid_cur);
+    if (lid_clicked >= 0 && lid_clicked != lid_cur) {
+        snprintf(lc.handle_lid_switch, sizeof(lc.handle_lid_switch), "%s", lid_vals[lid_clicked]);
+        dc_logind_conf_write_dropin(&lc);
+    }
+
+    ui_hint(c, "Writes /etc/systemd/logind.conf.d/50-dankc.conf via pkexec;");
+    ui_hint(c, "a re-login (or reboot) is needed for changes to take effect.");
 }
 
 /* ====================== niri Window Rules editor (W3.4) ======================
@@ -3945,6 +4098,10 @@ static void commit_edit(dc_settings *s)
     case 11: /* niri input tab keyboard xkb layout */
         copy_trunc(cfg->input_keyboard_layout, sizeof(cfg->input_keyboard_layout), s->edit_buf);
         input_persist(cfg);
+        break;
+    case 12: /* Time & Date tab timezone-picker filter draft -- not config.json
+              * state, see dc_settings.tz_filter */
+        copy_trunc(s->tz_filter, sizeof(s->tz_filter), s->edit_buf);
         break;
     default:
         break;
