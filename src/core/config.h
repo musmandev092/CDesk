@@ -175,6 +175,26 @@ typedef struct dc_config {
     bool lock_show_password_field; /* if false, the password pill only appears once typing starts */
     bool lock_use_wallpaper_bg;   /* blurred wallpaper background (reuses `wallpaper` + material_blur's
                                     * blur pipeline, ui/material_bg.c) instead of the flat surface fill */
+
+    /* Mouse/Touchpad/Keyboard (docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.7,
+     * services/niri_input.c): mirrors niri's `input {}` KDL block, which uses
+     * bare-keyword presence (not `key true/false`) for its boolean toggles --
+     * so each bool here is "emit this keyword in the managed fragment", not a
+     * tri-state on/off/default. All default false/0 (matches niri's own
+     * built-in defaults, i.e. a fresh install changes nothing until the user
+     * opts in). accel-speed is only written when its own *_enabled flag is
+     * set, since 0 is indistinguishable from niri's default. */
+    bool input_touchpad_tap;
+    bool input_touchpad_natural_scroll;
+    bool input_touchpad_dwt;
+    bool input_touchpad_disabled_on_external_mouse;
+    bool input_touchpad_accel_enabled;
+    float input_touchpad_accel_speed; /* -1..1 */
+    bool input_mouse_natural_scroll;
+    bool input_mouse_accel_enabled;
+    float input_mouse_accel_speed; /* -1..1 */
+    bool input_keyboard_numlock;
+    char input_keyboard_layout[32]; /* xkb layout string e.g. "us"; empty = unset */
 } dc_config;
 
 /* The active config. Read-only for the rest of the app. */

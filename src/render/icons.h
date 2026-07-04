@@ -220,4 +220,14 @@
 #define DC_ICON_SMARTPHONE 0xe32c
 #define DC_ICON_STAR 0xe838
 
+/* Settings-completeness tabs (docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.5/7/
+ * 8/9: Firewall, Mouse/Touchpad/Keyboard, Date & Time, Power idle/lid).
+ * Firewall's "shield" glyph is new (0xe9e0, confirmed present via fontTools
+ * cmap lookup against assets/fonts/MaterialSymbolsRounded.ttf, same
+ * verification method as the rest of this header); Mouse/Keyboard reuse the
+ * existing glyphs above (already in the font subset via the Bluetooth
+ * device-type icons); Date & Time reuses SCHEDULE and Power idle/lid reuses
+ * POWER -- both tabs already exist, this task only extends them. */
+#define DC_ICON_SHIELD 0xe9e0
+
 #endif /* DC_RENDER_ICONS_H */

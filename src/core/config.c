@@ -97,6 +97,20 @@ static dc_config config = {
     .lock_show_date = true,
     .lock_show_password_field = true,
     .lock_use_wallpaper_bg = false,
+
+    /* docs/19-SETTINGS-COMPLETENESS-PLAN.md sec.7: all off/0 -- a fresh
+     * install writes no dankc-input.kdl until the user opts into something,
+     * matching niri's own out-of-the-box behavior. */
+    .input_touchpad_tap = false,
+    .input_touchpad_natural_scroll = false,
+    .input_touchpad_dwt = false,
+    .input_touchpad_disabled_on_external_mouse = false,
+    .input_touchpad_accel_enabled = false,
+    .input_touchpad_accel_speed = 0.0f,
+    .input_mouse_natural_scroll = false,
+    .input_mouse_accel_enabled = false,
+    .input_mouse_accel_speed = 0.0f,
+    .input_keyboard_numlock = false,
 };
 
 const dc_config *dc_config_current = &config;
@@ -371,6 +385,20 @@ void dc_config_load(void)
     get_bool(root, "lockShowDate", &config.lock_show_date);
     get_bool(root, "lockShowPasswordField", &config.lock_show_password_field);
     get_bool(root, "lockUseWallpaperBg", &config.lock_use_wallpaper_bg);
+
+    get_bool(root, "inputTouchpadTap", &config.input_touchpad_tap);
+    get_bool(root, "inputTouchpadNaturalScroll", &config.input_touchpad_natural_scroll);
+    get_bool(root, "inputTouchpadDwt", &config.input_touchpad_dwt);
+    get_bool(root, "inputTouchpadDisabledOnExternalMouse",
+             &config.input_touchpad_disabled_on_external_mouse);
+    get_bool(root, "inputTouchpadAccelEnabled", &config.input_touchpad_accel_enabled);
+    get_float(root, "inputTouchpadAccelSpeed", &config.input_touchpad_accel_speed, -1.0f, 1.0f);
+    get_bool(root, "inputMouseNaturalScroll", &config.input_mouse_natural_scroll);
+    get_bool(root, "inputMouseAccelEnabled", &config.input_mouse_accel_enabled);
+    get_float(root, "inputMouseAccelSpeed", &config.input_mouse_accel_speed, -1.0f, 1.0f);
+    get_bool(root, "inputKeyboardNumlock", &config.input_keyboard_numlock);
+    get_string(root, "inputKeyboardLayout", config.input_keyboard_layout,
+               sizeof(config.input_keyboard_layout));
     cJSON_Delete(root);
 
     apply_theme();
@@ -501,6 +529,21 @@ void dc_config_save(void)
     cJSON_AddBoolToObject(root, "lockShowDate", config.lock_show_date);
     cJSON_AddBoolToObject(root, "lockShowPasswordField", config.lock_show_password_field);
     cJSON_AddBoolToObject(root, "lockUseWallpaperBg", config.lock_use_wallpaper_bg);
+
+    cJSON_AddBoolToObject(root, "inputTouchpadTap", config.input_touchpad_tap);
+    cJSON_AddBoolToObject(root, "inputTouchpadNaturalScroll", config.input_touchpad_natural_scroll);
+    cJSON_AddBoolToObject(root, "inputTouchpadDwt", config.input_touchpad_dwt);
+    cJSON_AddBoolToObject(root, "inputTouchpadDisabledOnExternalMouse",
+                          config.input_touchpad_disabled_on_external_mouse);
+    cJSON_AddBoolToObject(root, "inputTouchpadAccelEnabled", config.input_touchpad_accel_enabled);
+    cJSON_AddNumberToObject(root, "inputTouchpadAccelSpeed",
+                            (double)config.input_touchpad_accel_speed);
+    cJSON_AddBoolToObject(root, "inputMouseNaturalScroll", config.input_mouse_natural_scroll);
+    cJSON_AddBoolToObject(root, "inputMouseAccelEnabled", config.input_mouse_accel_enabled);
+    cJSON_AddNumberToObject(root, "inputMouseAccelSpeed", (double)config.input_mouse_accel_speed);
+    cJSON_AddBoolToObject(root, "inputKeyboardNumlock", config.input_keyboard_numlock);
+    if (config.input_keyboard_layout[0])
+        cJSON_AddStringToObject(root, "inputKeyboardLayout", config.input_keyboard_layout);
 
     char *text = cJSON_Print(root);
     cJSON_Delete(root);
