@@ -21,6 +21,7 @@
 #include "viewporter-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
 #include "cursor-shape-v1-client-protocol.h"
+#include "keyboard-shortcuts-inhibit-unstable-v1-client-protocol.h"
 
 /* Continuous (touchpad) scroll sources report many tiny wl_fixed deltas per
  * gesture; a wheel "click" is conventionally 10 wl_fixed units (matching
@@ -416,6 +417,13 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *kbd, uint32_t se
         return;
     }
 
+    /* Recorded for dc_wayland_base_keysym() (docs/23-KEYBIND-EDITING-PLAN.md
+     * sec.3: keybind chord capture) unconditionally on every press, even if
+     * there's no key_cb/xkb_state yet -- callers only read it once
+     * xkb_state exists anyway, and keeping this ahead of the early-return
+     * below matches the task's "before invoking the key callback" ordering. */
+    wl->last_keycode = keycode;
+
     if (!wl->xkb_state || !wl->key_cb)
         return;
 
@@ -507,6 +515,35 @@ static const struct wl_seat_listener seat_listener = {
     .name = seat_handle_name,
 };
 
+/* --- keyboard-shortcuts-inhibit ------------------------------------------ */
+
+/* Both events are purely informational (docs/23-KEYBIND-EDITING-PLAN.md
+ * sec.3) -- the capture flow drives its own lifecycle (Esc/key-press to
+ * finish, dc_wayland_shortcuts_uninhibit() on cancel/hide) and doesn't need
+ * to react to the compositor toggling active/inactive, but libwayland
+ * aborts on any NULL listener slot for the bound version, so both need at
+ * least a stub. */
+static void shortcuts_inhibitor_handle_active(void *data,
+    struct zwp_keyboard_shortcuts_inhibitor_v1 *inhibitor)
+{
+    DC_UNUSED(data);
+    DC_UNUSED(inhibitor);
+    dc_debug("keyboard-shortcuts-inhibitor: active");
+}
+
+static void shortcuts_inhibitor_handle_inactive(void *data,
+    struct zwp_keyboard_shortcuts_inhibitor_v1 *inhibitor)
+{
+    DC_UNUSED(data);
+    DC_UNUSED(inhibitor);
+    dc_debug("keyboard-shortcuts-inhibitor: inactive");
+}
+
+static const struct zwp_keyboard_shortcuts_inhibitor_v1_listener shortcuts_inhibitor_listener = {
+    .active = shortcuts_inhibitor_handle_active,
+    .inactive = shortcuts_inhibitor_handle_inactive,
+};
+
 /* --- registry ----------------------------------------------------------- */
 
 static void registry_handle_global(void *data, struct wl_registry *registry, uint32_t name,
@@ -539,6 +576,13 @@ static void registry_handle_global(void *data, struct wl_registry *registry, uin
     } else if (strcmp(interface, wp_cursor_shape_manager_v1_interface.name) == 0) {
         wl->cursor_shape_manager =
             wl_registry_bind(registry, name, &wp_cursor_shape_manager_v1_interface, 1);
+    } else if (strcmp(interface, zwp_keyboard_shortcuts_inhibit_manager_v1_interface.name) == 0) {
+        /* Nullable optional (docs/23-KEYBIND-EDITING-PLAN.md sec.3), like
+         * cursor_shape_manager above -- absent on compositors that don't
+         * implement it, in which case dc_wayland_shortcuts_inhibit() just
+         * returns false and callers degrade rather than fail to build/run. */
+        wl->shortcuts_inhibit_manager = wl_registry_bind(
+            registry, name, &zwp_keyboard_shortcuts_inhibit_manager_v1_interface, 1);
     } else if (strcmp(interface, wl_seat_interface.name) == 0) {
         wl->seat = wl_registry_bind(registry, name, &wl_seat_interface, DC_MIN(version, 7u));
         wl_seat_add_listener(wl->seat, &seat_listener, wl);
@@ -639,6 +683,11 @@ void dc_wayland_destroy(dc_wayland *wl)
         xkb_context_unref(wl->xkb_context);
     if (wl->repeat_timerfd >= 0)
         close(wl->repeat_timerfd);
+
+    if (wl->shortcuts_inhibitor)
+        zwp_keyboard_shortcuts_inhibitor_v1_destroy(wl->shortcuts_inhibitor);
+    if (wl->shortcuts_inhibit_manager)
+        zwp_keyboard_shortcuts_inhibit_manager_v1_destroy(wl->shortcuts_inhibit_manager);
 
     if (wl->registry)
         wl_registry_destroy(wl->registry);
@@ -771,4 +820,61 @@ bool dc_wayland_shift_down(dc_wayland *wl)
         return false;
     return xkb_state_mod_name_is_active(wl->xkb_state, XKB_MOD_NAME_SHIFT,
                                         XKB_STATE_MODS_EFFECTIVE) > 0;
+}
+
+bool dc_wayland_super_down(dc_wayland *wl)
+{
+    if (!wl->xkb_state)
+        return false;
+    return xkb_state_mod_name_is_active(wl->xkb_state, XKB_MOD_NAME_LOGO,
+                                        XKB_STATE_MODS_EFFECTIVE) > 0;
+}
+
+bool dc_wayland_alt_down(dc_wayland *wl)
+{
+    if (!wl->xkb_state)
+        return false;
+    return xkb_state_mod_name_is_active(wl->xkb_state, XKB_MOD_NAME_ALT,
+                                        XKB_STATE_MODS_EFFECTIVE) > 0;
+}
+
+uint32_t dc_wayland_base_keysym(dc_wayland *wl)
+{
+    if (!wl->xkb_keymap || !wl->xkb_state || wl->last_keycode == 0)
+        return 0;
+
+    xkb_layout_index_t layout = xkb_state_key_get_layout(wl->xkb_state, wl->last_keycode);
+    const xkb_keysym_t *syms = NULL;
+    int n = xkb_keymap_key_get_syms_by_level(wl->xkb_keymap, wl->last_keycode, layout, 0, &syms);
+    if (n <= 0 || !syms)
+        return 0;
+    return (uint32_t)syms[0];
+}
+
+bool dc_wayland_shortcuts_inhibit(dc_wayland *wl, struct wl_surface *surface)
+{
+    if (!wl->shortcuts_inhibit_manager || !wl->seat || !surface)
+        return false;
+
+    /* At most one active inhibitor (wl.h): drop any prior one first rather
+     * than leaking it or holding two inhibitors on possibly-different
+     * surfaces at once (docs/23-KEYBIND-EDITING-PLAN.md sec.3). */
+    dc_wayland_shortcuts_uninhibit(wl);
+
+    wl->shortcuts_inhibitor = zwp_keyboard_shortcuts_inhibit_manager_v1_inhibit_shortcuts(
+        wl->shortcuts_inhibit_manager, surface, wl->seat);
+    if (!wl->shortcuts_inhibitor)
+        return false;
+
+    zwp_keyboard_shortcuts_inhibitor_v1_add_listener(wl->shortcuts_inhibitor,
+                                                     &shortcuts_inhibitor_listener, wl);
+    return true;
+}
+
+void dc_wayland_shortcuts_uninhibit(dc_wayland *wl)
+{
+    if (!wl->shortcuts_inhibitor)
+        return;
+    zwp_keyboard_shortcuts_inhibitor_v1_destroy(wl->shortcuts_inhibitor);
+    wl->shortcuts_inhibitor = NULL;
 }
