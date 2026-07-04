@@ -30,6 +30,16 @@ typedef struct NVGcontext NVGcontext;
 void dc_material_bg_fill_card(NVGcontext *vg, struct dc_render *render, float x, float y, float w,
                               float h, float radius);
 
+/* Same as dc_material_bg_fill_card() but with an independent radius per
+ * corner (nvgRoundedRectVarying order: top-left, top-right, bottom-right,
+ * bottom-left) -- used by connected-frame chrome (ui/connected.c), where the
+ * near-edge corners are square (0) and the far corners are rounded.
+ * dc_material_bg_fill_card() is now a thin wrapper over this with all four
+ * radii equal. */
+void dc_material_bg_fill_card_varying(NVGcontext *vg, struct dc_render *render, float x, float y,
+                                      float w, float h, float r_tl, float r_tr, float r_br,
+                                      float r_bl);
+
 /* Drop the cached texture so the next dc_material_bg_fill_card() call
  * regenerates it from disk. Call after the configured wallpaper path
  * changes (config load/reapply, wallpaper picker). Safe to call even if

@@ -202,14 +202,14 @@ static int ensure_image(dc_render *render)
     return cached_image;
 }
 
-void dc_material_bg_fill_card(NVGcontext *vg, dc_render *render, float x, float y, float w, float h,
-                              float radius)
+void dc_material_bg_fill_card_varying(NVGcontext *vg, dc_render *render, float x, float y, float w,
+                                      float h, float r_tl, float r_tr, float r_br, float r_bl)
 {
     const dc_theme *t = dc_theme_current;
     int img = render ? ensure_image(render) : 0;
 
     nvgBeginPath(vg);
-    nvgRoundedRect(vg, x, y, w, h, radius);
+    nvgRoundedRectVarying(vg, x, y, w, h, r_tl, r_tr, r_br, r_bl);
     if (img > 0) {
         /* Stretch-fit: the source is already blurred well past the point
          * where aspect-ratio distortion is visible. */
@@ -218,7 +218,7 @@ void dc_material_bg_fill_card(NVGcontext *vg, dc_render *render, float x, float 
         nvgFill(vg);
 
         nvgBeginPath(vg);
-        nvgRoundedRect(vg, x, y, w, h, radius);
+        nvgRoundedRectVarying(vg, x, y, w, h, r_tl, r_tr, r_br, r_bl);
         nvgFillColor(vg, nvgRGBA(t->surface_container.r, t->surface_container.g,
                                  t->surface_container.b, DC_MATERIAL_BG_SCRIM_ALPHA));
         nvgFill(vg);
@@ -227,4 +227,10 @@ void dc_material_bg_fill_card(NVGcontext *vg, dc_render *render, float x, float 
                                  t->surface_container.b, 255));
         nvgFill(vg);
     }
+}
+
+void dc_material_bg_fill_card(NVGcontext *vg, dc_render *render, float x, float y, float w, float h,
+                              float radius)
+{
+    dc_material_bg_fill_card_varying(vg, render, x, y, w, h, radius, radius, radius, radius);
 }
