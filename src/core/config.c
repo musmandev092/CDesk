@@ -791,6 +791,9 @@ void dc_config_load(void)
                         DC_CONFIG_AUDIO_DEVICES_MAX, &config.audio_aliases_n);
     get_string_array_wide(root, "audioHiddenDevices", config.audio_hidden,
                           DC_CONFIG_AUDIO_DEVICES_MAX, &config.audio_hidden_n);
+
+    get_string(root, "updateTerminalCmd", config.update_terminal_cmd, sizeof(config.update_terminal_cmd));
+    get_int(root, "updatesCheckIntervalMin", &config.updates_check_interval_min, 0, 1440);
     cJSON_Delete(root);
 
     apply_theme();
@@ -1004,6 +1007,10 @@ void dc_config_save(void)
                       config.audio_max_volumes_n);
     add_audio_alias_map(root, "audioDeviceAliases", config.audio_aliases, config.audio_aliases_n);
     add_string_array_wide(root, "audioHiddenDevices", config.audio_hidden, config.audio_hidden_n);
+
+    if (config.update_terminal_cmd[0])
+        cJSON_AddStringToObject(root, "updateTerminalCmd", config.update_terminal_cmd);
+    cJSON_AddNumberToObject(root, "updatesCheckIntervalMin", config.updates_check_interval_min);
 
     char *text = cJSON_Print(root);
     cJSON_Delete(root);
