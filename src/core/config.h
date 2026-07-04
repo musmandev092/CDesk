@@ -8,9 +8,30 @@
 #define DC_CORE_CONFIG_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #define DC_CONFIG_THEME_MAX 32
 #define DC_CONFIG_PATH_MAX 512
+
+/* Per-app notification rules (docs/26-DND-SCHEDULING-PLAN.md rule-engine
+ * section): "match" is compared case-insensitively against either the
+ * notification's app_name or its desktop-entry hint (T2, notifications.c).
+ * action/urgency are plain ints -- not the notifications.h enum -- so
+ * config.c doesn't need to depend on that header (same trick as
+ * nightlight_schedule_mode below); notifications.c casts them back. */
+#define DC_CONFIG_NOTIF_RULES_MAX 32
+#define DC_CONFIG_NOTIF_RULE_MATCH 64
+
+/* action: 0=mute (recorded, no popup/sound) / 1=ignore (dropped entirely) /
+ * 2=popup-only (toast then deleted, never kept in history) / 3=no-history
+ * (toast+Current, deleted once it would move to History).
+ * urgency: -1=keep the notification's own urgency, else 0=low/1=normal/
+ * 2=critical override. */
+typedef struct dc_notif_rule {
+    char match[DC_CONFIG_NOTIF_RULE_MATCH];
+    int action;
+    int urgency;
+} dc_notif_rule;
 
 /* Bar widget host (docs/12-BAR-SPEC.md sec.0/7 stage S2): each section is a
  * config-driven list of widget ids, e.g. "launcherButton", "clock". */
@@ -89,6 +110,25 @@ typedef struct dc_config {
     int notif_timeout_normal_sec;
     int notif_timeout_critical_sec;
     bool dnd_enabled;
+
+    /* DND scheduling (docs/26-DND-SCHEDULING-PLAN.md): dnd_enabled above
+     * remains the sole runtime gate (back-compat: an old config with just
+     * dndEnabled:true keeps meaning "on indefinitely"). dnd_until_epoch is a
+     * CLOCK_REALTIME wall-clock second count: 0 means "on indefinitely" while
+     * dnd_enabled is true, >0 is an auto-resume deadline (a stale/past value
+     * self-clears on the next 1Hz tick, T2). dnd_until_hour is the resume
+     * hour (0-23, localtime) used by the "until HH:MM" preset. */
+    int64_t dnd_until_epoch;
+    int dnd_until_hour;
+
+    /* Notification privacy mode (docs/26-DND-SCHEDULING-PLAN.md): redacts
+     * toast summary/body at render time (T4, toasts.c); the notification
+     * center itself still shows full content. */
+    bool notif_privacy_mode;
+
+    /* Per-app notification rules; first match wins (T2, method_notify). */
+    dc_notif_rule notif_rules[DC_CONFIG_NOTIF_RULES_MAX];
+    int notif_rules_n;
 
     /* Notification sounds (docs/14-COMPLETION-PLAN.md W1.3, services/sound.c):
      * master switch + per-event toggle + linear volume, matching DMS's
