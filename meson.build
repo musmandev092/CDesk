@@ -184,3 +184,23 @@ install_data('assets/fonts/InterVariable.ttf',
 install_data('assets/sounds/freedesktop/message.oga',
              'assets/sounds/freedesktop/message-new-instant.oga',
              install_dir: get_option('datadir') / 'dankc/sounds/freedesktop')
+
+# docs/28-GREETER-PLAN.md T5: the greetd-facing wrapper that launches
+# `dankc greeter` under niri (see docs/GREETER.md). Installed like any
+# other bindir executable; `meson install` alone does not make it a login
+# greeter (that needs a `greeter` system user + cache dir + editing real
+# /etc/greetd/config.toml — all deliberately manual, see docs/GREETER.md).
+install_data('scripts/dankc-greeter',
+             install_dir: get_option('bindir'),
+             install_mode: 'rwxr-xr-x')
+
+# The remaining greetd integration bits (packaging/greetd/config.toml.example,
+# packaging/systemd/sysusers-dankc-greeter.conf,
+# packaging/systemd/tmpfiles-dankc-greeter.conf) are intentionally NOT
+# installed by meson: they either create a system user + cache dir owned by
+# it (sysusers/tmpfiles) or are a template for /etc/greetd/config.toml
+# itself. Wiring those in automatically would mean a routine
+# `meson install` silently starts provisioning a login greeter, which is
+# exactly the kind of surprise docs/GREETER.md tells you to avoid — they
+# stay source-tree files a packager/admin applies by hand, per
+# docs/GREETER.md's install steps.
