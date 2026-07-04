@@ -142,6 +142,20 @@ struct tick_ctx {
     int last_brightness;
     bool have_last;
     char brightness_path[300]; /* Cached sysfs path for brightness reading */
+
+    /* New OSD variants (mic mute/media/power profile/output switch): each
+     * polled + diffed independently, same "have_last" pattern as volume/
+     * brightness above but with its own guard since these are unrelated
+     * subsystems that can each start reporting at different times. */
+    bool have_last_mic;
+    bool last_mic_muted;
+    bool have_last_sink;
+    char last_sink_name[64];
+    bool have_last_media;
+    bool last_media_active;
+    bool last_media_playing;
+    bool have_last_power;
+    dc_power_mode last_power_mode;
 };
 
 /* Cache the backlight device path on first call. */
@@ -253,6 +267,75 @@ static void clock_tick(void *data)
                 dc_osd_show_brightness(ctx->osd, first, brightness);
         }
         ctx->last_brightness = brightness;
+    }
+
+    /* Mic (default source) mute OSD: poll + diff, mirrors the sink volume
+     * block above. */
+    dc_audio_info mic;
+    if (dc_audio_read_source(&mic) && mic.available) {
+        if (ctx->have_last_mic && mic.muted != ctx->last_mic_muted) {
+            dc_output *first = NULL;
+            wl_list_for_each(first, &ctx->wl->outputs, link) {
+                break;
+            }
+            if (first)
+                dc_osd_show_mic_mute(ctx->osd, first, mic.muted);
+        }
+        ctx->last_mic_muted = mic.muted;
+        ctx->have_last_mic = true;
+    }
+
+    /* Audio output device OSD: poll the default sink's human name + diff. */
+    char sink_name[64];
+    if (dc_audio_read_sink_name(sink_name, sizeof(sink_name)) && sink_name[0]) {
+        if (ctx->have_last_sink && strcmp(sink_name, ctx->last_sink_name) != 0) {
+            dc_output *first = NULL;
+            wl_list_for_each(first, &ctx->wl->outputs, link) {
+                break;
+            }
+            if (first)
+                dc_osd_show_output_switch(ctx->osd, first, sink_name);
+        }
+        snprintf(ctx->last_sink_name, sizeof(ctx->last_sink_name), "%s", sink_name);
+        ctx->have_last_sink = true;
+    }
+
+    /* Media play/pause OSD: poll mpris + diff on a playback-status
+     * transition while a player was already active on the previous tick
+     * (so opening a player fresh doesn't itself pop the OSD, only actually
+     * toggling play<->pause does) -- not on every title change (e.g. a
+     * track skip while still playing shouldn't pop this). */
+    dc_mpris_info mp;
+    if (dc_mpris_read(&mp) && mp.active) {
+        if (ctx->have_last_media && ctx->last_media_active && mp.playing != ctx->last_media_playing) {
+            dc_output *first = NULL;
+            wl_list_for_each(first, &ctx->wl->outputs, link) {
+                break;
+            }
+            if (first)
+                dc_osd_show_media(ctx->osd, first, mp.playing, mp.title);
+        }
+        ctx->last_media_playing = mp.playing;
+        ctx->last_media_active = true;
+        ctx->have_last_media = true;
+    } else {
+        ctx->last_media_active = false;
+        ctx->have_last_media = true;
+    }
+
+    /* Power profile OSD: poll + diff the active mode. */
+    dc_power_info pw;
+    if (dc_power_read(&pw) && pw.available && pw.active_mode != DC_POWER_MODE_UNKNOWN) {
+        if (ctx->have_last_power && pw.active_mode != ctx->last_power_mode) {
+            dc_output *first = NULL;
+            wl_list_for_each(first, &ctx->wl->outputs, link) {
+                break;
+            }
+            if (first)
+                dc_osd_show_power_profile(ctx->osd, first, dc_power_mode_label(pw.active_mode));
+        }
+        ctx->last_power_mode = pw.active_mode;
+        ctx->have_last_power = true;
     }
 }
 

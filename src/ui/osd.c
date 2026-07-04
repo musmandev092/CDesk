@@ -7,6 +7,7 @@
 #include "dc.h"
 #include "render/icons.h"
 #include "render/nvg.h"
+#include "render/shape.h"
 #include "theme/theme.h"
 #include "ui/bar/bar.h"
 #include "wayland/egl.h"
@@ -16,6 +17,7 @@
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 
@@ -38,11 +40,24 @@
  * COMPLETION-PLAN.md W2.3), matching the bar's own screen-edge spacing. */
 #define DC_OSD_SIDE_MARGIN 16
 
-/* OSD mode: either volume or brightness. */
+/* OSD mode. VOLUME/BRIGHTNESS are the original value+progress-bar variants;
+ * the rest are icon+text-label variants added for mic mute/media/power
+ * profile/output switch (see osd_render()'s mode switch below). */
 typedef enum {
     DC_OSD_MODE_VOLUME,
     DC_OSD_MODE_BRIGHTNESS,
+    DC_OSD_MODE_MIC_MUTE,
+    DC_OSD_MODE_MEDIA,
+    DC_OSD_MODE_POWER_PROFILE,
+    DC_OSD_MODE_OUTPUT_SWITCH,
 } dc_osd_mode;
+
+/* True for the two original value+progress-bar variants; false for the
+ * icon+text-label variants. */
+static bool osd_mode_is_value(dc_osd_mode mode)
+{
+    return mode == DC_OSD_MODE_VOLUME || mode == DC_OSD_MODE_BRIGHTNESS;
+}
 
 struct dc_osd {
     dc_wayland *wl;
@@ -69,6 +84,7 @@ struct dc_osd {
     int value;           /* 0-100 percent, applies to both volume and brightness */
     int icon;            /* Material Symbols codepoint to display */
     bool muted;          /* Volume only: whether muted */
+    char label[96];       /* Text-label variants only (mic/media/power/output) */
 
     bool visible;
     bool configured;
@@ -162,30 +178,46 @@ static void osd_render(dc_osd *osd)
                    NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
 
     const float tx = pad + 52.0f;
-    const float tw = w - pad - 52.0f - 52.0f;
-    const float th = 8.0f;
-    float frac = osd->value / 100.0f;
-    if (frac < 0.0f)
-        frac = 0.0f;
-    if (frac > 1.0f)
-        frac = 1.0f;
 
-    nvgBeginPath(vg);
-    nvgRoundedRect(vg, tx, cy - th / 2.0f, tw, th, th / 2.0f);
-    nvgFillColor(vg, nvgRGBA(t->outline.r, t->outline.g, t->outline.b, 90));
-    nvgFill(vg);
-    nvgBeginPath(vg);
-    nvgRoundedRect(vg, tx, cy - th / 2.0f, tw * frac, th, th / 2.0f);
-    nvgFillColor(vg, nvgRGBA(t->primary.r, t->primary.g, t->primary.b, 255));
-    nvgFill(vg);
+    if (osd_mode_is_value(osd->mode)) {
+        const float tw = w - pad - 52.0f - 52.0f;
+        const float th = 8.0f;
+        float frac = osd->value / 100.0f;
+        if (frac < 0.0f)
+            frac = 0.0f;
+        if (frac > 1.0f)
+            frac = 1.0f;
 
-    char label[8];
-    snprintf(label, sizeof(label), "%d", osd->value);
-    nvgFontFaceId(vg, osd->render->font_ui);
-    nvgFontSize(vg, 14.0f);
-    nvgFillColor(vg, nvgRGBA(t->surface_text.r, t->surface_text.g, t->surface_text.b, 255));
-    nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
-    nvgText(vg, w - pad - 18.0f, cy, label, NULL);
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, tx, cy - th / 2.0f, tw, th, th / 2.0f);
+        nvgFillColor(vg, nvgRGBA(t->outline.r, t->outline.g, t->outline.b, 90));
+        nvgFill(vg);
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, tx, cy - th / 2.0f, tw * frac, th, th / 2.0f);
+        nvgFillColor(vg, nvgRGBA(t->primary.r, t->primary.g, t->primary.b, 255));
+        nvgFill(vg);
+
+        char pct_label[8];
+        snprintf(pct_label, sizeof(pct_label), "%d", osd->value);
+        nvgFontFaceId(vg, osd->render->font_ui);
+        nvgFontSize(vg, 14.0f);
+        nvgFillColor(vg, nvgRGBA(t->surface_text.r, t->surface_text.g, t->surface_text.b, 255));
+        nvgTextAlign(vg, NVG_ALIGN_RIGHT | NVG_ALIGN_MIDDLE);
+        nvgText(vg, w - pad - 18.0f, cy, pct_label, NULL);
+    } else {
+        /* Icon+text-label variants (mic mute/media/power profile/output
+         * switch): no progress bar/percent, just the label filling the rest
+         * of the pill, ellipsized to fit -- same truncation convention as
+         * e.g. ui/launcher.c's row labels. */
+        const float lw = w - pad - tx - 12.0f;
+        char buf[96];
+        nvgFontFaceId(vg, osd->render->font_ui);
+        nvgFontSize(vg, 15.0f);
+        nvgFillColor(vg, nvgRGBA(t->surface_text.r, t->surface_text.g, t->surface_text.b, 255));
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        dc_shape_ellipsize(osd->render, osd->label, lw, buf, sizeof(buf));
+        dc_shape_draw_text(osd->render, tx, cy, buf, NULL);
+    }
 
     nvgEndFrame(vg);
 
@@ -318,18 +350,14 @@ void dc_osd_integrate(dc_osd *osd, struct dc_loop *loop)
         dc_loop_add_fd(loop, osd->timer_fd, POLLIN, timer_cb, osd);
 }
 
-/* Generic OSD show: displays either volume or brightness with a custom icon. */
-static void osd_show_generic(dc_osd *osd, dc_output *output, dc_osd_mode mode, int value, int icon,
-                             bool muted)
+/* Shared tail of every dc_osd_show_*() call: (re)shows the surface on
+ * `output` and (re)arms the auto-hide timer. Callers set osd->mode/icon/
+ * value/muted/label first. Factored out of what used to be
+ * osd_show_generic()'s body so the new label-mode variants (mic mute/media/
+ * power profile/output switch) can share it without duplicating the layer-
+ * surface/positioning/animation logic. */
+static void osd_present(dc_osd *osd, dc_output *output)
 {
-    osd->mode = mode;
-    osd->value = value;
-    osd->icon = icon;
-    osd->muted = muted;
-
-    const char *mode_name = (mode == DC_OSD_MODE_VOLUME) ? "volume" : "brightness";
-    dc_debug("osd %s %d%s", mode_name, value, (mode == DC_OSD_MODE_VOLUME && muted) ? " (muted)" : "");
-
     if (osd->visible) {
         /* A new change during the exit fade cancels it and re-shows. */
         if (osd->closing) {
@@ -406,6 +434,37 @@ static void osd_show_generic(dc_osd *osd, dc_output *output, dc_osd_mode mode, i
     arm_timer(osd);
 }
 
+/* Generic OSD show: displays either volume or brightness with a custom icon. */
+static void osd_show_generic(dc_osd *osd, dc_output *output, dc_osd_mode mode, int value, int icon,
+                             bool muted)
+{
+    osd->mode = mode;
+    osd->value = value;
+    osd->icon = icon;
+    osd->muted = muted;
+
+    const char *mode_name = (mode == DC_OSD_MODE_VOLUME) ? "volume" : "brightness";
+    dc_debug("osd %s %d%s", mode_name, value, (mode == DC_OSD_MODE_VOLUME && muted) ? " (muted)" : "");
+
+    osd_present(osd, output);
+}
+
+/* Icon+text-label OSD show, shared by the mic mute/media/power profile/
+ * output switch variants below (osd_render() draws these without the
+ * progress bar + percent number, see osd_mode_is_value()). */
+static void osd_show_label(dc_osd *osd, dc_output *output, dc_osd_mode mode, int icon,
+                           const char *label)
+{
+    osd->mode = mode;
+    osd->icon = icon;
+    osd->muted = false;
+    snprintf(osd->label, sizeof(osd->label), "%s", label ? label : "");
+
+    dc_debug("osd mode=%d: %s", (int)mode, osd->label);
+
+    osd_present(osd, output);
+}
+
 void dc_osd_show_volume(dc_osd *osd, dc_output *output, int volume, bool muted)
 {
     int icon = muted ? DC_ICON_VOLUME_OFF : DC_ICON_VOLUME_UP;
@@ -415,6 +474,48 @@ void dc_osd_show_volume(dc_osd *osd, dc_output *output, int volume, bool muted)
 void dc_osd_show_brightness(dc_osd *osd, dc_output *output, int brightness)
 {
     osd_show_generic(osd, output, DC_OSD_MODE_BRIGHTNESS, brightness, DC_ICON_BRIGHTNESS_MEDIUM, false);
+}
+
+void dc_osd_show_mic_mute(dc_osd *osd, dc_output *output, bool muted)
+{
+    int icon = muted ? DC_ICON_MIC_OFF : DC_ICON_MIC;
+    osd_show_label(osd, output, DC_OSD_MODE_MIC_MUTE, icon, muted ? "Microphone Off" : "Microphone On");
+}
+
+void dc_osd_show_media(dc_osd *osd, dc_output *output, bool playing, const char *title)
+{
+    /* Icon reflects the new state itself (like VOLUME_UP/VOLUME_OFF above),
+     * not the "next action" a play/pause button would perform. */
+    int icon = playing ? DC_ICON_PLAY_ARROW : DC_ICON_PAUSE;
+    const char *label = (title && title[0]) ? title : (playing ? "Playing" : "Paused");
+    osd_show_label(osd, output, DC_OSD_MODE_MEDIA, icon, label);
+}
+
+void dc_osd_show_power_profile(dc_osd *osd, dc_output *output, const char *label)
+{
+    /* Best-fit icons from the existing subset (no exact "balance"/"eco"
+     * glyph available -- see this task's final report for the compromise
+     * this represents): TUNE (sliders) for Balanced, SPEED for Performance,
+     * BATTERY_FULL for Power Saver, generic POWER otherwise. */
+    int icon = DC_ICON_POWER;
+    if (label) {
+        if (strcmp(label, "Performance") == 0)
+            icon = DC_ICON_SPEED;
+        else if (strcmp(label, "Balanced") == 0)
+            icon = DC_ICON_TUNE;
+        else if (strcmp(label, "Power Saver") == 0)
+            icon = DC_ICON_BATTERY_FULL;
+    }
+    osd_show_label(osd, output, DC_OSD_MODE_POWER_PROFILE, icon, label);
+}
+
+void dc_osd_show_output_switch(dc_osd *osd, dc_output *output, const char *device_name)
+{
+    /* HEADPHONES is the closest existing glyph to a generic "audio output
+     * device" icon (already reused this way for bluetooth headset devices
+     * in ui/controlcenter.c's cc_bt_device_icon()) -- no plain
+     * "speaker"/"output" glyph in the current font subset. */
+    osd_show_label(osd, output, DC_OSD_MODE_OUTPUT_SWITCH, DC_ICON_HEADPHONES, device_name);
 }
 
 void dc_osd_destroy(dc_osd *osd)
