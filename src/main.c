@@ -484,6 +484,21 @@ static void dashboard_open_settings(void *user)
     dc_settings_toggle(c->settings, first_output(c->wl));
 }
 
+/* Launcher builtin-entry activation (docs/22-NOTEPAD-PLAN.md NT5): maps a
+ * builtin's `action` string to the panel it opens, same resolve-output +
+ * toggle pattern as `dankc ctl notepad` (control_dispatch above). */
+struct launcher_builtin_ctx {
+    dc_notepad *notepad;
+    struct dc_wayland *wl;
+};
+
+static void launcher_builtin_activate(const char *action, void *user)
+{
+    struct launcher_builtin_ctx *c = user;
+    if (strcmp(action, "notepad") == 0)
+        dc_notepad_toggle(c->notepad, first_output(c->wl));
+}
+
 /* Run a shell command detached (children auto-reaped via SIGCHLD SIG_IGN). */
 static void run_sh(const char *cmd)
 {
@@ -1311,6 +1326,8 @@ int main(int argc, char **argv)
     dc_clipboard *clipboard = dc_clipboard_create(wl, g_loop);
     dc_clip_picker *clip_picker = dc_clip_picker_create(wl, &egl, &render, clipboard);
     dc_notepad *notepad = dc_notepad_create(wl, &egl, &render);
+    struct launcher_builtin_ctx launcher_builtin_ctx = {.notepad = notepad, .wl = wl};
+    dc_launcher_set_builtin_cb(launcher, launcher_builtin_activate, &launcher_builtin_ctx);
     dc_settings *settings = dc_settings_create(wl, &egl, &render);
     dc_dashboard *dashboard = dc_dashboard_create(wl, &egl, &render);
     struct dash_settings_ctx dash_settings = {.settings = settings, .wl = wl};

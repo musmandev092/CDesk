@@ -40,4 +40,13 @@ void dc_launcher_handle_motion(dc_launcher *l, double x, double y);
 /* Wheel scroll over the result list (positive steps_v = scroll down). */
 void dc_launcher_handle_scroll(dc_launcher *l, int steps_v);
 
+/* Register a callback for builtin-entry activation (docs/22-NOTEPAD-PLAN.md
+ * NT5): builtins (e.g. "Notepad") are matched against the search query
+ * alongside apps and rendered as a pinned row above the results, calc-row
+ * style. Activating one (Enter/click) invokes cb(action, ud) then closes the
+ * launcher, same as launching an app. `action` is one of the builtin table's
+ * static strings (e.g. "notepad") -- valid for the process lifetime, no need
+ * to copy it. */
+void dc_launcher_set_builtin_cb(dc_launcher *l, void (*cb)(const char *action, void *ud), void *ud);
+
 #endif /* DC_UI_LAUNCHER_H */
