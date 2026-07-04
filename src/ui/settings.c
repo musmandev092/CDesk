@@ -1960,6 +1960,61 @@ static void systheme_app_row(uictx *c, const char *label, const char *app_id, bo
         ui_hint(c, caveat);
 }
 
+/* docs/21-THEMING-COVERAGE-PLAN.md Task 8: the ~33 themable apps are grouped
+ * into these fixed categories (Settings UI section, §3). One theme_app_entry
+ * per app row; systheme_category() below renders a whole category at once. */
+typedef struct {
+    const char *label;
+    const char *app_id;
+    bool *field;
+    const char *caveat;
+} theme_app_entry;
+
+/* Lightweight sub-header for one SYSTEM THEMING category -- deliberately
+ * smaller/dimmer than ui_section() so the ~7 categories read as a grouping
+ * within the existing section rather than as new top-level sections. */
+static void ui_subsection(uictx *c, const char *label)
+{
+    c->y += 10.0f;
+    if (c->mode == UI_RENDER) {
+        nvgFontFaceId(c->vg, c->s->render->font_ui);
+        nvgFontSize(c->vg, ui_fs(c, 11.0f));
+        nvgTextAlign(c->vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        nvgFillColor(c->vg, tc(c->t->surface_variant_text));
+        nvgText(c->vg, 0, c->y + 6.0f, label, NULL);
+    }
+    c->y += 18.0f;
+}
+
+/* Renders one SYSTEM THEMING category: a sub-header, then detected-first app
+ * rows -- undetected apps stay hidden behind a trailing "Show N undetected"
+ * row until clicked. `open` is that category's session-local expand flag
+ * (see the static bool array in tab_theme_colors(); never persisted to
+ * config, resets every process restart). If every app in the category is
+ * undetected, the header + affordance still render (no dead empty section). */
+static void systheme_category(uictx *c, const char *title, const theme_app_entry *entries, int n,
+                              bool *open)
+{
+    int hidden = 0;
+    for (int i = 0; i < n; i++)
+        if (!dc_systheme_app_detected(entries[i].app_id))
+            hidden++;
+
+    ui_subsection(c, title);
+    for (int i = 0; i < n; i++) {
+        if (!*open && !dc_systheme_app_detected(entries[i].app_id))
+            continue;
+        systheme_app_row(c, entries[i].label, entries[i].app_id, entries[i].field,
+                        entries[i].caveat);
+    }
+    if (hidden > 0) {
+        char label[48];
+        snprintf(label, sizeof(label), "%s %d undetected", *open ? "Hide" : "Show", hidden);
+        if (ui_list_row(c, label, NULL, *open ? IC_EXPAND_LESS : IC_EXPAND_MORE, false) == 1)
+            *open = !*open;
+    }
+}
+
 static void tab_theme_colors(uictx *c)
 {
     ui_section(c, "MODE");
@@ -1986,7 +2041,7 @@ static void tab_theme_colors(uictx *c)
      * actual app theme files (see systheme.h). Nothing here touches disk. */
     ui_section(c, "SYSTEM THEMING");
     if (ui_toggle(c, "Theme system apps",
-                  "Recolor GTK, Qt, and terminal apps from dankc's live wallpaper theme",
+                  "Recolor GTK, Qt, terminals, editors, launchers & more from your theme",
                   c->cfg->systheme_enabled)) {
         c->cfg->systheme_enabled = !c->cfg->systheme_enabled;
         c->changed = true;
@@ -1994,15 +2049,90 @@ static void tab_theme_colors(uictx *c)
     ui_hint(c, "Opt-in -- writes each app's own native theme file, backing up");
     ui_hint(c, "anything user-owned once before the first change.");
     if (c->cfg->systheme_enabled) {
-        systheme_app_row(c, "GTK", "gtk", &c->cfg->systheme_gtk,
-                        "Already-running GTK apps may need a restart to pick this up");
-        systheme_app_row(c, "Qt", "qt", &c->cfg->systheme_qt,
-                        "Qt apps apply colors on restart");
-        systheme_app_row(c, "Alacritty", "alacritty", &c->cfg->systheme_alacritty, NULL);
-        systheme_app_row(c, "VS Code", "vscode", &c->cfg->systheme_vscode,
-                        "Reopen VS Code windows to see the new colors");
-        systheme_app_row(c, "Kitty", "kitty", &c->cfg->systheme_kitty, NULL);
-        systheme_app_row(c, "Foot", "foot", &c->cfg->systheme_foot, NULL);
+        dc_config *g = c->cfg;
+        /* Session-local "show undetected" expand flags, one per category
+         * below -- plain function-static bools, never written to config.json,
+         * reset to collapsed (false) on every process restart. */
+        static bool open_toolkits, open_terminals, open_editors, open_launchers,
+                    open_notifications, open_browsers, open_media;
+
+        const theme_app_entry toolkits[] = {
+            {"GTK", "gtk", &g->systheme_gtk,
+             "Already-running GTK apps may need a restart to pick this up"},
+            {"GTK 2", "gtk2", &g->systheme_gtk2,
+             "Restart GTK2 apps for the ~/.gtkrc-2.0 change to apply"},
+            {"Qt", "qt", &g->systheme_qt,
+             "Needs QT_QPA_PLATFORMTHEME=qt5ct/6ct set; apply on restart"},
+            {"Kvantum", "kvantum", &g->systheme_kvantum,
+             "Needs Kvantum as the active Qt style; restart apps to apply"},
+            {"KDE", "kde", &g->systheme_kde,
+             "Live for most KDE apps; some need a restart"},
+        };
+        systheme_category(c, "TOOLKITS", toolkits, DC_ARRAY_LEN(toolkits), &open_toolkits);
+
+        const theme_app_entry terminals[] = {
+            {"Alacritty", "alacritty", &g->systheme_alacritty, NULL},
+            {"Kitty", "kitty", &g->systheme_kitty, NULL},
+            {"Foot", "foot", &g->systheme_foot, "Restart foot to apply"},
+            {"Ghostty", "ghostty", &g->systheme_ghostty, NULL},
+            {"WezTerm", "wezterm", &g->systheme_wezterm,
+             "Add color_scheme = \"DankC\" to wezterm.lua once to activate"},
+            {"Konsole", "konsole", &g->systheme_konsole,
+             "Restart Konsole to apply the new color scheme"},
+            {"Xresources", "xresources", &g->systheme_xresources,
+             "New terminal instances only (xrdb -merge); XWayland apps only"},
+        };
+        systheme_category(c, "TERMINALS", terminals, DC_ARRAY_LEN(terminals), &open_terminals);
+
+        const theme_app_entry editors[] = {
+            {"VS Code", "vscode", &g->systheme_vscode,
+             "Reopen VS Code windows to see the new colors"},
+            {"Zed", "zed", &g->systheme_zed, "Reopen Zed to see the new theme"},
+            {"Helix", "helix", &g->systheme_helix, NULL},
+            {"Neovim", "neovim", &g->systheme_neovim,
+             "Run :colorscheme dank once to activate"},
+            {"Vim", "vim", &g->systheme_vim,
+             "Add \":colorscheme dank\" to your vimrc once to activate"},
+            {"Sublime Text", "sublime", &g->systheme_sublime, NULL},
+            {"Emacs", "emacs", &g->systheme_emacs,
+             "Add (load-theme 'dank) to your init file once to activate"},
+        };
+        systheme_category(c, "EDITORS", editors, DC_ARRAY_LEN(editors), &open_editors);
+
+        const theme_app_entry launchers[] = {
+            {"Rofi", "rofi", &g->systheme_rofi, NULL},
+            {"Wofi", "wofi", &g->systheme_wofi, NULL},
+            {"Fuzzel", "fuzzel", &g->systheme_fuzzel, NULL},
+            {"Tofi", "tofi", &g->systheme_tofi, NULL},
+        };
+        systheme_category(c, "LAUNCHERS", launchers, DC_ARRAY_LEN(launchers), &open_launchers);
+
+        const theme_app_entry notifications[] = {
+            {"Mako", "mako", &g->systheme_mako, NULL},
+            {"Dunst", "dunst", &g->systheme_dunst, NULL},
+            {"SwayNC", "swaync", &g->systheme_swaync,
+             "Only applied if swaync's style.css already exists"},
+        };
+        systheme_category(c, "NOTIFICATIONS", notifications, DC_ARRAY_LEN(notifications),
+                          &open_notifications);
+
+        const theme_app_entry browsers[] = {
+            {"Firefox", "firefox", &g->systheme_firefox, "Chrome UI only; restart Firefox"},
+            {"qutebrowser", "qutebrowser", &g->systheme_qutebrowser,
+             "Only applied if qutebrowser's config.py already exists"},
+            {"Discord", "discord", &g->systheme_discord,
+             "Needs Vencord/Vesktop; enable theme in-client"},
+        };
+        systheme_category(c, "BROWSERS & CHAT", browsers, DC_ARRAY_LEN(browsers), &open_browsers);
+
+        const theme_app_entry media[] = {
+            {"btop", "btop", &g->systheme_btop, NULL},
+            {"cava", "cava", &g->systheme_cava, NULL},
+            {"Zathura", "zathura", &g->systheme_zathura, "Restart Zathura to apply"},
+            {"Spicetify", "spicetify", &g->systheme_spicetify,
+             "Needs spicetify CLI + backup"},
+        };
+        systheme_category(c, "MEDIA & MONITORS", media, DC_ARRAY_LEN(media), &open_media);
     }
 }
 
