@@ -17,6 +17,7 @@
 #include "services/niri_input.h"
 #include "services/power.h"
 #include "services/printers.h"
+#include "services/systheme.h"
 #include "services/timedate.h"
 #include "services/weather.h"
 #include "theme/theme.h"
@@ -1941,6 +1942,24 @@ static void tab_osd(uictx *c)
  * intentionally does NOT touch any theme engine source file, matching this
  * task's explicit coordination boundary. Dynamic color itself stays on the
  * Personalization tab (unchanged) since it already existed there. */
+/* One row of the SYSTEM THEMING section below: a toggle bound to *field,
+ * plus a "not detected" hint when dc_systheme_app_detected(app_id) is false
+ * (the app is opted in but dc_systheme_apply() will skip it until it's
+ * actually installed), plus an optional reload caveat for apps that don't
+ * live-reload their theme file. */
+static void systheme_app_row(uictx *c, const char *label, const char *app_id, bool *field,
+                             const char *caveat)
+{
+    if (ui_toggle(c, label, NULL, *field)) {
+        *field = !*field;
+        c->changed = true;
+    }
+    if (!dc_systheme_app_detected(app_id))
+        ui_hint(c, "Not detected on this system");
+    if (caveat)
+        ui_hint(c, caveat);
+}
+
 static void tab_theme_colors(uictx *c)
 {
     ui_section(c, "MODE");
@@ -1959,6 +1978,32 @@ static void tab_theme_colors(uictx *c)
     ui_section(c, "PALETTE");
     ui_hint(c, "Pick a color scheme and enable dynamic (wallpaper-derived)");
     ui_hint(c, "color on the Personalization tab.");
+
+    /* docs/.../system-theming task 4: settings UI for services/systheme.c
+     * (task 1, merged). Toggles here only flip dc_config fields + set
+     * c->changed -- dc_config_reapply() -> apply_theme() -> dc_systheme_apply()
+     * already runs on every settings change and is the sole writer of the
+     * actual app theme files (see systheme.h). Nothing here touches disk. */
+    ui_section(c, "SYSTEM THEMING");
+    if (ui_toggle(c, "Theme system apps",
+                  "Recolor GTK, Qt, and terminal apps from dankc's live wallpaper theme",
+                  c->cfg->systheme_enabled)) {
+        c->cfg->systheme_enabled = !c->cfg->systheme_enabled;
+        c->changed = true;
+    }
+    ui_hint(c, "Opt-in -- writes each app's own native theme file, backing up");
+    ui_hint(c, "anything user-owned once before the first change.");
+    if (c->cfg->systheme_enabled) {
+        systheme_app_row(c, "GTK", "gtk", &c->cfg->systheme_gtk,
+                        "Already-running GTK apps may need a restart to pick this up");
+        systheme_app_row(c, "Qt", "qt", &c->cfg->systheme_qt,
+                        "Qt apps apply colors on restart");
+        systheme_app_row(c, "Alacritty", "alacritty", &c->cfg->systheme_alacritty, NULL);
+        systheme_app_row(c, "VS Code", "vscode", &c->cfg->systheme_vscode,
+                        "Reopen VS Code windows to see the new colors");
+        systheme_app_row(c, "Kitty", "kitty", &c->cfg->systheme_kitty, NULL);
+        systheme_app_row(c, "Foot", "foot", &c->cfg->systheme_foot, NULL);
+    }
 }
 
 static void tab_dock(uictx *c)
