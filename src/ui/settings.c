@@ -1177,6 +1177,17 @@ static void tab_personalization(uictx *c)
         }
     }
 
+    /* docs/27-CONNECTED-FRAME-PLAN.md T1: config-only for now -- no panel
+     * reads connected_frame yet, so flipping this has no visible effect
+     * until T2+ wires up the chrome rendering. Independent of
+     * frame_enabled above (screen-corner overlay). */
+    if (ui_toggle(c, "Connected panels", "Stitch popouts and the dock into the bar",
+                  c->cfg->connected_frame)) {
+        c->cfg->connected_frame = !c->cfg->connected_frame;
+        c->changed = true;
+        c->bars = true;
+    }
+
     /* MOTION moved to its own "Typography & Motion" tab (docs/14-COMPLETION-
      * PLAN.md W2.4, matches DMS's TypographyMotionTab.qml grouping) -- see
      * tab_typography() below. */

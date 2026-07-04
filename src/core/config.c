@@ -85,6 +85,9 @@ static dc_config config = {
      * sec.1). materialBlur defaults on per docs/POLISH.md P2. */
     .frame_enabled = false,
     .frame_radius = 12.0f,
+    /* docs/27-CONNECTED-FRAME-PLAN.md: independent of frame_enabled, off by
+     * default until the chrome rendering (T2+) lands. */
+    .connected_frame = false,
     .material_blur = true,
 
     .autostart_enabled = true,
@@ -703,6 +706,7 @@ void dc_config_load(void)
                      &config.dock_pinned_n);
     get_bool(root, "frameEnabled", &config.frame_enabled);
     get_float(root, "frameRadius", &config.frame_radius, 0.0f, 200.0f);
+    get_bool(root, "connectedFrame", &config.connected_frame);
     get_bool(root, "materialBlur", &config.material_blur);
     get_bool(root, "autostartEnabled", &config.autostart_enabled);
 
@@ -920,6 +924,7 @@ void dc_config_save(void)
     add_string_array(root, "dockPinned", config.dock_pinned, config.dock_pinned_n);
     cJSON_AddBoolToObject(root, "frameEnabled", config.frame_enabled);
     cJSON_AddNumberToObject(root, "frameRadius", (double)config.frame_radius);
+    cJSON_AddBoolToObject(root, "connectedFrame", config.connected_frame);
     cJSON_AddBoolToObject(root, "materialBlur", config.material_blur);
     cJSON_AddBoolToObject(root, "autostartEnabled", config.autostart_enabled);
 
