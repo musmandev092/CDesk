@@ -294,6 +294,52 @@ typedef struct dc_config {
     bool systheme_discord;   /* default false: needs Vesktop/Vencord, not stock Discord */
     bool systheme_spicetify; /* default false: rewrites a Spotify client mod's theme files */
     bool systheme_gtk2;
+
+    /* Battery protection + power/sleep depth (docs/24-BATTERY-POWER-PLAN.md).
+     * charge_limit is the *desired* charge_control_end_threshold percentage
+     * (50-100); battery.c's dc_battery_set_charge_limit() is the only thing
+     * that ever writes it to sysfs (via pkexec), and only when the user hits
+     * "Apply" -- sysfs resets on reboot, so dankc deliberately does NOT
+     * auto-reapply this at startup (see plan doc "Key decisions"). Default
+     * 100 == "no limit configured" (matches an unconfigured/absent sysfs
+     * threshold). battery_notifications is the master switch for the
+     * low/critical/charge-limit-reached toasts (services/battery_auto.c);
+     * low/critical thresholds are plain battery percent (raw, not the
+     * charge-limit-rescaled UI percent -- see plan doc). auto_power_saver
+     * flips the power profile to power-saver once raw%% <= low threshold
+     * while on battery. auto_profile_switch + profile_on_ac/profile_on_battery
+     * drive an automatic dc_power_set_mode() call on each observed AC-edge
+     * (never at startup); the profile ints are plain 0=power-saver/
+     * 1=balanced/2=performance -- not power.h's enum, same trick as
+     * nightlight_schedule_mode above, so config.c doesn't need to depend on
+     * power.h. */
+    int charge_limit;
+    bool battery_notifications;
+    int low_battery_threshold;
+    int critical_battery_threshold;
+    bool auto_power_saver;
+    bool auto_profile_switch;
+    int profile_on_ac;
+    int profile_on_battery;
+
+    /* Idle timeouts (stretch T7, src/services/idle.c -- an ext-idle-notify-v1
+     * client): per-AC-source minute counts for 4 escalating stages (lock ->
+     * monitor-off -> suspend -> hibernate), separately configurable for AC
+     * and battery since logind's own IdleAction/Sec is single-valued and
+     * can't do that split (plan doc "Key decisions"). idle_timeouts_enabled
+     * is the master switch (off by default: no idle mechanism exists yet
+     * without T7, and a stage value of 0 always means "disabled" regardless
+     * of the master switch). All default 0 (disabled) so a fresh install/
+     * upgrade changes nothing until the user opts in. */
+    bool idle_timeouts_enabled;
+    int idle_lock_ac_min;
+    int idle_lock_batt_min;
+    int idle_monitor_off_ac_min;
+    int idle_monitor_off_batt_min;
+    int idle_suspend_ac_min;
+    int idle_suspend_batt_min;
+    int idle_hibernate_ac_min;
+    int idle_hibernate_batt_min;
 } dc_config;
 
 /* The active config. Read-only for the rest of the app. */
