@@ -146,6 +146,7 @@ src = files(
   'src/niri/niri.c',
   'src/theme/theme.c',
   'src/ipc/control.c',
+  'src/services/greetd.c',
 )
 
 # The single C++ translation unit (Material colour math).
