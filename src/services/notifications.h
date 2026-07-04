@@ -70,6 +70,20 @@ typedef enum {
     DC_NOTIF_HISTORY = 1,
 } dc_notif_status;
 
+/* Per-app rule engine action (docs/26-DND-SCHEDULING-PLAN.md rule-engine
+ * section; mirrors core/config.h's dc_notif_rule.action int, which config.c
+ * stores as a plain int to avoid depending on this header -- see that
+ * struct's comment). Evaluated in method_notify() after hint parsing, before
+ * acquire_slot(): the first rule whose `match` equals (case-insensitively)
+ * either the notification's app_name or its ".desktop"-stripped desktop-entry
+ * hint wins. */
+typedef enum {
+    DC_NOTIF_RULE_MUTE = 0,       /* recorded (Current/History), no popup, no sound */
+    DC_NOTIF_RULE_IGNORE = 1,     /* dropped entirely -- never stored, still returns a fresh id */
+    DC_NOTIF_RULE_POPUP_ONLY = 2, /* toast only -- deleted (not archived to History) on expiry/dismiss */
+    DC_NOTIF_RULE_NO_HISTORY = 3, /* toast + Current, deleted instead of moving to History */
+} dc_notif_rule_action;
+
 /* One action button: key is what's sent back in ActionInvoked, label is the
  * button text. The spec's reserved "default" key (invoked by clicking the
  * notification body itself, not a button) is filtered out at parse time --
@@ -83,6 +97,7 @@ typedef struct {
 typedef struct {
     uint32_t id;
     char app_name[DC_NOTIF_APP];
+    char desktop_entry[DC_NOTIF_APP]; /* "desktop-entry" hint (e.g. "firefox"), sans ".desktop" if the sender included it; empty if not sent -- matched against per-app rules alongside app_name */
     char summary[DC_NOTIF_SUMMARY];
     char body[DC_NOTIF_BODY];
     char app_icon[DC_NOTIF_ICON]; /* icon name (XDG theme) or absolute path from the Notify() app_icon arg / icon_data hint */
@@ -112,6 +127,17 @@ typedef struct {
     bool popup;            /* still shown as a transient toast */
     bool active;           /* occupies this slot (either tab; false = free/deleted) */
     dc_notif_status status;
+
+    /* Set when a DC_NOTIF_RULE_POPUP_ONLY / DC_NOTIF_RULE_NO_HISTORY rule
+     * matched this notification (docs/26-DND-SCHEDULING-PLAN.md rule-engine
+     * section). popup_only: deleted (not archived) the moment the toast would
+     * otherwise just stop popping (expiry/dismiss) -- it never reaches
+     * History. no_history: behaves like a normal notification while on the
+     * Current tab, but is deleted instead of moved when it would transition
+     * to History (dismiss/clear-current). See notifications.c's
+     * resolve_dismiss()/dc_notifications_clear_current()/_tick(). */
+    bool popup_only;
+    bool no_history;
 } dc_notification;
 
 typedef struct dc_notifications dc_notifications;
@@ -189,5 +215,37 @@ void dc_notifications_seed_demo(dc_notifications *n);
  * the assigned id (0 if `n` is NULL). */
 uint32_t dc_notifications_post_local(dc_notifications *n, const char *app, const char *summary,
                                      const char *body, dc_urgency urgency);
+
+/* --- DND scheduling (docs/26-DND-SCHEDULING-PLAN.md) ----------------------
+ *
+ * dnd_enabled (core/config.h) remains the sole runtime popup gate (checked
+ * directly in method_notify()/dc_notifications_post_local(), unchanged from
+ * before this feature) -- these just add a persisted auto-resume deadline on
+ * top of it. `n` is only used to fire an immediate changed_cb refresh (e.g.
+ * so the notification center's DND chip/countdown updates without waiting
+ * for the next 1Hz tick); passing NULL just skips that (config is still
+ * mutated + saved). A stale/past dnd_until_epoch self-clears at the top of
+ * dc_notifications_tick(). */
+
+/* Turn DND on. dur_sec <= 0 means indefinite (dnd_until_epoch=0, matching the
+ * old dndEnabled:true-only back-compat behavior); dur_sec > 0 sets an
+ * auto-resume deadline dur_sec from now (CLOCK_REALTIME, survives suspend). */
+void dc_notif_dnd_start(dc_notifications *n, int dur_sec);
+
+/* Turn DND on until the next occurrence of `hour` (0-23, localtime) -- e.g.
+ * "until 8 AM". If that time today has already passed, resumes tomorrow
+ * instead (computed via a second mktime() on the incremented day, not a flat
+ * +24h in seconds, so a DST transition in between doesn't shift the actual
+ * wall-clock hour). Persists `hour` as dnd_until_hour for the UI to
+ * pre-select next time. */
+void dc_notif_dnd_start_until_hour(dc_notifications *n, int hour);
+
+/* Turn DND off (clears dnd_enabled and dnd_until_epoch). */
+void dc_notif_dnd_stop(dc_notifications *n);
+
+/* -1 = DND off; 0 = DND on indefinitely (no deadline); >0 = seconds left
+ * until auto-resume. Pure read of core/config.h's dc_config_current -- no
+ * `n` needed. */
+int64_t dc_notif_dnd_remaining_sec(void);
 
 #endif /* DC_SERVICES_NOTIFICATIONS_H */
