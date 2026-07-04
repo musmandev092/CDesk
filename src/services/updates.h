@@ -81,6 +81,15 @@ int dc_updates_read(dc_update_backend *out, int max);
  * bar-widget badge in a later task. */
 int dc_updates_total(void);
 
+/* Periodic auto-check for the systemUpdate bar widget: call from a ~1Hz
+ * timer (main.c's clock_tick). Self-limits internally via a static "last
+ * kicked" timestamp compared against `interval_min` (dc_config.
+ * updates_check_interval_min), same convention as dc_battery_auto_tick()/
+ * dc_wallpaper_cycle_tick() -- cheap to call every tick. `interval_min <= 0`
+ * means auto-check is disabled (manual-only via the System Updater tab's
+ * "Check for updates" button, the pre-existing behavior). */
+void dc_updates_auto_tick(int interval_min);
+
 /* Spawns an interactive terminal running the real upgrade command for
  * `backend`:
  *   - "pacman" or "aur" -> "sudo pacman -Syu" (docs/29 sec.4's key default;

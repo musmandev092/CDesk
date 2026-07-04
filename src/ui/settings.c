@@ -420,6 +420,26 @@ static float sidebar_scroll_max(const dc_settings *s)
     return m > 0.0f ? m : 0.0f;
 }
 
+/* Scroll the sidebar tab list just enough to bring s->active_tab into view
+ * (used both when the window first opens on a tab -- e.g. DANKC_SETTINGS_TAB,
+ * dc_settings_toggle_tab() -- and when switching tabs while already open).
+ * Extracted so both call sites share the same clamp logic. */
+static void sidebar_reveal_active_tab(dc_settings *s)
+{
+    float item_h = DC_SIDEBAR_ITEM_H;
+    float body_h = sidebar_body_height(s);
+    float max_scroll = sidebar_scroll_max(s);
+    float iy = s->active_tab * item_h;
+    if (iy < s->sidebar_scroll_y)
+        s->sidebar_scroll_y = iy;
+    else if (iy + item_h > s->sidebar_scroll_y + body_h)
+        s->sidebar_scroll_y = iy + item_h - body_h;
+    if (s->sidebar_scroll_y > max_scroll)
+        s->sidebar_scroll_y = max_scroll;
+    if (s->sidebar_scroll_y < 0.0f)
+        s->sidebar_scroll_y = 0.0f;
+}
+
 /* ============================ immediate-mode UI ============================ */
 
 typedef enum { UI_MEASURE, UI_RENDER, UI_HIT } ui_mode;
@@ -5372,23 +5392,7 @@ static void s_show(dc_settings *s, dc_output *output)
      * visible -- matters for DANKC_SETTINGS_TAB screenshot verification of
      * tabs low in the list (logical_height is already DC_SET_HEIGHT at this
      * point; it's only overridden once the first configure event arrives). */
-    {
-        float item_h = DC_SIDEBAR_ITEM_H;
-        float body_h = sidebar_body_height(s);
-        float total_h = TAB_COUNT * item_h;
-        float max_scroll = total_h - body_h;
-        if (max_scroll < 0.0f)
-            max_scroll = 0.0f;
-        float iy = s->active_tab * item_h;
-        if (iy < s->sidebar_scroll_y)
-            s->sidebar_scroll_y = iy;
-        else if (iy + item_h > s->sidebar_scroll_y + body_h)
-            s->sidebar_scroll_y = iy + item_h - body_h;
-        if (s->sidebar_scroll_y > max_scroll)
-            s->sidebar_scroll_y = max_scroll;
-        if (s->sidebar_scroll_y < 0.0f)
-            s->sidebar_scroll_y = 0.0f;
-    }
+    sidebar_reveal_active_tab(s);
     s->focus_field = 0;
     s->edit_buf[0] = '\0';
     s->test_clicks_done = false;
@@ -5487,6 +5491,24 @@ void dc_settings_toggle(dc_settings *s, dc_output *output)
         s_begin_close(s);
     else
         s_show(s, output);
+}
+
+void dc_settings_toggle_tab(dc_settings *s, dc_output *output, dc_settings_tab tab)
+{
+    int internal = (tab == DC_SETTINGS_TAB_UPDATER) ? TAB_SYSTEM_UPDATER : TAB_NETWORK;
+    if (s->visible && !s->closing) {
+        if (s->active_tab == internal) {
+            s_begin_close(s);
+        } else {
+            s->active_tab = internal;
+            sidebar_reveal_active_tab(s);
+            s->scroll_y = 0;
+            s_render(s);
+        }
+    } else {
+        s->active_tab = internal;
+        s_show(s, output);
+    }
 }
 
 void dc_settings_hide(dc_settings *s)

@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 /* --- PATH probing (mirrors services/screenrec.c's cmd_exists(), which in
@@ -194,6 +195,19 @@ int dc_updates_total(void)
             total += rows[i].count;
     }
     return total;
+}
+
+void dc_updates_auto_tick(int interval_min)
+{
+    if (interval_min <= 0)
+        return; /* manual-only, same default as the System Updater tab's own knob */
+
+    static time_t last_check = 0;
+    time_t now = time(NULL);
+    if (last_check != 0 && now - last_check < interval_min * 60)
+        return;
+    last_check = now;
+    dc_updates_check_async();
 }
 
 /* --- upgrade ------------------------------------------------------------ */

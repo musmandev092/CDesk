@@ -30,6 +30,21 @@ void dc_settings_hide(dc_settings *s);
 bool dc_settings_visible(dc_settings *s);
 struct wl_surface *dc_settings_surface(dc_settings *s);
 
+/* A small public subset of settings.c's (private) tab list that other
+ * modules need to jump straight to -- currently the systemUpdate/vpn bar
+ * widgets (docs/29-SMALL-FEATURES-PLAN.md sec.5). Deliberately not the full
+ * ~28-tab enum (that stays file-local to settings.c); extend as more
+ * external jump targets are needed. */
+typedef enum {
+    DC_SETTINGS_TAB_NETWORK,
+    DC_SETTINGS_TAB_UPDATER,
+} dc_settings_tab;
+
+/* Open settings directly on `tab`: same toggle shape as dc_dashboard_toggle()
+ * -- closes if already open on that tab, switches tab (without closing) if
+ * open on a different one, else opens fresh on `tab`. */
+void dc_settings_toggle_tab(dc_settings *s, struct dc_output *output, dc_settings_tab tab);
+
 void dc_settings_handle_click(dc_settings *s, double x, double y);
 /* `x` (surface-local) picks whether the wheel scrolls the sidebar tab list
  * (now 20 tabs, taller than the window -- docs/14-COMPLETION-PLAN.md W2) or

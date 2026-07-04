@@ -18,6 +18,7 @@
 #include "services/screenrec.h"
 #include "services/sysmon.h"
 #include "services/tray.h"
+#include "services/updates.h"
 #include "services/weather.h"
 #include "theme/theme.h"
 #include "ui/bar/bar_tokens.h"
@@ -498,6 +499,115 @@ static float measure_screenrec(dc_bar *bar)
 static void draw_screenrec_pill(dc_bar *bar, const dc_pill *p)
 {
     layout_screenrec(bar, p->content_x0, true);
+}
+
+/* --- systemUpdate ----------------------------------------------------------- */
+
+/* Icon + total pending-update count (services/updates.h's dc_updates_total(),
+ * summed across the pacman/aur/flatpak backends). Hidden entirely while
+ * nothing is pending (measure returns 0, same "widget opts itself out of the
+ * layout" convention as weather's no-data case) -- there's no "0 updates"
+ * idle glyph to show, unlike screenRecorder's idle camera icon, since a
+ * clean system has nothing useful to say here. dc_updates_total()/_read()
+ * are documented cheap enough to call every render (a handful of stat()s, no
+ * forking), so this widget doesn't need its own cache -- the periodic
+ * *check* itself (which does fork checkupdates/paru/flatpak) is kicked from
+ * main.c's clock_tick via dc_updates_auto_tick(), gated by
+ * updatesCheckIntervalMin same as the System Updater settings tab's manual
+ * button. Click (main.c's DC_BAR_REGION_SYSTEM_UPDATE case) opens Settings
+ * on that tab. */
+static float layout_update(dc_bar *bar, float x0, bool draw)
+{
+    const int total = dc_updates_total();
+    if (total <= 0)
+        return 0.0f;
+
+    NVGcontext *vg = bar->render->vg;
+    const dc_theme *t = dc_theme_current;
+    const dc_config *cfg = dc_config_current;
+    const float cy = bar_cy(bar);
+    const float isz = dc_bar_icon_size(cfg, -4);
+    const float icon_text_gap = 4.0f;
+
+    float x = x0;
+    if (draw)
+        dc_render_icon(bar->render, DC_ICON_UPDATE, x, cy, isz, t->primary,
+                       NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+    x += isz + icon_text_gap;
+
+    char label[16];
+    snprintf(label, sizeof(label), "%d", total);
+    nvgFontFaceId(vg, bar->render->font_ui);
+    nvgFontSize(vg, DC_BAR_TEXT_SIZE);
+    float bounds[4];
+    nvgTextBounds(vg, 0.0f, 0.0f, label, NULL, bounds);
+    const float text_w = bounds[2] - bounds[0];
+    if (draw) {
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        nvgFillColor(vg, tc(t->surface_text));
+        nvgText(vg, x, cy, label, NULL);
+    }
+    x += text_w;
+    return x - x0;
+}
+
+static float measure_update(dc_bar *bar)
+{
+    return layout_update(bar, 0.0f, false);
+}
+
+static void draw_update_pill(dc_bar *bar, const dc_pill *p)
+{
+    layout_update(bar, p->content_x0, true);
+}
+
+/* --- vpn --------------------------------------------------------------- */
+
+/* A single shield glyph: dimmed (surface_variant_text) when saved VPN/
+ * WireGuard profiles exist but none is active, primary-colored (highlighted)
+ * when at least one is. Hidden entirely when there are no saved profiles at
+ * all (dc_net_vpn_list() returns 0) -- nothing this widget could usefully
+ * show or link to in that case. dc_net_vpn_list() is documented cheap enough
+ * to call every render frame (same cost class as dc_net_saved_list()), so no
+ * caching/tick wiring is needed here, unlike systemUpdate's fork-based
+ * check. Click (main.c's DC_BAR_REGION_VPN case) opens Settings on the
+ * Network tab, where profiles can be activated/deactivated. */
+static float layout_vpn(dc_bar *bar, float x0, bool draw)
+{
+    const dc_config *cfg = dc_config_current;
+    const dc_theme *t = dc_theme_current;
+    const float cy = bar_cy(bar);
+    const float isz = dc_bar_icon_size(cfg, -4);
+
+    dc_net_vpn vpns[DC_NET_VPN_MAX];
+    const int n = dc_net_vpn_list(vpns, DC_NET_VPN_MAX);
+    if (n == 0)
+        return 0.0f;
+
+    bool active = false;
+    for (int i = 0; i < n; i++) {
+        if (vpns[i].active) {
+            active = true;
+            break;
+        }
+    }
+
+    if (draw) {
+        dc_color color = active ? t->primary : t->surface_variant_text;
+        dc_render_icon(bar->render, DC_ICON_SHIELD, x0, cy, isz, color,
+                       NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+    }
+    return isz;
+}
+
+static float measure_vpn(dc_bar *bar)
+{
+    return layout_vpn(bar, 0.0f, false);
+}
+
+static void draw_vpn_pill(dc_bar *bar, const dc_pill *p)
+{
+    layout_vpn(bar, p->content_x0, true);
 }
 
 /* --- workspaceSwitcher ---------------------------------------------------- */
@@ -1729,6 +1839,9 @@ static const dc_bar_widget_def *find_widget(const char *id)
         {"notepad", measure_notepad, draw_notepad_pill, true, false, DC_BAR_REGION_NOTEPAD},
         {"screenRecorder", measure_screenrec, draw_screenrec_pill, true, false,
          DC_BAR_REGION_SCREENREC},
+        {"systemUpdate", measure_update, draw_update_pill, true, false,
+         DC_BAR_REGION_SYSTEM_UPDATE},
+        {"vpn", measure_vpn, draw_vpn_pill, true, false, DC_BAR_REGION_VPN},
         {"cpuUsage", measure_cpu, draw_cpu_pill, true, false, DC_BAR_REGION_CPU},
         {"memUsage", measure_mem, draw_mem_pill, true, false, DC_BAR_REGION_MEM},
         {"notificationButton", measure_notif, draw_notif_pill, true, false,

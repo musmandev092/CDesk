@@ -29,6 +29,7 @@
 #include "services/screenrec.h"
 #include "services/sysmon.h"
 #include "services/tray.h"
+#include "services/updates.h"
 #include "services/wallpaper.h"
 #include "services/weather.h"
 #include "theme/theme.h"
@@ -289,6 +290,17 @@ static void clock_tick(void *data)
      * free below since render_all() already repaints every tick. */
     if (bar_widget_configured("screenRecorder"))
         dc_screenrec_active();
+    /* systemUpdate bar widget: kick a periodic background update check
+     * (dc_updates_check_async() forks checkupdates/paru-or-yay/flatpak),
+     * respecting updatesCheckIntervalMin (0 = manual-only via the System
+     * Updater settings tab's button, unchanged) and self-limited internally
+     * by dc_updates_auto_tick() so this call is cheap every tick. Gated by
+     * bar_widget_configured() so users who never add the widget don't pay
+     * for periodic forks -- same convention as the screenRecorder guard
+     * above. The widget itself reads dc_updates_total() fresh on every
+     * render (cheap, no forking -- see bar.c's layout_update()). */
+    if (bar_widget_configured("systemUpdate"))
+        dc_updates_auto_tick(dc_config_current->updates_check_interval_min);
     render_all(ctx->set);
     dc_dashboard_refresh(ctx->dashboard); /* keep clock/meters/media live while open */
 
@@ -938,6 +950,10 @@ static void handle_left_click(struct wl_surface *surface, double x, double y, st
                 dc_screenrec_stop(ctx->notifications);
             else
                 dc_screenrec_start(ctx->notifications, false);
+        } else if (region == DC_BAR_REGION_SYSTEM_UPDATE) {
+            dc_settings_toggle_tab(ctx->settings, dc_bar_output(bar), DC_SETTINGS_TAB_UPDATER);
+        } else if (region == DC_BAR_REGION_VPN) {
+            dc_settings_toggle_tab(ctx->settings, dc_bar_output(bar), DC_SETTINGS_TAB_NETWORK);
         } else if (region == DC_BAR_REGION_TRAY) {
             /* Click-to-activate (docs/POLISH.md P4): left click opens the
              * item's primary action (e.g. a player's main window). */
