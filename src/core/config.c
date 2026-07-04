@@ -2,6 +2,7 @@
 
 #include "core/dms_import.h"
 #include "core/log.h"
+#include "services/systheme.h"
 #include "theme/dynamic.h"
 #include "theme/theme.h"
 
@@ -111,6 +112,17 @@ static dc_config config = {
     .input_mouse_accel_enabled = false,
     .input_mouse_accel_speed = 0.0f,
     .input_keyboard_numlock = false,
+
+    /* services/systheme.c: master switch off (opt-in), per-app toggles on
+     * (matches the master switch's own "opt in once, get everything
+     * detected" intent -- see config.h's field comment). */
+    .systheme_enabled = false,
+    .systheme_gtk = true,
+    .systheme_qt = true,
+    .systheme_alacritty = true,
+    .systheme_vscode = true,
+    .systheme_kitty = true,
+    .systheme_foot = true,
 };
 
 const dc_config *dc_config_current = &config;
@@ -271,6 +283,7 @@ static void apply_theme(void)
             dc_warn("dynamic color: could not read %s", config.wallpaper);
         }
     }
+    dc_systheme_apply(&config);
 }
 
 /* Resolve the config.json path. Returns false if no HOME/XDG. */
@@ -399,6 +412,14 @@ void dc_config_load(void)
     get_bool(root, "inputKeyboardNumlock", &config.input_keyboard_numlock);
     get_string(root, "inputKeyboardLayout", config.input_keyboard_layout,
                sizeof(config.input_keyboard_layout));
+
+    get_bool(root, "systemThemingEnabled", &config.systheme_enabled);
+    get_bool(root, "systemThemeGtk", &config.systheme_gtk);
+    get_bool(root, "systemThemeQt", &config.systheme_qt);
+    get_bool(root, "systemThemeAlacritty", &config.systheme_alacritty);
+    get_bool(root, "systemThemeVscode", &config.systheme_vscode);
+    get_bool(root, "systemThemeKitty", &config.systheme_kitty);
+    get_bool(root, "systemThemeFoot", &config.systheme_foot);
     cJSON_Delete(root);
 
     apply_theme();
@@ -544,6 +565,14 @@ void dc_config_save(void)
     cJSON_AddBoolToObject(root, "inputKeyboardNumlock", config.input_keyboard_numlock);
     if (config.input_keyboard_layout[0])
         cJSON_AddStringToObject(root, "inputKeyboardLayout", config.input_keyboard_layout);
+
+    cJSON_AddBoolToObject(root, "systemThemingEnabled", config.systheme_enabled);
+    cJSON_AddBoolToObject(root, "systemThemeGtk", config.systheme_gtk);
+    cJSON_AddBoolToObject(root, "systemThemeQt", config.systheme_qt);
+    cJSON_AddBoolToObject(root, "systemThemeAlacritty", config.systheme_alacritty);
+    cJSON_AddBoolToObject(root, "systemThemeVscode", config.systheme_vscode);
+    cJSON_AddBoolToObject(root, "systemThemeKitty", config.systheme_kitty);
+    cJSON_AddBoolToObject(root, "systemThemeFoot", config.systheme_foot);
 
     char *text = cJSON_Print(root);
     cJSON_Delete(root);
