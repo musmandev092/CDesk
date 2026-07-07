@@ -7,9 +7,12 @@
 
 #include "cJSON.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <math.h>
 #include <poll.h>
+#include <signal.h>
+#include <sys/prctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -368,10 +371,108 @@ static void audio_pwdump_start(void)
     dc_debug("audio: forking pw-dump (async, device cache miss/stale)");
 }
 
+/* --- event-driven refresh: persistent pw-mon watcher ----------------------
+ *
+ * With only the age-based cache above, the bar/OSD readers (1Hz via main.c's
+ * clock_tick) kept the cache perpetually stale-by-age, forking a fresh
+ * pw-dump every DC_AUDIO_DEVICE_CACHE_SECONDS forever -- ~17k forks/day at
+ * idle. Instead, one long-lived `pw-mon` child watches the PipeWire graph:
+ * its stdout only produces bytes when something actually changed (node
+ * added/removed, volume/mute/default switched), and any activity just marks
+ * the cache stale (g_devices_time = 0). The next 1Hz reader then kicks one
+ * pw-dump -- so refreshes happen within ~1s of a real change and never
+ * otherwise, with the tick cadence acting as a natural debounce for event
+ * bursts. If pw-mon is missing or dies, `alive` drops and
+ * audio_devices_maybe_refresh() falls back to the old age-based polling
+ * (one spawn attempt per process run; no respawn loop). */
+static struct {
+    bool alive;
+    pid_t pid;
+    int fd;
+} g_pwmon = {.fd = -1};
+
+static void pwmon_teardown(void)
+{
+    if (g_pwmon.fd >= 0) {
+        dc_loop_remove_fd(g_pwdump.loop, g_pwmon.fd);
+        close(g_pwmon.fd);
+        g_pwmon.fd = -1;
+    }
+    if (g_pwmon.alive)
+        dc_info("audio: pw-mon watcher gone; falling back to %ds polling",
+                DC_AUDIO_DEVICE_CACHE_SECONDS);
+    g_pwmon.alive = false;
+}
+
+static void pwmon_ready(int fd, uint32_t revents, void *data)
+{
+    DC_UNUSED(data);
+
+    char scratch[4096];
+    ssize_t n;
+    while ((n = read(fd, scratch, sizeof(scratch))) > 0)
+        ; /* drain; content is irrelevant, activity itself is the signal */
+
+    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+        pwmon_teardown(); /* EOF (pw-mon died / not installed) or hard error */
+        return;
+    }
+    if (revents & (POLLHUP | POLLERR)) {
+        pwmon_teardown();
+        return;
+    }
+
+    g_devices_time = 0; /* stale; next reader (<=1s away) refreshes once */
+}
+
+static void pwmon_start(void)
+{
+    if (!g_pwdump.loop)
+        return;
+
+    int fds[2];
+    if (pipe(fds) < 0)
+        return;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return;
+    }
+
+    if (pid == 0) { /* child: pw-mon -> write end of the pipe */
+        close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+        close(fds[1]);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0)
+            dup2(devnull, STDERR_FILENO);
+        /* Die with dankc: nothing kills children on exit, and an orphaned
+         * pw-mon would linger until its next write hit EPIPE. */
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        execlp("pw-mon", "pw-mon", (char *)NULL);
+        _exit(127); /* exec failed -> immediate EOF -> pwmon_teardown() */
+    }
+
+    close(fds[1]);
+    fcntl(fds[0], F_SETFL, O_NONBLOCK);
+    g_pwmon.fd = fds[0];
+    g_pwmon.pid = pid;
+    g_pwmon.alive = true;
+    dc_loop_add_fd(g_pwdump.loop, fds[0], POLLIN, pwmon_ready, NULL);
+    dc_info("audio: pw-mon watcher started (event-driven device cache)");
+}
+
 static void audio_devices_maybe_refresh(void)
 {
-    time_t now = time(NULL);
-    bool stale = !g_devices_valid || now - g_devices_time >= DC_AUDIO_DEVICE_CACHE_SECONDS;
+    bool stale;
+    if (!g_devices_valid)
+        stale = true;
+    else if (g_pwmon.alive)
+        stale = g_devices_time == 0; /* only events/writes mark it stale */
+    else
+        stale = time(NULL) - g_devices_time >= DC_AUDIO_DEVICE_CACHE_SECONDS;
     if (stale)
         audio_pwdump_start(); /* no-op if already in flight or no loop bound yet */
 }
@@ -390,6 +491,7 @@ static void audio_devices_invalidate(void)
 void dc_audio_init(struct dc_loop *loop)
 {
     g_pwdump.loop = loop;
+    pwmon_start();
 }
 
 /* --- legacy default-sink/source readers (kept for main.c's OSD tick and the
