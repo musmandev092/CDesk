@@ -22,6 +22,7 @@
 #include "services/weather.h"
 #include "theme/theme.h"
 #include "ui/bar/bar_tokens.h"
+#include "ui/hover.h"
 #include "wayland/egl.h"
 #include "wayland/wl.h"
 
@@ -2108,8 +2109,8 @@ static float bar_hover_height(const dc_config *cfg, dc_bar_region region)
     }
 }
 
-/* Hover bg (docs/12-BAR-SPEC.md sec.3): withAlpha(blend(surfaceContainerHigh,
- * primary, 0.10), max(0.30, widgetTransparency)), painted on top of whichever
+/* Hover bg (docs/12-BAR-SPEC.md sec.3): dc_hover_bg_color()'s translucent
+ * state-layer tint, painted on top of whichever
  * hit rect the pointer is currently over — sized to that region's own visual
  * shape (bar_hover_height()), not the taller click target, so full pills get
  * a stadium and circular sub-regions (media transport, tray chips) get a
@@ -2134,14 +2135,13 @@ static void draw_hover_overlay(dc_bar *bar)
     float y = bar_cy(bar) - h / 2.0f;
     float radius = dc_bar_clamp_radius(h / 2.0f, w, h);
 
-    NVGcolor blended = color_lerp(tc(t->surface_container_high), tc(t->primary), 0.10f);
-    float alpha = fmaxf(0.30f, cfg->bar_widget_transparency);
+    dc_color hc = dc_hover_bg_color(t->surface_container_high, t->primary,
+                                    cfg->bar_widget_transparency);
 
     NVGcontext *vg = bar->render->vg;
     nvgBeginPath(vg);
     nvgRoundedRect(vg, hit->x0, y, w, h, radius);
-    nvgFillColor(vg, nvgRGBA((unsigned char)(blended.r * 255.0f), (unsigned char)(blended.g * 255.0f),
-                            (unsigned char)(blended.b * 255.0f), (unsigned char)(alpha * 255.0f)));
+    nvgFillColor(vg, nvgRGBA(hc.r, hc.g, hc.b, hc.a));
     nvgFill(vg);
 }
 

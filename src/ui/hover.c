@@ -1,18 +1,19 @@
 #include "ui/hover.h"
 
-#include <math.h>
-
 dc_color dc_hover_bg_color(dc_color base, dc_color primary, float widget_alpha)
 {
-    const float blend_t = 0.10f;
-    float a = widget_alpha > 0.30f ? widget_alpha : 0.30f;
-    if (a > 1.0f)
-        a = 1.0f;
-
-    dc_color out;
-    out.r = (uint8_t)lroundf((float)base.r + ((float)primary.r - (float)base.r) * blend_t);
-    out.g = (uint8_t)lroundf((float)base.g + ((float)primary.g - (float)base.g) * blend_t);
-    out.b = (uint8_t)lroundf((float)base.b + ((float)primary.b - (float)base.b) * blend_t);
-    out.a = (uint8_t)lroundf(a * 255.0f);
+    /* Material state layer: every caller paints this LAST, on top of the
+     * already-drawn element (icon + label included), so it must be a
+     * translucent tint -- never an opaque fill. The original DMS formula
+     * here -- withAlpha(blend(base, primary, 0.10), max(0.30,
+     * widgetTransparency)) -- is a *background replacement* color; painted
+     * over content at widgetTransparency ~1.0 it fully covered the hovered
+     * element, making every icon "fade out" on hover (reported live
+     * 2026-07-07). A ~12%-alpha primary tint gives the same perceived
+     * background shift while keeping the content readable underneath. */
+    (void)base;
+    (void)widget_alpha;
+    dc_color out = primary;
+    out.a = 31; /* ~12% state-layer alpha */
     return out;
 }
