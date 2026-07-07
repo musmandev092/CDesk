@@ -275,6 +275,7 @@ static void clock_tick(void *data)
      * is engaged. */
     dc_wallpaper_cycle_tick(dc_lock_active(ctx->lock));
     dc_notepad_tick(ctx->notepad); /* autosave debounce check (docs/22-NOTEPAD-PLAN.md NT4) */
+    dc_config_save_tick();         /* flush a debounced config save (config.c, 1/s rate limit) */
     dc_sysmon_poll(); /* self-limits to 3s (docs/12-BAR-SPEC.md sec.4 cpuUsage/memUsage) */
     /* Both self-limit/no-op while the Processes popout is closed (docs/13-
      * POPOUTS-SPEC.md: "2s poll only while open, no background cost"). */

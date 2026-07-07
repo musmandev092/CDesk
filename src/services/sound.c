@@ -110,9 +110,31 @@ static bool resolve_sound_file(const char *event, char *out, size_t out_sz)
     }
 
     /* 2. Vendored fallback (dev-tree relative path, then installed path --
-     * same two-step pattern as render/nvg.c's FONT_CANDIDATES). */
+     * same two-step pattern as render/nvg.c's FONT_CANDIDATES). The relative
+     * path is probed against the cwd AND the executable's parent directory
+     * (bin/dankc layout), so launching from outside the repo root still
+     * finds the vendored copies (mirrors nvg.c's probe_font_path()). */
+    static char exe_dir[512];
+    static bool exe_dir_init = false;
+    if (!exe_dir_init) {
+        exe_dir_init = true;
+        ssize_t n = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
+        if (n > 0) {
+            exe_dir[n] = '\0';
+            char *slash = strrchr(exe_dir, '/');
+            if (slash)
+                *slash = '\0';
+            else
+                exe_dir[0] = '\0';
+        } else {
+            exe_dir[0] = '\0';
+        }
+    }
     for (size_t e = 0; e < sizeof(exts) / sizeof(exts[0]); e++) {
         if (try_path(out, out_sz, "assets/sounds/freedesktop/%s.%s", event, exts[e]))
+            return true;
+        if (exe_dir[0] &&
+            try_path(out, out_sz, "%s/../assets/sounds/freedesktop/%s.%s", exe_dir, event, exts[e]))
             return true;
     }
     for (size_t e = 0; e < sizeof(exts) / sizeof(exts[0]); e++) {

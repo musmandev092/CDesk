@@ -862,8 +862,27 @@ static void ensure_parent_dir(const char *path)
     mkdir(dir, 0755);
 }
 
-void dc_config_save(void)
+/* Debounce state: dc_config_save() is called from every immediate-mode
+ * settings interaction (slider drags fire it per motion event), which
+ * produced several disk writes per second on a live session. Writes are
+ * rate-limited to one per second; a suppressed save sets `pending` and
+ * dc_config_save_tick() (main.c's 1Hz clock_tick) flushes it, so the
+ * on-disk file is never more than ~1s behind the last change. */
+static bool g_save_pending;
+static int64_t g_last_save_ms;
+
+static int64_t save_now_ms(void)
 {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void config_write_now(void)
+{
+    g_save_pending = false;
+    g_last_save_ms = save_now_ms();
+
     char path[512];
     if (!config_path(path, sizeof(path)))
         return;
@@ -1050,6 +1069,21 @@ void dc_config_save(void)
         dc_warn("could not write %s", path);
     }
     free(text);
+}
+
+void dc_config_save(void)
+{
+    if (save_now_ms() - g_last_save_ms < 1000) {
+        g_save_pending = true;
+        return;
+    }
+    config_write_now();
+}
+
+void dc_config_save_tick(void)
+{
+    if (g_save_pending && save_now_ms() - g_last_save_ms >= 1000)
+        config_write_now();
 }
 
 /* --- Audio per-device config accessors/setters ---------------------------

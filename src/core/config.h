@@ -446,6 +446,10 @@ dc_config *dc_config_mut(void);
 void dc_config_reapply(void);
 void dc_config_save(void);
 
+/* Flush a debounced dc_config_save() (writes are rate-limited to 1/s; see
+ * config.c). Called from main.c's 1Hz clock_tick. */
+void dc_config_save_tick(void);
+
 /* Register a callback invoked by dc_config_notify_changed(). The settings UI
  * calls dc_config_notify_changed() after mutating fields that affect other
  * live surfaces (bar geometry, widget lists); main.c registers a callback that

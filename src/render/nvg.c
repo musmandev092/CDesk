@@ -384,6 +384,8 @@ static const char *const EMOJI_FONT_CANDIDATES[] = {
     "/usr/share/dankc/fonts/NotoEmoji-Regular.ttf",
 };
 
+static const char *probe_font_path(const char *cand); /* defined below load_one_lazy_group */
+
 #define DC_MAX_FALLBACK_FONTS DC_RENDER_MAX_FALLBACKS
 
 /* Dedupe list of every fallback font path accepted so far (zh-cn/ja/ko all
@@ -542,10 +544,10 @@ static void load_one_lazy_group(dc_render *render, int group)
 {
     if (group == LAZY_EMOJI) {
         for (size_t i = 0; i < sizeof(EMOJI_FONT_CANDIDATES) / sizeof(char *); i++) {
-            if (access(EMOJI_FONT_CANDIDATES[i], R_OK) != 0)
+            const char *path = probe_font_path(EMOJI_FONT_CANDIDATES[i]);
+            if (!path)
                 continue;
-            if (add_fallback_font(render, EMOJI_FONT_CANDIDATES[i], 0x1F600, g_loaded_paths,
-                                  &g_n_loaded_paths))
+            if (add_fallback_font(render, path, 0x1F600, g_loaded_paths, &g_n_loaded_paths))
                 break;
         }
         return;
@@ -598,21 +600,69 @@ static void service_lazy_fallbacks(dc_render *render)
         dc_shape_reset_cache();
 }
 
+/* Resolve one font candidate to a readable path. Absolute candidates are
+ * probed as-is. Relative ("assets/...") candidates are probed against the
+ * cwd first (dev run from the repo root), then against the executable's
+ * parent directory and the executable's directory (bin/dankc and in-tree
+ * build layouts) -- so `~/dankc/bin/dankc` launched from anywhere still
+ * finds the bundled fonts instead of silently disabling icons.
+ *
+ * Returns NULL if nothing exists. Non-NULL returns may point into one
+ * shared static buffer: valid until the next call, which is fine for the
+ * single-threaded startup path (every caller consumes the path -- mmap /
+ * load_cmap / snprintf-copy -- before probing the next candidate). */
+static const char *probe_font_path(const char *cand)
+{
+    if (access(cand, R_OK) == 0)
+        return cand;
+    if (cand[0] == '/')
+        return NULL;
+
+    static char exe_dir[512];
+    static bool exe_dir_init = false;
+    if (!exe_dir_init) {
+        exe_dir_init = true;
+        ssize_t n = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
+        if (n > 0) {
+            exe_dir[n] = '\0';
+            char *slash = strrchr(exe_dir, '/');
+            if (slash)
+                *slash = '\0';
+            else
+                exe_dir[0] = '\0';
+        } else {
+            exe_dir[0] = '\0';
+        }
+    }
+    if (!exe_dir[0])
+        return NULL;
+
+    static char buf[768];
+    snprintf(buf, sizeof(buf), "%s/../%s", exe_dir, cand);
+    if (access(buf, R_OK) == 0)
+        return buf;
+    snprintf(buf, sizeof(buf), "%s/%s", exe_dir, cand);
+    if (access(buf, R_OK) == 0)
+        return buf;
+    return NULL;
+}
+
 static int load_font(NVGcontext *vg, const char *name, const char *const *candidates, size_t count,
                      const char **out_path)
 {
     for (size_t i = 0; i < count; i++) {
-        if (access(candidates[i], R_OK) != 0)
+        const char *path = probe_font_path(candidates[i]);
+        if (!path)
             continue;
         size_t size = 0;
-        unsigned char *data = mmap_font_file(candidates[i], &size);
+        unsigned char *data = mmap_font_file(path, &size);
         if (!data)
             continue;
         int font = nvgCreateFontMemAtIndex(vg, name, data, (int)size, 0, 0);
         if (font >= 0) {
-            dc_debug("loaded font '%s': %s (mmap %zu bytes)", name, candidates[i], size);
+            dc_debug("loaded font '%s': %s (mmap %zu bytes)", name, path, size);
             if (out_path)
-                *out_path = candidates[i];
+                *out_path = path;
             return font;
         }
         munmap(data, size); /* fontstash never retained it (freeData=0, load failed) */
